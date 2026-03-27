@@ -1,0 +1,15 @@
+# MCP transport client used by the runtime and inspection CLI.
+[package]
+name = "mcp-client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mcp-config = { path = "../config" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

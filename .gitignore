@@ -1,0 +1,12 @@
+/target
+**/target
+.DS_Store
+.env
+.env.*
+!.env.example
+config/mcp_servers.json
+.arka/**
+.vscode/**
+node_modules/
+data/sessions/
+data/whatsapp-web/

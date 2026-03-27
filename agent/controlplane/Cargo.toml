@@ -1,0 +1,32 @@
+# Session-oriented HTTP control plane and terminal client.
+[package]
+name = "agent-controlplane"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-openai = { path = "../openai" }
+agent-runtime = { path = "../runtime" }
+mcp-client = { path = "../../mcp/client" }
+mcp-config = { path = "../../mcp/config" }
+mcp-metadata = { path = "../../mcp/metadata" }
+async-trait.workspace = true
+axum.workspace = true
+dotenvy.workspace = true
+futures-util.workspace = true
+hmac = "0.12"
+reqwest.workspace = true
+rustyline.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3", "with-uuid-1"] }
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+time.workspace = true
+uuid.workspace = true

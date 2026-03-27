@@ -1,0 +1,14 @@
+{
+  "subagents": [
+    {
+      "type": "tool-executor",
+      "display_name": "Tool Executor",
+      "purpose": "Build the final executable MCP action from a selected capability and its full metadata.",
+      "when_to_use": "Use this after choosing a specific MCP tool or resource that should be invoked for the user request.",
+      "target_requirements": "Requires server_name, capability_kind, and capability_id selected by the main agent.",
+      "result_summary": "Executes delegated MCP work on the selected server and returns a terminal completed, partial, or cannot_execute report.",
+      "prompt_path": "subagents/tool-executor.prompt.md",
+      "enabled": true
+    }
+  ]
+}

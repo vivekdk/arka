@@ -1,0 +1,9 @@
+# MCP registry loader and validator.
+[package]
+name = "mcp-config"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

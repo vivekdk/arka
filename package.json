@@ -1,0 +1,13 @@
+{
+  "name": "arka-whatsapp-web-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "whatsapp-web": "node bridges/whatsapp-web/server.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.21.2",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

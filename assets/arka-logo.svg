@@ -1,0 +1,41 @@
+<svg width="720" height="240" viewBox="0 0 720 240" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="arkaLogoTitle arkaLogoDesc">
+  <title id="arkaLogoTitle">Arka logo</title>
+  <desc id="arkaLogoDesc">A geometric arch and stylized A paired with the Arka wordmark, designed for an AI and data-focused product.</desc>
+  <defs>
+    <linearGradient id="arkaDawn" x1="52" y1="30" x2="186" y2="198" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4A261"/>
+      <stop offset="1" stop-color="#0F5B50"/>
+    </linearGradient>
+    <linearGradient id="arkaWordmark" x1="224" y1="60" x2="595" y2="188" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1C1B18"/>
+      <stop offset="1" stop-color="#0F5B50"/>
+    </linearGradient>
+    <clipPath id="arkaSunClip">
+      <path d="M119 34C72.0558 34 34 72.0558 34 119V200H204V119C204 72.0558 165.944 34 119 34Z"/>
+    </clipPath>
+  </defs>
+
+  <rect x="18" y="18" width="202" height="202" rx="48" fill="#FFF8ED"/>
+  <path d="M119 34C72.0558 34 34 72.0558 34 119V200H58V119C58 85.3106 85.3106 58 119 58C152.689 58 180 85.3106 180 119V200H204V119C204 72.0558 165.944 34 119 34Z" fill="url(#arkaDawn)"/>
+  <g clip-path="url(#arkaSunClip)">
+    <circle cx="119" cy="104" r="34" fill="#F4A261"/>
+    <path d="M55 155H183" stroke="#0F5B50" stroke-width="10" stroke-linecap="round" opacity="0.18"/>
+    <path d="M67 171H171" stroke="#0F5B50" stroke-width="10" stroke-linecap="round" opacity="0.3"/>
+    <path d="M81 187H157" stroke="#0F5B50" stroke-width="10" stroke-linecap="round" opacity="0.42"/>
+  </g>
+  <path d="M119 82L80 176H104.5L118.4 140.8H119.6L133.5 176H158L119 82Z" fill="#1C1B18"/>
+  <path d="M119 82L146.5 148H131.8L119 115.8L106.2 148H91.5L119 82Z" fill="#FFF8ED"/>
+  <path d="M88 152H150" stroke="#FFF8ED" stroke-width="10" stroke-linecap="round"/>
+
+  <text
+    x="246"
+    y="176"
+    fill="url(#arkaWordmark)"
+    font-family="Avenir Next, Montserrat, Poppins, Arial, sans-serif"
+    font-size="108"
+    font-weight="700"
+    letter-spacing="-4"
+  >Arka</text>
+
+  <path d="M581 183.5C581 178.253 585.253 174 590.5 174H682.5C687.747 174 692 178.253 692 183.5C692 188.747 687.747 193 682.5 193H590.5C585.253 193 581 188.747 581 183.5Z" fill="#0F5B50" opacity="0.12"/>
+</svg>

@@ -1,0 +1,14 @@
+# Small CLI for inspecting configured MCP servers end to end.
+[package]
+name = "mcp-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mcp-client = { path = "../client" }
+mcp-config = { path = "../config" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

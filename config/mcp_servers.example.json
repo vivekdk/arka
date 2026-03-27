@@ -1,0 +1,79 @@
+{
+  "servers": [
+    {
+      "name": "postgres-crm",
+      "transport": {
+        "type": "stdio",
+        "command": "uv",
+        "args": [
+          "run",
+          "--directory",
+          "/absolute/path/to/postgres-mcp",
+          "postgres-mcp",
+          "postgresql://USERNAME:PASSWORD@HOST:5432/DATABASE"
+        ]
+      }
+    },
+    {
+      "name": "clickhouse-analytics",
+      "transport": {
+        "type": "stdio",
+        "command": "uv",
+        "args": [
+          "run",
+          "--with",
+          "mcp-clickhouse",
+          "--python",
+          "3.10",
+          "mcp-clickhouse"
+        ],
+        "env": {
+          "CLICKHOUSE_HOST": "analytics.example.com",
+          "CLICKHOUSE_PORT": "8123",
+          "CLICKHOUSE_USER": "default",
+          "CLICKHOUSE_PASSWORD": "replace-me",
+          "CLICKHOUSE_SECURE": "true",
+          "CLICKHOUSE_VERIFY": "true",
+          "CLICKHOUSE_CONNECT_TIMEOUT": "30",
+          "CLICKHOUSE_SEND_RECEIVE_TIMEOUT": "30"
+        }
+      }
+    },
+    {
+      "name": "posthog",
+      "transport": {
+        "type": "streamable_http",
+        "url": "https://posthog.example.com/mcp",
+        "headers": {
+          "Authorization": "Bearer replace-me"
+        }
+      }
+    },
+    {
+      "name": "kite-remote",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "mcp-remote",
+          "https://mcp.kite.trade/mcp",
+          "--debug"
+        ]
+      },
+      "description": "OAuth-backed remote MCP hosted through the mcp-remote stdio wrapper."
+    },
+    {
+      "name": "sqlite-local",
+      "transport": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": [
+          "mcp-server-sqlite",
+          "--db-path",
+          "/absolute/path/to/local.db"
+        ]
+      }
+    }
+  ]
+}

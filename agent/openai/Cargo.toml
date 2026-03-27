@@ -1,0 +1,17 @@
+# OpenAI Responses API adapter for `agent-runtime`.
+[package]
+name = "agent-openai"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mcp-client = { path = "../../mcp/client" }
+mcp-metadata = { path = "../../mcp/metadata" }
+agent-runtime = { path = "../runtime" }
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
