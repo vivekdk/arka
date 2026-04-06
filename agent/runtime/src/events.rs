@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::{
     ids::{StepId, TurnId},
-    state::{McpCapabilityTarget, TerminationReason, UsageSummary},
+    policy::{ToolMaskDecision, ToolMaskEnforcementMode},
+    state::{DelegationTarget, TerminationReason, UsageSummary},
 };
 
 /// Event sink abstraction used by the runtime loop.
@@ -94,6 +95,10 @@ pub enum RuntimeRawArtifactKind {
     McpRequest,
     McpResponse,
     McpError,
+    LocalToolRequest,
+    LocalToolResponse,
+    LocalToolError,
+    PolicyDecision,
 }
 
 /// Raw transport payload retained for internal debugging.
@@ -163,8 +168,8 @@ pub enum RuntimeEvent {
         subagent_type: String,
         /// Delegated goal passed to the sub-agent.
         goal: String,
-        /// Delegated MCP capability target selected by the main agent.
-        target: McpCapabilityTarget,
+        /// Delegated execution target selected by the main agent.
+        target: DelegationTarget,
     },
     ModelCalled {
         /// Turn identifier.
@@ -248,6 +253,16 @@ pub enum RuntimeEvent {
         /// Final delegated execution status.
         status: String,
     },
+    ToolMaskEvaluated {
+        turn_id: TurnId,
+        step_id: StepId,
+        executor: RuntimeExecutor,
+        at: SystemTime,
+        enforcement_mode: ToolMaskEnforcementMode,
+        allowed_tool_ids: Vec<String>,
+        denied_tool_ids: Vec<String>,
+        decisions: Vec<ToolMaskDecision>,
+    },
     McpCalled {
         /// Turn identifier.
         turn_id: TurnId,
@@ -284,6 +299,25 @@ pub enum RuntimeEvent {
         /// Error text when the call failed or the tool returned an MCP error.
         error: Option<String>,
         /// Full response payload retained for debugging.
+        response_payload: Value,
+    },
+    LocalToolCalled {
+        turn_id: TurnId,
+        step_id: StepId,
+        tool_name: String,
+        executor: RuntimeExecutor,
+        at: SystemTime,
+    },
+    LocalToolResponded {
+        turn_id: TurnId,
+        step_id: StepId,
+        tool_name: String,
+        executor: RuntimeExecutor,
+        at: SystemTime,
+        latency: Duration,
+        was_error: bool,
+        result_summary: String,
+        error: Option<String>,
         response_payload: Value,
     },
     StepEnded {

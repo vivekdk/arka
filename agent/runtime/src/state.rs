@@ -20,6 +20,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use crate::{
     ids::{MessageId, StepId, TurnId},
     model::ModelStepDecision,
+    policy::ToolMaskPlan,
 };
 
 /// Strongly typed MCP server identifier.
@@ -326,6 +327,8 @@ pub enum StepOutcomeKind {
 pub struct RunRequest {
     /// Path to the system prompt template file for this turn.
     pub system_prompt_path: PathBuf,
+    /// Root directory used for prompt rendering and local tool execution.
+    pub working_directory: PathBuf,
     /// Prior conversation history to inject before the new user message.
     pub conversation_history: Vec<ConversationMessage>,
     /// Fresh user message that starts this turn.
@@ -336,6 +339,8 @@ pub struct RunRequest {
     pub registry_path: PathBuf,
     /// Path to the configured sub-agent registry.
     pub subagent_registry_path: PathBuf,
+    /// Optional JSON overlay used for per-environment tool policy rules.
+    pub tool_policy_path: Option<PathBuf>,
     /// Optional allowlist of server names enabled for the turn.
     pub enabled_servers: Option<Vec<ServerName>>,
     /// Runtime safety and timeout limits.
@@ -462,21 +467,26 @@ impl MessageRecord {
                 record.result_summary
             ),
             Self::LocalToolCall(record) => {
-                format!("- tool_call: local_tool={} inactive=true", record.tool_name)
+                format!(
+                    "- tool_call: local_tool={} args={}",
+                    record.tool_name, record.arguments
+                )
             }
             Self::LocalToolResult(record) => format!(
-                "- tool_result: local_tool={} inactive=true status={}",
-                record.tool_name, record.status
+                "- tool_result: local_tool={} status={} error={} payload={}",
+                record.tool_name,
+                record.status,
+                record.error.is_some(),
+                record.result_summary
             ),
             Self::MemoryRead(record) => format!("- memory_read: {}", record.label),
             Self::MemoryWrite(record) => format!("- memory_write: {}", record.label),
             Self::SkillCall(record) => format!("- skill_call: {}", record.label),
             Self::SubAgentCall(record) => format!(
-                "- sub_agent_call: type={} goal={} target={}::{}",
+                "- sub_agent_call: type={} goal={} target={}",
                 record.subagent_type,
                 record.goal,
-                record.target.server_name,
-                record.target.capability_id
+                record.target.summary()
             ),
             Self::SubAgentResult(record) => format!(
                 "- sub_agent_result: type={} status={} actions={} detail={}",
@@ -525,6 +535,40 @@ pub struct McpCapabilityTarget {
     pub capability_id: String,
 }
 
+/// One local-tools delegation scope selected by the main agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalToolsScopeTarget {
+    pub scope: String,
+}
+
+impl LocalToolsScopeTarget {
+    pub fn working_directory() -> Self {
+        Self {
+            scope: "working_directory".to_owned(),
+        }
+    }
+}
+
+/// Typed delegation target for one sub-agent invocation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum DelegationTarget {
+    McpCapability(McpCapabilityTarget),
+    LocalToolsScope(LocalToolsScopeTarget),
+}
+
+impl DelegationTarget {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::McpCapability(target) => format!(
+                "{}::{:?}::{}",
+                target.server_name, target.capability_kind, target.capability_id
+            ),
+            Self::LocalToolsScope(target) => format!("local_tools::{}", target.scope),
+        }
+    }
+}
+
 /// One MCP invocation requested by runtime.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpCallMessageRecord {
@@ -560,8 +604,10 @@ pub struct LocalToolCallMessageRecord {
     pub message_id: MessageId,
     /// Message timestamp.
     pub timestamp: SystemTime,
-    /// Placeholder local tool name.
+    /// Local tool name.
     pub tool_name: LocalToolName,
+    /// JSON arguments forwarded to the local tool.
+    pub arguments: Value,
 }
 
 /// Placeholder message shape for local tool results.
@@ -571,10 +617,14 @@ pub struct LocalToolResultMessageRecord {
     pub message_id: MessageId,
     /// Message timestamp.
     pub timestamp: SystemTime,
-    /// Placeholder local tool name.
+    /// Local tool name.
     pub tool_name: LocalToolName,
-    /// Placeholder status text.
+    /// Tool execution status.
     pub status: String,
+    /// Human-readable payload summary reused in prompt history.
+    pub result_summary: String,
+    /// Error text when the tool failed.
+    pub error: Option<String>,
 }
 
 /// Typed sub-agent invocation record.
@@ -584,7 +634,7 @@ pub struct SubAgentCallMessageRecord {
     pub timestamp: SystemTime,
     pub subagent_type: String,
     pub goal: String,
-    pub target: McpCapabilityTarget,
+    pub target: DelegationTarget,
 }
 
 /// Typed sub-agent result record.
@@ -596,6 +646,8 @@ pub struct SubAgentResultMessageRecord {
     pub status: String,
     pub executed_action_count: u32,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mask: Option<ToolMaskPlan>,
 }
 
 /// Placeholder message used by inactive capability families.
@@ -662,6 +714,7 @@ mod tests {
             message_id: MessageId::new(),
             timestamp: SystemTime::now(),
             tool_name: LocalToolName::new("read_file").expect("valid tool"),
+            arguments: json!({"path": "README.md"}),
         });
 
         assert!(mcp_message.summary_line().contains("mcp_call"));

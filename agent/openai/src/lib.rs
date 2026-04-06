@@ -27,7 +27,8 @@ use agent_runtime::{
         ModelAdapterResponse, ModelStepDecision, ModelStepRequest, SubagentAdapterResponse,
         SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
     },
-    state::{ResponseClient, ResponseFormat, UsageSummary},
+    policy::ToolMaskPlan,
+    state::{DelegationTarget, ResponseClient, ResponseFormat, UsageSummary},
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -137,7 +138,7 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "subagent_step_decision",
-                    "schema": subagent_decision_schema(),
+                    "schema": subagent_decision_schema(&request.tool_mask_plan),
                     "strict": true
                 }
             },
@@ -477,9 +478,9 @@ fn parse_subagent_decision_text(
     let wire: OpenAiSubagentDecisionWire = serde_json::from_str(decision_text)
         .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?;
     match wire.decision_type.as_str() {
-        "tool_call" => Ok(SubagentDecision::ToolCall {
+        "mcp_tool_call" => Ok(SubagentDecision::McpToolCall {
             server_name: wire.server_name.ok_or_else(|| {
-                ModelAdapterError::InvalidDecision("tool_call requires server_name".to_owned())
+                ModelAdapterError::InvalidDecision("mcp_tool_call requires server_name".to_owned())
             })?,
             tool_name: wire.tool_name.unwrap_or_default(),
             arguments: serde_json::from_str(
@@ -487,15 +488,31 @@ fn parse_subagent_decision_text(
             )
             .map_err(|error| {
                 ModelAdapterError::InvalidDecision(format!(
-                    "invalid tool_call arguments_json: {error}"
+                    "invalid mcp_tool_call arguments_json: {error}"
                 ))
             })?,
         }),
-        "resource_read" => Ok(SubagentDecision::ResourceRead {
+        "mcp_resource_read" => Ok(SubagentDecision::McpResourceRead {
             server_name: wire.server_name.ok_or_else(|| {
-                ModelAdapterError::InvalidDecision("resource_read requires server_name".to_owned())
+                ModelAdapterError::InvalidDecision(
+                    "mcp_resource_read requires server_name".to_owned(),
+                )
             })?,
             resource_uri: wire.resource_uri.unwrap_or_default(),
+        }),
+        "local_tool_call" => Ok(SubagentDecision::LocalToolCall {
+            tool_name: agent_runtime::state::LocalToolName::new(
+                wire.tool_name.unwrap_or_default(),
+            )
+            .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?,
+            arguments: serde_json::from_str(
+                &wire.arguments_json.unwrap_or_else(|| "{}".to_owned()),
+            )
+            .map_err(|error| {
+                ModelAdapterError::InvalidDecision(format!(
+                    "invalid local_tool_call arguments_json: {error}"
+                ))
+            })?,
         }),
         "done" => Ok(SubagentDecision::Done {
             summary: wire.summary.unwrap_or_default(),
@@ -611,7 +628,7 @@ struct OpenAiDecisionWire {
     #[serde(default)]
     goal: String,
     #[serde(default)]
-    target: Option<agent_runtime::state::McpCapabilityTarget>,
+    target: Option<DelegationTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -679,14 +696,43 @@ fn decision_schema() -> Value {
             "subagent_type": { "type": "string" },
             "goal": { "type": "string" },
             "target": {
-                "type": ["object", "null"],
-                "required": ["server_name", "capability_kind", "capability_id"],
-                "properties": {
-                    "server_name": { "type": "string", "minLength": 1 },
-                    "capability_kind": { "type": "string", "enum": ["tool", "resource"] },
-                    "capability_id": { "type": "string", "minLength": 1 }
-                },
-                "additionalProperties": false
+                "anyOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["mcp_capability"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["server_name", "capability_kind", "capability_id"],
+                                "properties": {
+                                    "server_name": { "type": "string", "minLength": 1 },
+                                    "capability_kind": { "type": "string", "enum": ["tool", "resource"] },
+                                    "capability_id": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["local_tools_scope"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["scope"],
+                                "properties": {
+                                    "scope": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                ]
             }
         },
         "additionalProperties": false
@@ -705,7 +751,45 @@ fn final_answer_render_schema() -> Value {
     })
 }
 
-fn subagent_decision_schema() -> Value {
+fn subagent_decision_schema(tool_mask_plan: &ToolMaskPlan) -> Value {
+    let mut action_types = vec!["done".to_owned(), "partial".to_owned(), "cannot_execute".to_owned()];
+    if !tool_mask_plan.allowed_mcp_tools.is_empty() {
+        action_types.push("mcp_tool_call".to_owned());
+    }
+    if !tool_mask_plan.allowed_mcp_resources.is_empty() {
+        action_types.push("mcp_resource_read".to_owned());
+    }
+    if !tool_mask_plan.allowed_local_tools.is_empty() {
+        action_types.push("local_tool_call".to_owned());
+    }
+
+    let server_names = tool_mask_plan
+        .allowed_mcp_tools
+        .iter()
+        .map(|tool| tool.server_name.clone())
+        .chain(
+            tool_mask_plan
+                .allowed_mcp_resources
+                .iter()
+                .map(|resource| resource.server_name.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let tool_names = tool_mask_plan
+        .allowed_mcp_tools
+        .iter()
+        .map(|tool| tool.tool_name.clone())
+        .chain(tool_mask_plan.allowed_local_tools.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let resource_uris = tool_mask_plan
+        .allowed_mcp_resources
+        .iter()
+        .map(|resource| resource.resource_uri.clone())
+        .collect::<Vec<_>>();
+
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -713,12 +797,27 @@ fn subagent_decision_schema() -> Value {
         "properties": {
             "type": {
                 "type": "string",
-                "enum": ["tool_call", "resource_read", "done", "partial", "cannot_execute"]
+                "enum": action_types
             },
-            "server_name": { "type": ["string", "null"] },
-            "tool_name": { "type": ["string", "null"] },
+            "server_name": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "type": "string", "enum": server_names }
+                ]
+            },
+            "tool_name": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "type": "string", "enum": tool_names }
+                ]
+            },
             "arguments_json": { "type": ["string", "null"] },
-            "resource_uri": { "type": ["string", "null"] },
+            "resource_uri": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "type": "string", "enum": resource_uris }
+                ]
+            },
             "summary": { "type": ["string", "null"] },
             "reason": { "type": ["string", "null"] }
         }
@@ -792,6 +891,7 @@ fn non_empty_text(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use agent_runtime::{
+        policy::ToolMaskPlan,
         model::ModelStepRequest,
         state::{ModelConfig, PromptSection, PromptSnapshot, UsageSummary},
     };
@@ -824,6 +924,8 @@ mod tests {
                 }],
             },
             model_config: ModelConfig::new("gpt-5.4"),
+            registered_tools: Vec::new(),
+            tool_mask_plan: ToolMaskPlan::terminal_only("main agent has no direct tools"),
         };
 
         let body = adapter.build_request_body(&request);
@@ -838,7 +940,7 @@ mod tests {
     #[test]
     fn parses_delegate_subagent_decision() {
         let decision = parse_decision_text(
-            r#"{"type":"delegate_subagent","content":"","subagent_type":"tool-executor","goal":"run a query","target":{"server_name":"postgres","capability_kind":"tool","capability_id":"run-sql"}}"#,
+            r#"{"type":"delegate_subagent","content":"","subagent_type":"mcp-executor","goal":"run a query","target":{"kind":"mcp_capability","value":{"server_name":"postgres","capability_kind":"tool","capability_id":"run-sql"}}}"#,
         )
         .expect("decision should parse");
 
@@ -846,14 +948,14 @@ mod tests {
             decision,
             agent_runtime::model::ModelStepDecision::DelegateSubagent {
                 delegation: agent_runtime::model::SubagentDelegationRequest {
-                    subagent_type: "tool-executor".to_owned(),
+                    subagent_type: "mcp-executor".to_owned(),
                     goal: "run a query".to_owned(),
-                    target: agent_runtime::state::McpCapabilityTarget {
+                    target: agent_runtime::state::DelegationTarget::McpCapability(agent_runtime::state::McpCapabilityTarget {
                         server_name: agent_runtime::state::ServerName::new("postgres")
                             .expect("valid server name"),
                         capability_kind: mcp_metadata::CapabilityKind::Tool,
                         capability_id: "run-sql".to_owned(),
-                    },
+                    }),
                 }
             }
         );
@@ -891,16 +993,10 @@ mod tests {
 
     #[test]
     fn subagent_schema_supports_terminal_loop_variants() {
-        let schema = subagent_decision_schema();
+        let schema = subagent_decision_schema(&ToolMaskPlan::terminal_only("none"));
         assert_eq!(
             schema["properties"]["type"]["enum"],
-            json!([
-                "tool_call",
-                "resource_read",
-                "done",
-                "partial",
-                "cannot_execute"
-            ])
+            json!(["done", "partial", "cannot_execute"])
         );
         assert_eq!(
             schema["required"],

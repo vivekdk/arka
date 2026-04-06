@@ -69,10 +69,14 @@ pub struct TurnRunnerOutput {
 pub struct RuntimeExecutionConfig {
     /// Prompt template path used for every turn.
     pub system_prompt_path: PathBuf,
+    /// Working directory used for prompt rendering and local tools.
+    pub working_directory: PathBuf,
     /// MCP registry path used to prepare sessions.
     pub registry_path: PathBuf,
     /// Sub-agent registry path used to render prompts and delegate execution.
     pub subagent_registry_path: PathBuf,
+    /// Optional tool-policy overlay config path.
+    pub tool_policy_path: Option<PathBuf>,
     /// Optional allowlist of MCP servers enabled for all turns.
     pub enabled_servers: Option<Vec<ServerName>>,
     /// Runtime safety and timeout limits.
@@ -174,11 +178,13 @@ where
         let started = Instant::now();
         let request = agent_runtime::RunRequest {
             system_prompt_path: self.config.system_prompt_path.clone(),
+            working_directory: self.config.working_directory.clone(),
             conversation_history: input.conversation_history,
             user_message: input.user_message,
             response_target: input.response_target,
             registry_path: self.config.registry_path.clone(),
             subagent_registry_path: self.config.subagent_registry_path.clone(),
+            tool_policy_path: self.config.tool_policy_path.clone(),
             enabled_servers: self.config.enabled_servers.clone(),
             limits: self.config.limits.clone(),
             model_config: self.config.model_config.clone(),

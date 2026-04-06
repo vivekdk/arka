@@ -19,13 +19,16 @@ use crate::{
         ModelStepDecision, SubagentDecision, SubagentStepRequest,
     },
     prompt::{PromptAssembler, PromptRenderError, load_and_render_system_prompt},
+    policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
     state::{
-        LlmMessageRecord, McpCallMessageRecord, McpCapability, McpCapabilityTarget,
+        DelegationTarget, LlmMessageRecord, LocalToolCallMessageRecord,
+        LocalToolResultMessageRecord, McpCallMessageRecord, McpCapability, McpCapabilityTarget,
         McpResultMessageRecord, MessageRecord, RunRequest, RuntimeLimits, ServerName,
         StepOutcomeKind, StepRecord, TerminationReason, TurnOutcome, TurnRecord, UsageSummary,
         UserMessageRecord,
     },
     subagent::{ConfiguredSubagent, SubagentConfigError, SubagentRegistry, load_subagent_prompt},
+    tools::{ToolDescriptor, builtin_local_tool_catalog, execute_local_tool},
 };
 use mcp_client::{
     ClientInfo, McpClient, McpClientError, McpConnection, McpResourceReadResult, McpToolCallResult,
@@ -194,6 +197,15 @@ where
 
         let subagent_registry = SubagentRegistry::load_from_path(&request.subagent_registry_path)?;
         let subagent_cards = subagent_registry.enabled_cards();
+        let local_tool_catalog = builtin_local_tool_catalog();
+        let policy_overlay = ToolPolicyEngine::load_overlay(request.tool_policy_path.as_deref());
+        let tool_policy_engine = match policy_overlay {
+            Ok(overlay) => ToolPolicyEngine::new(overlay),
+            Err(error) => {
+                warn!(error = %error, "tool policy overlay failed to load; continuing with defaults");
+                ToolPolicyEngine::new(None)
+            }
+        };
         let main_executor = RuntimeExecutor::main_agent();
 
         let turn_id = TurnId::new();
@@ -218,8 +230,10 @@ where
         let capabilities = build_capabilities(&mcp_session.servers);
         let system_prompt = load_and_render_system_prompt(
             &request.system_prompt_path,
+            &request.working_directory,
             &capabilities,
             &subagent_cards,
+            &local_tool_catalog,
             &request.response_target,
         )?;
 
@@ -253,6 +267,7 @@ where
                     step_number,
                     prompt.clone(),
                     request.model_config.clone(),
+                    local_tool_catalog.clone(),
                     turn_start,
                     request.limits.turn_timeout,
                     sink,
@@ -320,7 +335,8 @@ where
                         timestamp: SystemTime::now(),
                         content: format!(
                             "delegating to sub-agent `{}` for target `{}`",
-                            delegation.subagent_type, delegation.target.capability_id
+                            delegation.subagent_type,
+                            delegation.target.summary()
                         ),
                     });
                     step_messages.push(llm_message.clone());
@@ -353,6 +369,7 @@ where
                     let (subagent_result_message, maybe_execution) = self
                         .run_subagent(
                             &request,
+                            &tool_policy_engine,
                             &subagent_registry,
                             mcp_session,
                             &delegation.subagent_type,
@@ -429,6 +446,7 @@ where
         step_number: u32,
         prompt: crate::state::PromptSnapshot,
         model_config: crate::state::ModelConfig,
+        registered_tools: Vec<ToolDescriptor>,
         turn_start: Instant,
         turn_timeout: Duration,
         sink: &mut dyn RuntimeDebugSink,
@@ -453,6 +471,10 @@ where
                     step_number,
                     prompt,
                     model_config,
+                    registered_tools,
+                    tool_mask_plan: crate::policy::ToolMaskPlan::terminal_only(
+                        "main agent does not directly execute tools",
+                    ),
                 },
                 Some(&mut debug_sink),
             ),
@@ -475,10 +497,11 @@ where
     async fn run_subagent(
         &self,
         request: &RunRequest,
+        tool_policy_engine: &ToolPolicyEngine,
         registry: &SubagentRegistry,
         mcp_session: &mut McpSession,
         subagent_type: &str,
-        target: &McpCapabilityTarget,
+        target: &DelegationTarget,
         goal: &str,
         turn_start: Instant,
         sink: &mut dyn RuntimeDebugSink,
@@ -493,6 +516,7 @@ where
             target,
             goal,
             &request.user_message,
+            &request.working_directory,
         )?;
         let model_config = configured
             .model_name
@@ -504,9 +528,44 @@ where
         let mut trace_messages = Vec::new();
         let mut subagent_messages = Vec::new();
         let mut executed_action_count = 0u32;
+        let mut last_tool_mask_plan = crate::policy::ToolMaskPlan::terminal_only(
+            "no delegated tools evaluated yet",
+        );
 
         for subagent_step_number in 1..=request.limits.max_subagent_steps_per_invocation {
             ensure_turn_time_remaining(turn_start, request.limits.turn_timeout)?;
+            let registered_tools = build_subagent_tool_catalog(mcp_session, target);
+            let tool_mask_plan = match registered_tools {
+                Ok(registered_tools) => {
+                    let plan = tool_policy_engine.evaluate(
+                        &ToolPolicyContext {
+                            executor: configured.subagent_type.clone(),
+                            response_client: request.response_target.client,
+                            phase: ToolPolicyPhase::DelegatedExecution,
+                            environment: None,
+                            working_directory: request.working_directory.clone(),
+                        },
+                        &registered_tools,
+                    );
+                    emit_tool_mask_debug(
+                        sink,
+                        turn_id,
+                        step_id,
+                        &executor,
+                        &plan,
+                        &registered_tools,
+                    );
+                    (registered_tools, plan)
+                }
+                Err(error) => {
+                    let plan = crate::policy::ToolMaskPlan::terminal_only(error.to_string());
+                    emit_tool_mask_debug(sink, turn_id, step_id, &executor, &plan, &[]);
+                    (Vec::new(), plan)
+                }
+            };
+            let registered_tools = tool_mask_plan.0;
+            let tool_mask_plan = tool_mask_plan.1;
+            last_tool_mask_plan = tool_mask_plan.clone();
             let prompt = build_subagent_loop_prompt(
                 &base_prompt,
                 &subagent_messages,
@@ -530,6 +589,8 @@ where
                         subagent_type: subagent_type.to_owned(),
                         prompt,
                         model_config: model_config.clone(),
+                        registered_tools: registered_tools.clone(),
+                        tool_mask_plan: tool_mask_plan.clone(),
                     },
                     Some(&mut debug_sink),
                 ),
@@ -554,6 +615,7 @@ where
                             "completed",
                             executed_action_count,
                             summary,
+                            Some(tool_mask_plan),
                         ),
                         DelegatedExecutionOutcome {
                             usage,
@@ -568,6 +630,7 @@ where
                             "partial",
                             executed_action_count,
                             format_partial_detail(&summary, &reason),
+                            Some(tool_mask_plan),
                         ),
                         DelegatedExecutionOutcome {
                             usage,
@@ -587,6 +650,7 @@ where
                             status,
                             executed_action_count,
                             reason,
+                            Some(tool_mask_plan),
                         ),
                         DelegatedExecutionOutcome {
                             usage,
@@ -594,7 +658,7 @@ where
                         },
                     ));
                 }
-                SubagentDecision::ToolCall {
+                SubagentDecision::McpToolCall {
                     server_name,
                     tool_name,
                     arguments,
@@ -606,6 +670,7 @@ where
                                 subagent_type,
                                 executed_action_count,
                                 "sub-agent exhausted its MCP action budget".to_owned(),
+                                Some(tool_mask_plan),
                             ),
                             DelegatedExecutionOutcome {
                                 usage,
@@ -614,9 +679,9 @@ where
                         ));
                     }
 
-                    let call_target = match validate_subagent_target(
+                    let call_target = match validate_masked_mcp_call(
                         &mcp_session.servers,
-                        target,
+                        &tool_mask_plan,
                         &server_name,
                         CapabilityKind::Tool,
                         &tool_name,
@@ -628,6 +693,7 @@ where
                                     subagent_type,
                                     executed_action_count,
                                     reason,
+                                    Some(tool_mask_plan),
                                 ),
                                 DelegatedExecutionOutcome {
                                     usage,
@@ -723,7 +789,7 @@ where
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
                 }
-                SubagentDecision::ResourceRead {
+                SubagentDecision::McpResourceRead {
                     server_name,
                     resource_uri,
                 } => {
@@ -734,6 +800,7 @@ where
                                 subagent_type,
                                 executed_action_count,
                                 "sub-agent exhausted its MCP action budget".to_owned(),
+                                Some(tool_mask_plan),
                             ),
                             DelegatedExecutionOutcome {
                                 usage,
@@ -742,9 +809,9 @@ where
                         ));
                     }
 
-                    let call_target = match validate_subagent_target(
+                    let call_target = match validate_masked_mcp_call(
                         &mcp_session.servers,
-                        target,
+                        &tool_mask_plan,
                         &server_name,
                         CapabilityKind::Resource,
                         &resource_uri,
@@ -756,6 +823,7 @@ where
                                     subagent_type,
                                     executed_action_count,
                                     reason,
+                                    Some(tool_mask_plan),
                                 ),
                                 DelegatedExecutionOutcome {
                                     usage,
@@ -849,6 +917,145 @@ where
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
                 }
+                SubagentDecision::LocalToolCall {
+                    tool_name,
+                    arguments,
+                } => {
+                    if executed_action_count >= request.limits.max_subagent_mcp_calls_per_invocation
+                    {
+                        return Ok((
+                            subagent_budget_result(
+                                subagent_type,
+                                executed_action_count,
+                                "sub-agent exhausted its action budget".to_owned(),
+                                Some(tool_mask_plan),
+                            ),
+                            DelegatedExecutionOutcome {
+                                usage,
+                                trace_messages,
+                            },
+                        ));
+                    }
+
+                    if !tool_mask_plan
+                        .allowed_local_tools
+                        .iter()
+                        .any(|candidate| candidate == tool_name.as_str())
+                    {
+                        return Ok((
+                            subagent_policy_result(
+                                subagent_type,
+                                executed_action_count,
+                                format!("local tool `{}` is not allowed in this step", tool_name),
+                                Some(tool_mask_plan),
+                            ),
+                            DelegatedExecutionOutcome {
+                                usage,
+                                trace_messages,
+                            },
+                        ));
+                    }
+
+                    let call_message = MessageRecord::LocalToolCall(LocalToolCallMessageRecord {
+                        message_id: MessageId::new(),
+                        timestamp: SystemTime::now(),
+                        tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                    sink.record(RuntimeEvent::LocalToolCalled {
+                        turn_id: turn_id.clone(),
+                        step_id: step_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        executor: executor.clone(),
+                        at: SystemTime::now(),
+                    });
+                    sink.record_raw_artifact(RuntimeRawArtifact {
+                        turn_id: turn_id.clone(),
+                        step_id: Some(step_id.clone()),
+                        occurred_at: SystemTime::now(),
+                        kind: RuntimeRawArtifactKind::LocalToolRequest,
+                        source: "local_tool_runtime".to_owned(),
+                        executor: executor.clone(),
+                        summary: Some(format!("local tool call {}", tool_name)),
+                        payload: serde_json::json!({
+                            "tool_name": tool_name.to_string(),
+                            "arguments": arguments.clone(),
+                        }),
+                    });
+                    let started = Instant::now();
+                    let result = execute_local_tool(&tool_name, &arguments, &request.working_directory);
+                    let (result_message, was_error, response_payload, result_summary, error) =
+                        match result {
+                            Ok(result) => (
+                                MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                                    message_id: MessageId::new(),
+                                    timestamp: SystemTime::now(),
+                                    tool_name: tool_name.clone(),
+                                    status: result.status.clone(),
+                                    result_summary: result.summary.clone(),
+                                    error: None,
+                                }),
+                                false,
+                                serde_json::to_value(&result).unwrap_or_else(|serialization_error| serde_json::json!({
+                                    "serialization_error": serialization_error.to_string(),
+                                })),
+                                result.summary,
+                                None,
+                            ),
+                            Err(error) => (
+                                MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                                    message_id: MessageId::new(),
+                                    timestamp: SystemTime::now(),
+                                    tool_name: tool_name.clone(),
+                                    status: "error".to_owned(),
+                                    result_summary: error.to_string(),
+                                    error: Some(error.to_string()),
+                                }),
+                                true,
+                                serde_json::json!({
+                                    "runtime_error": error.to_string(),
+                                }),
+                                error.to_string(),
+                                Some(error.to_string()),
+                            ),
+                        };
+                    sink.record_raw_artifact(RuntimeRawArtifact {
+                        turn_id: turn_id.clone(),
+                        step_id: Some(step_id.clone()),
+                        occurred_at: SystemTime::now(),
+                        kind: if was_error {
+                            RuntimeRawArtifactKind::LocalToolError
+                        } else {
+                            RuntimeRawArtifactKind::LocalToolResponse
+                        },
+                        source: "local_tool_runtime".to_owned(),
+                        executor: executor.clone(),
+                        summary: Some(format!(
+                            "{} local tool {}",
+                            if was_error { "error" } else { "response" },
+                            tool_name
+                        )),
+                        payload: response_payload.clone(),
+                    });
+                    sink.record(RuntimeEvent::LocalToolResponded {
+                        turn_id: turn_id.clone(),
+                        step_id: step_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        executor: executor.clone(),
+                        at: SystemTime::now(),
+                        latency: started.elapsed(),
+                        was_error,
+                        result_summary: result_summary.clone(),
+                        error: error.clone(),
+                        response_payload: response_payload.clone(),
+                    });
+
+                    executed_action_count += 1;
+                    trace_messages.push(call_message.clone());
+                    trace_messages.push(result_message.clone());
+                    subagent_messages.push(call_message);
+                    subagent_messages.push(result_message);
+                }
             }
         }
 
@@ -858,6 +1065,7 @@ where
                 executed_action_count,
                 "sub-agent exhausted its reasoning budget before reaching a terminal result"
                     .to_owned(),
+                Some(last_tool_mask_plan),
             ),
             DelegatedExecutionOutcome {
                 usage,
@@ -1085,49 +1293,74 @@ fn build_subagent_prompt(
     registry_path: &Path,
     configured: &ConfiguredSubagent,
     mcp_session: &McpSession,
-    target: &McpCapabilityTarget,
+    target: &DelegationTarget,
     goal: &str,
     user_message: &str,
+    working_directory: &Path,
 ) -> Result<String, RuntimeError> {
     let registry_dir = registry_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let server = mcp_session
-        .servers
-        .get(&target.server_name)
-        .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
-    let template = load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
+    match target {
+        DelegationTarget::McpCapability(target) => {
+            let server = mcp_session
+                .servers
+                .get(&target.server_name)
+                .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+            let template =
+                load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
 
-    let capability_block = match target.capability_kind {
-        CapabilityKind::Tool => {
-            let tool = lookup_tool(&server.full_catalog, &target.capability_id)?;
-            format!(
-                "Selected tool:\n- server: {}\n- name: {}\n- title: {}\n- description: {}\n- input_schema: {}\n",
-                target.server_name,
-                tool.name,
-                tool.title.as_deref().unwrap_or("None"),
-                tool.description.as_deref().unwrap_or("None"),
-                tool.input_schema
-            )
-        }
-        CapabilityKind::Resource => {
-            let resource = lookup_resource(&server.full_catalog, &target.capability_id)?;
-            format!(
-                "Selected resource:\n- server: {}\n- uri: {}\n- title: {}\n- description: {}\n- mime_type: {}\n",
-                target.server_name,
-                resource.uri,
-                resource.title.as_deref().unwrap_or("None"),
-                resource.description.as_deref().unwrap_or("None"),
-                resource.mime_type.as_deref().unwrap_or("None"),
-            )
-        }
-    };
+            let capability_block = match target.capability_kind {
+                CapabilityKind::Tool => {
+                    let tool = lookup_tool(&server.full_catalog, &target.capability_id)?;
+                    format!(
+                        "Selected tool:\n- server: {}\n- name: {}\n- title: {}\n- description: {}\n- input_schema: {}\n",
+                        target.server_name,
+                        tool.name,
+                        tool.title.as_deref().unwrap_or("None"),
+                        tool.description.as_deref().unwrap_or("None"),
+                        tool.input_schema
+                    )
+                }
+                CapabilityKind::Resource => {
+                    let resource = lookup_resource(&server.full_catalog, &target.capability_id)?;
+                    format!(
+                        "Selected resource:\n- server: {}\n- uri: {}\n- title: {}\n- description: {}\n- mime_type: {}\n",
+                        target.server_name,
+                        resource.uri,
+                        resource.title.as_deref().unwrap_or("None"),
+                        resource.description.as_deref().unwrap_or("None"),
+                        resource.mime_type.as_deref().unwrap_or("None"),
+                    )
+                }
+            };
 
-    Ok(format!(
-        "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected capability kind: {:?}\n- Selected capability id: {}\n\n{capability_block}",
-        target.capability_kind, target.capability_id
-    ))
+            Ok(format!(
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n\n{capability_block}",
+                target.capability_id
+            ))
+        }
+        DelegationTarget::LocalToolsScope(scope) => {
+            let template = load_subagent_prompt(&registry_dir, configured, "Local tool catalog")?;
+            let tools_block = builtin_local_tool_catalog()
+                .into_iter()
+                .map(|tool| {
+                    format!(
+                        "- Tool: {}\n  Description: {}\n  Input schema: {}",
+                        tool.name, tool.description, tool.input_schema
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!(
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n\n## Local Tools\n{}",
+                scope.scope,
+                working_directory.display(),
+                tools_block
+            ))
+        }
+    }
 }
 
 fn build_subagent_loop_prompt(
@@ -1152,17 +1385,65 @@ fn build_subagent_loop_prompt(
     )
 }
 
-fn validate_subagent_target(
+fn build_subagent_tool_catalog(
+    mcp_session: &McpSession,
+    target: &DelegationTarget,
+) -> Result<Vec<ToolDescriptor>, RuntimeError> {
+    match target {
+        DelegationTarget::McpCapability(target) => {
+            let server = mcp_session
+                .servers
+                .get(&target.server_name)
+                .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+            let mut tools = Vec::new();
+            for tool in &server.full_catalog.tools {
+                tools.push(ToolDescriptor::mcp_tool(
+                    &target.server_name,
+                    &tool.name,
+                    tool.title.as_deref(),
+                    tool.description.as_deref(),
+                    tool.input_schema.clone(),
+                ));
+            }
+            for resource in &server.full_catalog.resources {
+                tools.push(ToolDescriptor::mcp_resource(
+                    &target.server_name,
+                    &resource.uri,
+                    resource.title.as_deref(),
+                    resource.description.as_deref(),
+                ));
+            }
+            Ok(tools)
+        }
+        DelegationTarget::LocalToolsScope(_) => Ok(builtin_local_tool_catalog()),
+    }
+}
+
+fn validate_masked_mcp_call(
     servers: &HashMap<ServerName, PreparedServer>,
-    selected_target: &McpCapabilityTarget,
+    tool_mask_plan: &crate::policy::ToolMaskPlan,
     requested_server_name: &ServerName,
     capability_kind: CapabilityKind,
     capability_id: &str,
 ) -> Result<McpCapabilityTarget, String> {
-    if requested_server_name != &selected_target.server_name {
+    let is_allowed = match capability_kind {
+        CapabilityKind::Tool => tool_mask_plan.allowed_mcp_tools.iter().any(|tool| {
+            tool.server_name == requested_server_name.to_string() && tool.tool_name == capability_id
+        }),
+        CapabilityKind::Resource => tool_mask_plan.allowed_mcp_resources.iter().any(|resource| {
+            resource.server_name == requested_server_name.to_string()
+                && resource.resource_uri == capability_id
+        }),
+    };
+    if !is_allowed {
         return Err(format!(
-            "sub-agent may only use MCP server `{}` during this delegation, but requested `{}`",
-            selected_target.server_name, requested_server_name
+            "MCP {} `{}` on server `{}` is not allowed in this step",
+            match capability_kind {
+                CapabilityKind::Tool => "tool",
+                CapabilityKind::Resource => "resource",
+            },
+            capability_id,
+            requested_server_name
         ));
     }
 
@@ -1191,6 +1472,7 @@ fn subagent_result_message(
     status: &str,
     executed_action_count: u32,
     detail: String,
+    tool_mask: Option<crate::policy::ToolMaskPlan>,
 ) -> MessageRecord {
     MessageRecord::SubAgentResult(crate::state::SubAgentResultMessageRecord {
         message_id: MessageId::new(),
@@ -1199,6 +1481,7 @@ fn subagent_result_message(
         status: status.to_owned(),
         executed_action_count,
         detail,
+        tool_mask,
     })
 }
 
@@ -1206,26 +1489,28 @@ fn subagent_budget_result(
     subagent_type: &str,
     executed_action_count: u32,
     reason: String,
+    tool_mask: Option<crate::policy::ToolMaskPlan>,
 ) -> MessageRecord {
     let status = if executed_action_count > 0 {
         "partial"
     } else {
         "cannot_execute"
     };
-    subagent_result_message(subagent_type, status, executed_action_count, reason)
+    subagent_result_message(subagent_type, status, executed_action_count, reason, tool_mask)
 }
 
 fn subagent_policy_result(
     subagent_type: &str,
     executed_action_count: u32,
     reason: String,
+    tool_mask: Option<crate::policy::ToolMaskPlan>,
 ) -> MessageRecord {
     let status = if executed_action_count > 0 {
         "partial"
     } else {
         "cannot_execute"
     };
-    subagent_result_message(subagent_type, status, executed_action_count, reason)
+    subagent_result_message(subagent_type, status, executed_action_count, reason, tool_mask)
 }
 
 fn format_partial_detail(summary: &str, reason: &str) -> String {
@@ -1236,6 +1521,43 @@ fn format_partial_detail(summary: &str, reason: &str) -> String {
     } else {
         format!("{summary}\nStopped because: {reason}")
     }
+}
+
+fn emit_tool_mask_debug(
+    sink: &mut dyn RuntimeDebugSink,
+    turn_id: &TurnId,
+    step_id: &StepId,
+    executor: &RuntimeExecutor,
+    plan: &crate::policy::ToolMaskPlan,
+    registered_tools: &[ToolDescriptor],
+) {
+    sink.record(RuntimeEvent::ToolMaskEvaluated {
+        turn_id: turn_id.clone(),
+        step_id: step_id.clone(),
+        executor: executor.clone(),
+        at: SystemTime::now(),
+        enforcement_mode: plan.enforcement_mode,
+        allowed_tool_ids: plan.allowed_tool_ids.clone(),
+        denied_tool_ids: plan.denied_tool_ids.clone(),
+        decisions: plan.decisions.clone(),
+    });
+    sink.record_raw_artifact(RuntimeRawArtifact {
+        turn_id: turn_id.clone(),
+        step_id: Some(step_id.clone()),
+        occurred_at: SystemTime::now(),
+        kind: RuntimeRawArtifactKind::PolicyDecision,
+        source: "tool_policy_engine".to_owned(),
+        executor: executor.clone(),
+        summary: Some(format!(
+            "tool policy evaluated ({} allowed / {} denied)",
+            plan.allowed_tool_ids.len(),
+            plan.denied_tool_ids.len()
+        )),
+        payload: serde_json::json!({
+            "plan": plan,
+            "registered_tools": registered_tools,
+        }),
+    });
 }
 
 async fn execute_tool_call(

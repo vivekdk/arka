@@ -1,12 +1,22 @@
 {
   "subagents": [
     {
+      "type": "mcp-executor",
+      "display_name": "Mcp Executor",
+      "purpose": "Complete delegated MCP work against the selected server capability using one or more MCP actions when needed.",
+      "when_to_use": "Use this after choosing a specific MCP capability target for the user request.",
+      "target_requirements": "Requires an MCP capability target selected by the main agent.",
+      "result_summary": "Executes delegated MCP work on the selected server and returns a terminal completed, partial, or cannot_execute report.",
+      "prompt_path": "subagents/mcp-executor.prompt.md",
+      "enabled": true
+    },
+    {
       "type": "tool-executor",
       "display_name": "Tool Executor",
-      "purpose": "Build the final executable MCP action from a selected capability and its full metadata.",
-      "when_to_use": "Use this after choosing a specific MCP tool or resource that should be invoked for the user request.",
-      "target_requirements": "Requires server_name, capability_kind, and capability_id selected by the main agent.",
-      "result_summary": "Executes delegated MCP work on the selected server and returns a terminal completed, partial, or cannot_execute report.",
+      "purpose": "Complete delegated local tool work inside the working directory using read_file for full UTF-8 reads, write_file for full-file writes, and edit_file for exact single-match text replacement.",
+      "when_to_use": "Use this when the user request requires workspace file inspection, targeted edits, or full rewrites.",
+      "target_requirements": "Requires a local tools scope selected by the main agent.",
+      "result_summary": "Executes delegated local tool work and returns a terminal completed, partial, or cannot_execute report.",
       "prompt_path": "subagents/tool-executor.prompt.md",
       "enabled": true
     }

@@ -23,9 +23,9 @@ The system is layered deliberately:
 2. `agent/runtime`
    - owns the single-turn execution loop
    - builds prompts from canonical state records
-   - executes MCP actions
+   - executes MCP actions and local tools
    - emits typed runtime events
-   - keeps local tools, memory, skills, and sub-agents as typed placeholders only
+   - evaluates tool-availability policy and produces per-step tool masks
 3. `agent/openai`
    - OpenAI Responses API adapter behind the runtime `ModelAdapter` trait
 4. `agent/controlplane`
@@ -70,9 +70,11 @@ Current variables:
 
 ```dotenv
 OPENAI_API_KEY=
-MODEL_NAME=gpt-5.4
+MODEL_NAME=gpt-5.4-mini
 SYSTEM_PROMPT=config/prompt.md
 MCP_REGISTRY_PATH=config/mcp_servers.json
+SUBAGENT_REGISTRY_PATH=config/subagents.json
+TOOL_POLICY_PATH=
 SESSION_STORE_DIR=data/sessions
 ```
 
@@ -83,7 +85,8 @@ Supported dynamic tags:
 - `<dynamic variable: working_directory>`
 - `<dynamic variable: current_date and time>`
 - `<dynamic variable: available MCPs>`
-- `<dynamic variable: available tools>`
+- `<dynamic variable: available sub-agents>`
+- `<dynamic variable: available tools>`: renders a generic runtime-managed tools notice rather than enumerating the tool catalog
 
 Optional variables:
 
@@ -200,6 +203,29 @@ Validation rules enforced by `mcp-config`:
 session state, message transcripts, and channel metadata and should remain local
 runtime data, not committed source.
 
+### Sub-agents
+
+The default sub-agent registry is `config/subagents.json`.
+
+Current built-in executors:
+
+- `mcp-executor`: delegated MCP tool/resource execution
+- `tool-executor`: delegated local tool execution inside the working directory
+
+Current built-in local tools:
+
+- `read_file`
+- `write_file`
+- `edit_file`
+
+### Tool policy
+
+`TOOL_POLICY_PATH` is optional. When set, it should point to a JSON overlay file
+that adjusts the default Rust tool policy rules without changing the static tool
+catalog in the prompt.
+
+Start from `config/tool_policy.example.json` if you want an overlay.
+
 ## Running It
 
 ### 1. Inspect an MCP server
@@ -215,6 +241,25 @@ cargo run -p mcp-cli -- inspect --server sqlite --config /path/to/mcp_servers.js
 ```
 
 ### 2. Start the control-plane server
+
+Create a local `.env` first. A minimal setup is:
+
+```dotenv
+OPENAI_API_KEY=...
+MODEL_NAME=gpt-5.4-mini
+SYSTEM_PROMPT=config/prompt.md
+MCP_REGISTRY_PATH=config/mcp_servers.json
+SUBAGENT_REGISTRY_PATH=config/subagents.json
+SESSION_STORE_DIR=data/sessions
+```
+
+Optional policy overlay:
+
+```dotenv
+TOOL_POLICY_PATH=config/tool_policy.json
+```
+
+If you use a policy overlay, create it from `config/tool_policy.example.json`.
 
 ```bash
 cargo run -p agent-controlplane --bin server
@@ -340,14 +385,17 @@ For each user turn it:
 1. builds a prompt from typed conversation and turn records
 2. calls the model through the `ModelAdapter` trait
 3. validates the model decision
-4. executes MCP calls when requested
-5. records typed messages and runtime events
-6. returns a `TurnOutcome`
+4. delegates to `mcp-executor` or `tool-executor` when requested
+5. executes MCP calls or local tools through the delegated executor
+6. evaluates tool policy and emits per-step tool masks
+7. records typed messages and runtime events
+7. returns a `TurnOutcome`
 
 Important design points:
 
 - MCP calls are active
-- local runtime tools such as `read_file`, `edit_file`, and `write_file` are modeled separately from MCP and remain inactive placeholders
+- local runtime tools such as `read_file`, `edit_file`, and `write_file` are active and workspace-scoped
+- the prompt-visible tool catalog stays static while per-step tool availability is enforced by the harness
 - observability is exposed as typed events collected in memory and returned to callers
 
 ## Current State
@@ -357,6 +405,9 @@ Implemented:
 - MCP registry loading and validation
 - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`
 - single-turn runtime with guardrails and typed state
+- delegated `mcp-executor` and `tool-executor` flows
+- local `read_file`, `write_file`, and `edit_file` execution
+- tool policy evaluation with optional JSON overlay config
 - OpenAI adapter
 - in-memory control-plane session orchestration
 - API routes, SSE events, approvals, idempotency
@@ -369,7 +420,7 @@ Not implemented yet:
 - persistent storage beyond the in-memory control-plane store
 - authentication and authorization
 - end-to-end automated tests against a real WhatsApp account; the local WhatsApp Web bridge is implemented, but live pairing still needs manual verification
-- richer local tool execution
+- additional local tools beyond `read_file`, `write_file`, and `edit_file`
 - long-running job queue or distributed workers
 
 ## Development

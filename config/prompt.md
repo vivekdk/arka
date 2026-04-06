@@ -24,7 +24,7 @@ Use this target when composing the final reply. The final reply must match the r
 </Response target>
 
 <Tools>
-<dynamic variable: available tools>
+Tool availability is enforced by the runtime harness and policy engine. Do not assume any specific local tool is available unless it is surfaced at execution time.
 </Tools>
 
 # System

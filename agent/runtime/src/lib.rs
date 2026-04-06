@@ -16,10 +16,12 @@
 pub mod events;
 mod ids;
 pub mod model;
+pub mod policy;
 pub mod prompt;
 pub mod runtime;
 pub mod state;
 pub mod subagent;
+pub mod tools;
 
 pub use events::{
     EventSink, InMemoryEventSink, RuntimeDebugSink, RuntimeEvent, RuntimeExecutor,
@@ -33,3 +35,4 @@ pub use state::{
     ResponseTarget, RunRequest, RuntimeLimits, ServerName, StepOutcomeKind, StepRecord,
     TerminationReason, TurnOutcome, TurnRecord, UsageSummary,
 };
+pub use tools::{ToolCallResultEnvelope, ToolDescriptor, ToolFamily, builtin_local_tool_catalog};

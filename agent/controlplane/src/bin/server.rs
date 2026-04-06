@@ -25,10 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_key = env::var("OPENAI_API_KEY")?;
     let model_name = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_owned());
     let system_prompt_path = load_system_prompt_path();
+    let working_directory = env::current_dir()?;
     let registry_path =
         env::var("MCP_REGISTRY_PATH").unwrap_or_else(|_| "config/mcp_servers.json".to_owned());
     let subagent_registry_path =
         env::var("SUBAGENT_REGISTRY_PATH").unwrap_or_else(|_| "config/subagents.json".to_owned());
+    let tool_policy_path = env::var("TOOL_POLICY_PATH").ok().map(PathBuf::from);
     let server_names = env::var("ENABLED_MCP_SERVERS")
         .ok()
         .map(|value| {
@@ -107,8 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         runtime,
         RuntimeExecutionConfig {
             system_prompt_path,
+            working_directory,
             registry_path: registry_path.into(),
             subagent_registry_path: subagent_registry_path.into(),
+            tool_policy_path,
             enabled_servers: server_names,
             limits: runtime_limits,
             model_config: ModelConfig::new(model_name),

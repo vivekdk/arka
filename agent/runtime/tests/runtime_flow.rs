@@ -16,7 +16,7 @@ use agent_runtime::{
         ModelAdapter, ModelAdapterError, ModelAdapterResponse, ModelStepDecision, ModelStepRequest,
         SubagentAdapterResponse, SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
     },
-    state::McpCapabilityTarget,
+    state::{DelegationTarget, McpCapabilityTarget},
 };
 use async_trait::async_trait;
 use mcp_metadata::{
@@ -45,12 +45,12 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "run-sql".to_owned(),
-                        },
+                        }),
                         goal: "Count rows".to_owned(),
                     },
                 },
@@ -65,7 +65,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
         ],
         vec![
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ToolCall {
+                decision: SubagentDecision::McpToolCall {
                     server_name: ServerName::new("fake").expect("valid server"),
                     tool_name: "run-sql".to_owned(),
                     arguments: json!({"query": "select 1"}),
@@ -96,6 +96,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
     let outcome = runtime
         .run_turn(RunRequest {
             system_prompt_path: prompt_path,
+            working_directory: temp_dir.clone(),
             conversation_history: vec![ConversationMessage {
                 timestamp: SystemTime::now(),
                 role: ConversationRole::Assistant,
@@ -105,6 +106,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path,
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -148,7 +150,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
             subagent_type,
             goal,
             ..
-        } if subagent_type == "tool-executor" && goal == "Count rows"
+        } if subagent_type == "mcp-executor" && goal == "Count rows"
     )));
     assert!(outcome.events.iter().any(|event| matches!(
         event,
@@ -156,12 +158,12 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
             subagent_type,
             status,
             ..
-        } if subagent_type == "tool-executor" && status == "completed"
+        } if subagent_type == "mcp-executor" && status == "completed"
     )));
 
     let prompts = prompt_log.lock().expect("prompt log should lock");
     assert!(prompts[0].contains("available MCPs") || prompts[0].contains("Server: fake"));
-    assert!(prompts[0].contains("tool-executor"));
+    assert!(prompts[0].contains("mcp-executor"));
 }
 
 #[tokio::test]
@@ -173,12 +175,12 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "preview_leads".to_owned(),
-                        },
+                        }),
                         goal: "Preview leads".to_owned(),
                     },
                 },
@@ -192,7 +194,7 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
             }),
         ],
         vec![Ok(SubagentAdapterResponse {
-            decision: SubagentDecision::ToolCall {
+            decision: SubagentDecision::McpToolCall {
                 server_name: ServerName::new("fake").expect("valid server"),
                 tool_name: "preview_leads".to_owned(),
                 arguments: json!({"limit": 2}),
@@ -213,11 +215,13 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
                 &temp_dir,
                 "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>",
             ),
+            working_directory: temp_dir.clone(),
             conversation_history: vec![],
             user_message: "Show sample leads".to_owned(),
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -240,8 +244,8 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
         })
         .expect("mcp responded event should be present");
 
-    assert_eq!(responded.0.display_name, "Tool Executor");
-    assert_eq!(responded.0.subagent_type.as_deref(), Some("tool-executor"));
+    assert_eq!(responded.0.display_name, "Mcp Executor");
+    assert_eq!(responded.0.subagent_type.as_deref(), Some("mcp-executor"));
     assert!(
         responded.2.to_string().len() > responded.1.len(),
         "debug payload should retain more detail than the transcript summary"
@@ -268,12 +272,12 @@ async fn delegated_subagent_follow_up_prompt_keeps_full_mcp_result_text() {
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "preview_leads".to_owned(),
-                        },
+                        }),
                         goal: "Preview leads".to_owned(),
                     },
                 },
@@ -288,7 +292,7 @@ async fn delegated_subagent_follow_up_prompt_keeps_full_mcp_result_text() {
         ],
         vec![
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ToolCall {
+                decision: SubagentDecision::McpToolCall {
                     server_name: ServerName::new("fake").expect("valid server"),
                     tool_name: "preview_leads".to_owned(),
                     arguments: json!({"limit": 2}),
@@ -316,11 +320,13 @@ async fn delegated_subagent_follow_up_prompt_keeps_full_mcp_result_text() {
                 &temp_dir,
                 "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>",
             ),
+            working_directory: temp_dir.clone(),
             conversation_history: vec![],
             user_message: "Preview the latest leads".to_owned(),
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -350,12 +356,12 @@ async fn prepared_session_skips_discovery_until_first_execution() {
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "run-sql".to_owned(),
-                        },
+                        }),
                         goal: "Run a query".to_owned(),
                     },
                 },
@@ -370,7 +376,7 @@ async fn prepared_session_skips_discovery_until_first_execution() {
         ],
         vec![
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ToolCall {
+                decision: SubagentDecision::McpToolCall {
                     server_name: ServerName::new("fake").expect("valid server"),
                     tool_name: "run-sql".to_owned(),
                     arguments: json!({"query": "select 1"}),
@@ -417,11 +423,13 @@ async fn prepared_session_skips_discovery_until_first_execution() {
         .run_turn_with_mcp_session(
             RunRequest {
                 system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
+                working_directory: temp_dir.clone(),
                 conversation_history: vec![],
                 user_message: "Run it".to_owned(),
                 response_target: default_response_target(),
                 registry_path,
                 subagent_registry_path,
+                tool_policy_path: None,
                 enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
                 limits: RuntimeLimits::default(),
                 model_config: ModelConfig::new("fake-model"),
@@ -445,12 +453,12 @@ async fn runtime_reads_resource_via_tool_executor() {
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Resource,
                             capability_id: "crm://dashboards/main".to_owned(),
-                        },
+                        }),
                         goal: "Read the dashboard".to_owned(),
                     },
                 },
@@ -465,7 +473,7 @@ async fn runtime_reads_resource_via_tool_executor() {
         ],
         vec![
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ResourceRead {
+                decision: SubagentDecision::McpResourceRead {
                     server_name: ServerName::new("fake").expect("valid server"),
                     resource_uri: "crm://dashboards/main".to_owned(),
                 },
@@ -488,11 +496,13 @@ async fn runtime_reads_resource_via_tool_executor() {
     let outcome = runtime
         .run_turn(RunRequest {
             system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
+            working_directory: temp_dir.clone(),
             conversation_history: vec![],
             user_message: "Show the dashboard".to_owned(),
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -526,12 +536,12 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
             Ok(ModelAdapterResponse {
                 decision: ModelStepDecision::DelegateSubagent {
                     delegation: SubagentDelegationRequest {
-                        subagent_type: "tool-executor".to_owned(),
-                        target: McpCapabilityTarget {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
                             server_name: ServerName::new("fake").expect("valid server"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "run-sql".to_owned(),
-                        },
+                        }),
                         goal: "Find the final count".to_owned(),
                     },
                 },
@@ -546,7 +556,7 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
         ],
         vec![
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ToolCall {
+                decision: SubagentDecision::McpToolCall {
                     server_name: ServerName::new("fake").expect("valid server"),
                     tool_name: "run-sql".to_owned(),
                     arguments: json!({"query": "select count(*) from one"}),
@@ -554,7 +564,7 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
                 usage: token_usage(1, 1),
             }),
             Ok(SubagentAdapterResponse {
-                decision: SubagentDecision::ToolCall {
+                decision: SubagentDecision::McpToolCall {
                     server_name: ServerName::new("fake").expect("valid server"),
                     tool_name: "run-sql".to_owned(),
                     arguments: json!({"query": "select count(*) from two"}),
@@ -579,11 +589,13 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
     let outcome = runtime
         .run_turn(RunRequest {
             system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
+            working_directory: temp_dir.clone(),
             conversation_history: vec![],
             user_message: "Get me the final count".to_owned(),
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -638,11 +650,13 @@ async fn runtime_fails_when_metadata_is_missing() {
     let error = runtime
         .run_turn(RunRequest {
             system_prompt_path: write_prompt(&temp_dir, "Be precise."),
+            working_directory: temp_dir.clone(),
             conversation_history: vec![],
             user_message: "Hello".to_owned(),
             response_target: default_response_target(),
             registry_path,
             subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
             enabled_servers: Some(vec![ServerName::new("missing-meta").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
@@ -743,10 +757,10 @@ fn cleanup_mcp_metadata(logical_name: &str) {
 fn write_subagent_registry(temp_dir: &Path) -> PathBuf {
     let prompt_dir = temp_dir.join("subagents");
     fs::create_dir_all(&prompt_dir).expect("subagent dir should exist");
-    let prompt_path = prompt_dir.join("tool-executor.prompt.md");
+    let prompt_path = prompt_dir.join("mcp-executor.prompt.md");
     fs::write(
         &prompt_path,
-        "You are the tool-executor. Return exactly one executable action or cannot_execute.",
+        "You are the mcp-executor. Return exactly one executable action or cannot_execute.",
     )
     .expect("subagent prompt should write");
     let registry_path = temp_dir.join("subagents.json");
@@ -755,13 +769,13 @@ fn write_subagent_registry(temp_dir: &Path) -> PathBuf {
         json!({
             "subagents": [
                 {
-                    "type": "tool-executor",
-                    "display_name": "Tool Executor",
+                    "type": "mcp-executor",
+                    "display_name": "Mcp Executor",
                     "purpose": "Build the final MCP action",
                     "when_to_use": "After selecting a capability",
                     "target_requirements": "server_name, capability_kind, capability_id",
                     "result_summary": "Returns one tool call or resource read",
-                    "prompt_path": "subagents/tool-executor.prompt.md",
+                    "prompt_path": "subagents/mcp-executor.prompt.md",
                     "enabled": true
                 }
             ]

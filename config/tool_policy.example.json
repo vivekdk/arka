@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {
+      "action": "deny",
+      "executors": ["tool-executor"],
+      "tags": ["file_write"],
+      "response_clients": ["whatsapp"],
+      "phases": ["delegated_execution"],
+      "reason": "File writes are disabled for WhatsApp sessions."
+    }
+  ]
+}

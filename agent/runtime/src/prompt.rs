@@ -6,7 +6,6 @@
 
 use std::{
     collections::BTreeMap,
-    env,
     fmt::Write,
     fs,
     path::{Path, PathBuf},
@@ -19,6 +18,7 @@ use crate::state::{
     ConversationMessage, McpCapability, MessageRecord, PromptSection, PromptSnapshot,
     ResponseClient, ResponseFormat, ResponseTarget, SubagentCard, format_system_time,
 };
+use crate::tools::ToolDescriptor;
 
 const WORKING_DIRECTORY_TAG: &str = "<dynamic variable: working_directory>";
 const CURRENT_DATE_TIME_TAG: &str = "<dynamic variable: current_date and time>";
@@ -83,8 +83,10 @@ impl PromptAssembler {
 /// Reads the prompt template from disk and replaces supported dynamic tags.
 pub fn load_and_render_system_prompt(
     path: &Path,
+    working_directory: &Path,
     mcp_capabilities: &[McpCapability],
     subagent_cards: &[SubagentCard],
+    available_tools: &[ToolDescriptor],
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
     let template =
@@ -93,21 +95,27 @@ pub fn load_and_render_system_prompt(
             source,
         })?;
 
-    render_system_prompt(&template, mcp_capabilities, subagent_cards, response_target)
+    render_system_prompt(
+        &template,
+        working_directory,
+        mcp_capabilities,
+        subagent_cards,
+        available_tools,
+        response_target,
+    )
 }
 
 fn render_system_prompt(
     template: &str,
+    working_directory: &Path,
     mcp_capabilities: &[McpCapability],
     subagent_cards: &[SubagentCard],
+    available_tools: &[ToolDescriptor],
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
     // Dynamic prompt tags are expanded late so each turn sees the current
     // working directory, local time, and enabled MCP catalog.
-    let working_directory = env::current_dir()
-        .map_err(PromptRenderError::CurrentWorkingDirectory)?
-        .display()
-        .to_string();
+    let working_directory = working_directory.display().to_string();
     let current_date_time = render_current_date_time()?;
 
     Ok(template
@@ -118,7 +126,7 @@ fn render_system_prompt(
             AVAILABLE_SUBAGENTS_TAG,
             &render_available_subagents(subagent_cards),
         )
-        .replace(AVAILABLE_TOOLS_TAG, "None")
+        .replace(AVAILABLE_TOOLS_TAG, &render_available_tools(available_tools))
         .replace(RESPONSE_TARGET_TAG, &render_response_target(response_target)))
 }
 
@@ -228,6 +236,15 @@ fn render_available_subagents(cards: &[SubagentCard]) -> String {
         .join("\n\n")
 }
 
+fn render_available_tools(tools: &[ToolDescriptor]) -> String {
+    if tools.is_empty() {
+        return "No runtime-managed tools are currently enabled.".to_owned();
+    }
+
+    "Tool availability is managed by the runtime harness and policy engine. Use only the tools exposed at execution time."
+        .to_owned()
+}
+
 fn render_response_target(target: &ResponseTarget) -> String {
     let client = match target.client {
         ResponseClient::Api => "api",
@@ -270,6 +287,7 @@ mod tests {
             ResponseClient, ResponseFormat, ResponseTarget, ServerName, SubagentCard,
             format_system_time,
         },
+        tools::builtin_local_tool_catalog,
     };
 
     use super::PromptAssembler;
@@ -318,6 +336,7 @@ mod tests {
 
         let rendered = load_and_render_system_prompt(
             &template_path,
+            &temp_dir,
             &[McpCapability {
                 server_name: ServerName::new("sqlite").expect("valid server"),
                 server_description: Some("SQLite workspace access".to_owned()),
@@ -334,6 +353,7 @@ mod tests {
                 target_requirements: "server_name, capability_kind, capability_id".to_owned(),
                 result_summary: "Returns a tool call or resource read".to_owned(),
             }],
+            &builtin_local_tool_catalog(),
             &ResponseTarget {
                 client: ResponseClient::Slack,
                 format: ResponseFormat::SlackMrkdwn,
@@ -349,7 +369,9 @@ mod tests {
         assert!(rendered.contains("Description: Execute SQL"));
         assert!(rendered.contains("Sub-agents:"));
         assert!(rendered.contains("Type: tool-executor"));
-        assert!(rendered.contains("Tools:\nNone"));
+        assert!(rendered.contains(
+            "Tools:\nTool availability is managed by the runtime harness and policy engine. Use only the tools exposed at execution time."
+        ));
         assert!(rendered.contains("Client: slack"));
         assert!(rendered.contains("Format: slack_mrkdwn"));
         assert!(rendered.contains("Unknown: <dynamic variable: future>"));
@@ -358,5 +380,6 @@ mod tests {
         assert!(!rendered.contains("<dynamic variable: available MCPs>"));
         assert!(!rendered.contains("<dynamic variable: available tools>"));
         assert!(!rendered.contains("<dynamic variable: response target>"));
+        assert!(!rendered.contains("Tool: read_file"));
     }
 }
