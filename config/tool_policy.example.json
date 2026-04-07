@@ -7,6 +7,14 @@
       "response_clients": ["whatsapp"],
       "phases": ["delegated_execution"],
       "reason": "File writes are disabled for WhatsApp sessions."
+    },
+    {
+      "action": "deny",
+      "executors": ["tool-executor"],
+      "tags": ["command_exec"],
+      "response_clients": ["whatsapp"],
+      "phases": ["delegated_execution"],
+      "reason": "Command execution is disabled for WhatsApp sessions."
     }
   ]
 }

@@ -182,7 +182,9 @@ impl ToolPolicyEngine {
         }
     }
 
-    pub fn load_overlay(path: Option<&Path>) -> Result<Option<ToolPolicyOverlay>, ToolPolicyLoadError> {
+    pub fn load_overlay(
+        path: Option<&Path>,
+    ) -> Result<Option<ToolPolicyOverlay>, ToolPolicyLoadError> {
         let Some(path) = path else {
             return Ok(None);
         };
@@ -278,17 +280,32 @@ impl ToolPolicyEngine {
 }
 
 fn default_policy_rules() -> Vec<ToolPolicyRule> {
-    vec![ToolPolicyRule {
-        action: ToolPolicyRuleAction::Deny,
-        executors: vec!["tool-executor".to_owned()],
-        tool_ids: Vec::new(),
-        families: Vec::new(),
-        tags: vec!["file_write".to_owned()],
-        response_clients: vec![ResponseClient::WhatsApp],
-        phases: vec![ToolPolicyPhase::DelegatedExecution],
-        environments: Vec::new(),
-        reason: Some("file writes are disabled for WhatsApp sessions by default".to_owned()),
-    }]
+    vec![
+        ToolPolicyRule {
+            action: ToolPolicyRuleAction::Deny,
+            executors: vec!["tool-executor".to_owned()],
+            tool_ids: Vec::new(),
+            families: Vec::new(),
+            tags: vec!["file_write".to_owned()],
+            response_clients: vec![ResponseClient::WhatsApp],
+            phases: vec![ToolPolicyPhase::DelegatedExecution],
+            environments: Vec::new(),
+            reason: Some("file writes are disabled for WhatsApp sessions by default".to_owned()),
+        },
+        ToolPolicyRule {
+            action: ToolPolicyRuleAction::Deny,
+            executors: vec!["tool-executor".to_owned()],
+            tool_ids: Vec::new(),
+            families: Vec::new(),
+            tags: vec!["command_exec".to_owned()],
+            response_clients: vec![ResponseClient::WhatsApp],
+            phases: vec![ToolPolicyPhase::DelegatedExecution],
+            environments: Vec::new(),
+            reason: Some(
+                "command execution is disabled for WhatsApp sessions by default".to_owned(),
+            ),
+        },
+    ]
 }
 
 fn matches_optional_string(filters: &[String], candidate: &str) -> bool {
@@ -307,7 +324,10 @@ fn matches_optional_enum<T: PartialEq>(filters: &[T], candidate: &T) -> bool {
 }
 
 fn matches_optional_tags(filters: &[String], tags: &[String]) -> bool {
-    filters.is_empty() || filters.iter().any(|filter| tags.iter().any(|tag| tag == filter))
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| tags.iter().any(|tag| tag == filter))
 }
 
 #[cfg(test)]
@@ -350,7 +370,29 @@ mod tests {
 
         assert!(plan.allowed_local_tools.contains(&"read_file".to_owned()));
         assert!(!plan.allowed_local_tools.contains(&"write_file".to_owned()));
-        assert_eq!(plan.enforcement_mode, ToolMaskEnforcementMode::AdapterFallback);
+        assert_eq!(
+            plan.enforcement_mode,
+            ToolMaskEnforcementMode::AdapterFallback
+        );
+    }
+
+    #[test]
+    fn whatsapp_denies_command_exec_by_default() {
+        let plan = ToolPolicyEngine::new(None).evaluate(
+            &ToolPolicyContext {
+                executor: "tool-executor".to_owned(),
+                response_client: ResponseClient::WhatsApp,
+                phase: ToolPolicyPhase::DelegatedExecution,
+                environment: None,
+                working_directory: std::env::temp_dir(),
+            },
+            &builtin_local_tool_catalog(),
+        );
+
+        assert!(plan.allowed_local_tools.contains(&"read_file".to_owned()));
+        assert!(plan.allowed_local_tools.contains(&"glob".to_owned()));
+        assert!(!plan.allowed_local_tools.contains(&"write_file".to_owned()));
+        assert!(!plan.allowed_local_tools.contains(&"bash".to_owned()));
     }
 
     #[test]

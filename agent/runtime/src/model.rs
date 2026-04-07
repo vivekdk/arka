@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::{
     policy::ToolMaskPlan,
     state::{
-        DelegationTarget, LocalToolName, ModelConfig, PromptSnapshot, ResponseTarget,
-        ServerName, UsageSummary,
+        DelegationTarget, LocalToolName, ModelConfig, PromptSnapshot, ResponseTarget, ServerName,
+        UsageSummary,
     },
     tools::ToolDescriptor,
 };

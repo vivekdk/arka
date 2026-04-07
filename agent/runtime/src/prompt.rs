@@ -126,8 +126,14 @@ fn render_system_prompt(
             AVAILABLE_SUBAGENTS_TAG,
             &render_available_subagents(subagent_cards),
         )
-        .replace(AVAILABLE_TOOLS_TAG, &render_available_tools(available_tools))
-        .replace(RESPONSE_TARGET_TAG, &render_response_target(response_target)))
+        .replace(
+            AVAILABLE_TOOLS_TAG,
+            &render_available_tools(available_tools),
+        )
+        .replace(
+            RESPONSE_TARGET_TAG,
+            &render_response_target(response_target),
+        ))
 }
 
 fn render_current_date_time() -> Result<String, PromptRenderError> {

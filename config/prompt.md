@@ -42,3 +42,7 @@ Tool availability is enforced by the runtime harness and policy engine. Do not a
 - Do not put a colon before tool calls.
 
 IMPORTANT: Go straight to the point. Try the simplest approach first without going in circles. Do not overdo it. Be extra concise.
+
+<Current Working Directory>
+<dynamic variable: working_directory>
+</Current Working Directory>

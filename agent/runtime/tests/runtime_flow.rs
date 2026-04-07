@@ -9,14 +9,14 @@ use std::{
 };
 
 use agent_runtime::{
-    AgentRuntime, ConversationMessage, ConversationRole, MessageRecord, ModelConfig,
+    AgentRuntime, ConversationMessage, ConversationRole, LocalToolName, MessageRecord, ModelConfig,
     ResponseClient, ResponseFormat, ResponseTarget, RunRequest, RuntimeError, RuntimeEvent,
     RuntimeLimits, ServerName, TerminationReason,
     model::{
         ModelAdapter, ModelAdapterError, ModelAdapterResponse, ModelStepDecision, ModelStepRequest,
         SubagentAdapterResponse, SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
     },
-    state::{DelegationTarget, McpCapabilityTarget},
+    state::{DelegationTarget, LocalToolsScopeTarget, McpCapabilityTarget},
 };
 use async_trait::async_trait;
 use mcp_metadata::{
@@ -629,6 +629,184 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
 }
 
 #[tokio::test]
+async fn runtime_delegates_tool_executor_and_executes_glob() {
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Find Rust source files".to_owned(),
+                    },
+                },
+                usage: token_usage(2, 2),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "glob complete".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("glob").expect("valid tool"),
+                    arguments: json!({"pattern":"src/**/*.rs"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::Done {
+                    summary: "Found Rust files".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-tool-glob");
+    fs::create_dir_all(temp_dir.join("src/nested")).expect("nested src dir");
+    fs::write(temp_dir.join("src/lib.rs"), "pub fn a() {}\n").expect("lib file");
+    fs::write(temp_dir.join("src/nested/mod.rs"), "pub fn b() {}\n").expect("mod file");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "Sub-agents:\n<dynamic variable: available sub-agents>\nTools:\n<dynamic variable: available tools>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            user_message: "Find Rust files".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "glob complete");
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::LocalToolCall(record) if record.tool_name.as_str() == "glob"
+    )));
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::LocalToolResult(record)
+            if record.tool_name.as_str() == "glob"
+                && record.result_summary.contains("src/lib.rs")
+                && record.result_summary.contains("src/nested/mod.rs")
+    )));
+    assert!(outcome.events.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::LocalToolResponded {
+            tool_name,
+            executor,
+            result_summary,
+            ..
+        } if tool_name == "glob"
+            && executor.subagent_type.as_deref() == Some("tool-executor")
+            && result_summary.contains("src/lib.rs")
+    )));
+}
+
+#[tokio::test]
+async fn delegated_tool_follow_up_prompt_keeps_bash_output() {
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Inspect bash output".to_owned(),
+                    },
+                },
+                usage: token_usage(2, 2),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "bash complete".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("bash").expect("valid tool"),
+                    arguments: json!({"command":"printf 'stdout-ok'; printf 'stderr-ok' >&2"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::Done {
+                    summary: "Bash inspected".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-tool-bash");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "Sub-agents:\n<dynamic variable: available sub-agents>\nTools:\n<dynamic variable: available tools>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            user_message: "Run a bash check".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+        })
+        .await
+        .expect("turn should succeed");
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    let follow_up_prompt = prompts
+        .iter()
+        .find(|prompt| {
+            prompt.contains("## Delegated Execution History")
+                && prompt.contains("tool_result: local_tool=bash")
+                && prompt.contains("stdout-ok")
+        })
+        .expect("subagent follow-up prompt should include bash output");
+    assert!(follow_up_prompt.contains("stderr-ok"));
+}
+
+#[tokio::test]
 async fn runtime_fails_when_metadata_is_missing() {
     cleanup_mcp_metadata("missing-meta");
     let adapter = FakeModelAdapter::new(
@@ -763,6 +941,12 @@ fn write_subagent_registry(temp_dir: &Path) -> PathBuf {
         "You are the mcp-executor. Return exactly one executable action or cannot_execute.",
     )
     .expect("subagent prompt should write");
+    let tool_prompt_path = prompt_dir.join("tool-executor.prompt.md");
+    fs::write(
+        &tool_prompt_path,
+        "You are the tool-executor. Return exactly one executable local tool action or cannot_execute.",
+    )
+    .expect("tool subagent prompt should write");
     let registry_path = temp_dir.join("subagents.json");
     fs::write(
         &registry_path,
@@ -776,6 +960,16 @@ fn write_subagent_registry(temp_dir: &Path) -> PathBuf {
                     "target_requirements": "server_name, capability_kind, capability_id",
                     "result_summary": "Returns one tool call or resource read",
                     "prompt_path": "subagents/mcp-executor.prompt.md",
+                    "enabled": true
+                },
+                {
+                    "type": "tool-executor",
+                    "display_name": "Tool Executor",
+                    "purpose": "Complete one local tool action",
+                    "when_to_use": "After selecting the local tools scope",
+                    "target_requirements": "local_tools_scope",
+                    "result_summary": "Returns one local tool call",
+                    "prompt_path": "subagents/tool-executor.prompt.md",
                     "enabled": true
                 }
             ]

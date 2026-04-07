@@ -442,13 +442,11 @@ impl WhatsAppGatewayHandle {
     {
         self.ensure_ready_and_allowed(&request.from_user_id).await?;
         let payload = normalized_payload(request);
-        let envelope = self
-            .adapter
-            .ingest(payload)
-            .map_err(map_adapter_error)?;
-        let dispatch = service.dispatch_envelope(envelope).await.map_err(|error| {
-            WhatsAppGatewayError::InvalidPayload(error.to_string())
-        })?;
+        let envelope = self.adapter.ingest(payload).map_err(map_adapter_error)?;
+        let dispatch = service
+            .dispatch_envelope(envelope)
+            .await
+            .map_err(|error| WhatsAppGatewayError::InvalidPayload(error.to_string()))?;
         self.queue_outbound(dispatch).await
     }
 
@@ -476,10 +474,7 @@ impl WhatsAppGatewayHandle {
             let message = WhatsAppOutboundMessage {
                 session_id: dispatch.session.session_id.clone(),
                 target,
-                text: self
-                    .adapter
-                    .render(outbound)
-                    .map_err(map_adapter_error)?,
+                text: self.adapter.render(outbound).map_err(map_adapter_error)?,
             };
             {
                 let mut state = self.state.lock().await;
@@ -504,7 +499,10 @@ impl WhatsAppGatewayHandle {
         })
     }
 
-    async fn ensure_ready_and_allowed(&self, from_user_id: &str) -> Result<(), WhatsAppGatewayError> {
+    async fn ensure_ready_and_allowed(
+        &self,
+        from_user_id: &str,
+    ) -> Result<(), WhatsAppGatewayError> {
         if let Some(control_client) = self.control_client.as_ref() {
             if let Ok(remote) = control_client.status(&self.account_id).await {
                 let mut state = self.state.lock().await;
@@ -522,7 +520,11 @@ impl WhatsAppGatewayHandle {
             return Err(WhatsAppGatewayError::NotReady);
         }
         if matches!(state.persisted.dm_policy, WhatsAppDmPolicy::Allowlist)
-            && !state.persisted.allow_from.iter().any(|known| known == from_user_id)
+            && !state
+                .persisted
+                .allow_from
+                .iter()
+                .any(|known| known == from_user_id)
         {
             return Err(WhatsAppGatewayError::SenderBlocked(from_user_id.to_owned()));
         }
@@ -647,12 +649,11 @@ fn persist_gateway_state(
             source,
         })?;
     }
-    let payload = serde_json::to_vec_pretty(state).map_err(|source| {
-        WhatsAppGatewayError::Serialize {
+    let payload =
+        serde_json::to_vec_pretty(state).map_err(|source| WhatsAppGatewayError::Serialize {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     fs::write(path, payload).map_err(|source| WhatsAppGatewayError::Io {
         path: path.to_path_buf(),
         source,

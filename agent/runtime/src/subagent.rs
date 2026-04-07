@@ -179,18 +179,30 @@ mod tests {
         .expect("tool-executor prompt should load");
 
         assert!(rendered.contains("You are the `tool-executor` sub-agent."));
+        assert!(rendered.contains(
+            "`glob` finds workspace-relative file or directory paths matching a glob pattern, with optional exclude globs."
+        ));
         assert!(rendered.contains("`read_file` reads the full UTF-8 contents of one file."));
         assert!(rendered.contains("`write_file` writes the full UTF-8 contents of one file."));
         assert!(rendered.contains(
             "`edit_file` replaces exactly one matching `old_text` block with `new_text` in a UTF-8 file."
         ));
         assert!(rendered.contains(
+            "`bash` runs one non-interactive bash command in the working directory and returns the exit code plus captured stdout and stderr."
+        ));
+        assert!(rendered.contains("Prefer `glob` for path discovery before opening files."));
+        assert!(rendered.contains(
             "Use `read_file` before mutating when the current file contents are not already known."
         ));
         assert!(rendered.contains(
             "If `edit_file` cannot find the requested text, read the file again and reassess before continuing."
         ));
-        assert!(rendered.contains("The delegated prompt will include the working directory and the available local tools."));
+        assert!(rendered.contains(
+            "If `bash` output is noisy or truncated, narrow the command and try again instead of guessing."
+        ));
+        assert!(rendered.contains(
+            "The delegated prompt will include the working directory and the available local tools."
+        ));
         assert!(!rendered.contains("<dynamic variable: MCP server details>"));
     }
 

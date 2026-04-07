@@ -11,13 +11,13 @@ use std::{
 
 use agent_controlplane::{
     ApiResponseFormat, ApprovalDecision, ChannelBinding, ChannelDeliveryTarget, ChannelEnvelope,
-    ChannelIntent, ChannelKind, ConversationStore, CreateSessionRequest,
-    InMemoryConversationStore, JsonlConversationStore, RuntimeHarnessEventEnvelope,
-    RuntimeHarnessObservation, SendSessionMessageRequest, SessionService, SlackConnector,
-    SlackDeliveryClient, SubmitApprovalRequest, TurnRunner, TurnRunnerInput, TurnRunnerOutput,
-    WhatsAppConnector, WhatsAppDeliveryClient, WhatsAppDeliveryError, WhatsAppDmPolicy,
-    WhatsAppGatewayStatus, WhatsAppWebhookPayload, api::SlackStreamHandle, router,
-    router_with_channels, router_with_slack,
+    ChannelIntent, ChannelKind, ConversationStore, CreateSessionRequest, InMemoryConversationStore,
+    JsonlConversationStore, RuntimeHarnessEventEnvelope, RuntimeHarnessObservation,
+    SendSessionMessageRequest, SessionService, SlackConnector, SlackDeliveryClient,
+    SubmitApprovalRequest, TurnRunner, TurnRunnerInput, TurnRunnerOutput, WhatsAppConnector,
+    WhatsAppDeliveryClient, WhatsAppDeliveryError, WhatsAppDmPolicy, WhatsAppGatewayStatus,
+    WhatsAppWebhookPayload, api::SlackStreamHandle, router, router_with_channels,
+    router_with_slack,
 };
 use agent_runtime::{
     ConversationRole, ResponseClient, ResponseFormat, ResponseTarget, RuntimeError, RuntimeEvent,
@@ -346,15 +346,18 @@ async fn whatsapp_gateway_login_status_and_delivery_flow() {
         }),
     );
 
-    let initial_status: WhatsAppGatewayStatus =
-        get_json(&app, "/channels/whatsapp/status").await;
+    let initial_status: WhatsAppGatewayStatus = get_json(&app, "/channels/whatsapp/status").await;
     assert_eq!(
         initial_status.connection_state,
         agent_controlplane::WhatsAppGatewayConnectionState::NeedsLogin
     );
 
-    let login: agent_controlplane::StartWhatsAppLoginResponse =
-        post_json_value(&app, "/channels/whatsapp/login/start", serde_json::json!({})).await;
+    let login: agent_controlplane::StartWhatsAppLoginResponse = post_json_value(
+        &app,
+        "/channels/whatsapp/login/start",
+        serde_json::json!({}),
+    )
+    .await;
     let ready_status: WhatsAppGatewayStatus = post_json_value(
         &app,
         "/channels/whatsapp/login/complete",
@@ -410,8 +413,12 @@ async fn whatsapp_gateway_rejects_blocked_sender() {
         }),
     );
 
-    let login: agent_controlplane::StartWhatsAppLoginResponse =
-        post_json_value(&app, "/channels/whatsapp/login/start", serde_json::json!({})).await;
+    let login: agent_controlplane::StartWhatsAppLoginResponse = post_json_value(
+        &app,
+        "/channels/whatsapp/login/start",
+        serde_json::json!({}),
+    )
+    .await;
     let _: WhatsAppGatewayStatus = post_json_value(
         &app,
         "/channels/whatsapp/login/complete",
@@ -775,7 +782,11 @@ async fn jsonl_store_restores_running_sessions_as_interrupted() {
         .await
         .expect("session should be created");
     let updated = store
-        .update_session(&session.session_id, agent_controlplane::SessionStatus::Running, None)
+        .update_session(
+            &session.session_id,
+            agent_controlplane::SessionStatus::Running,
+            None,
+        )
         .await
         .expect("session update should persist")
         .expect("session should still exist");
@@ -786,7 +797,10 @@ async fn jsonl_store_restores_running_sessions_as_interrupted() {
         .get_session(&session.session_id)
         .await
         .expect("session should reload");
-    assert_eq!(recovered.status, agent_controlplane::SessionStatus::Interrupted);
+    assert_eq!(
+        recovered.status,
+        agent_controlplane::SessionStatus::Interrupted
+    );
 
     cleanup_test_store_dir(&store_dir);
 }

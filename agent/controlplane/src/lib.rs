@@ -23,8 +23,7 @@ pub mod whatsapp;
 pub use adapters::{ChannelAdapter, SlackChannelAdapter, WhatsAppChannelAdapter};
 pub use api::{
     ApiError, ApiState, ReqwestSlackDeliveryClient, SlackConnector, SlackDeliveryClient,
-    SlackDeliveryError, router, router_with_channels, router_with_debug_history,
-    router_with_slack,
+    SlackDeliveryError, router, router_with_channels, router_with_debug_history, router_with_slack,
 };
 pub use observability::{
     DebugHistoryAvailableFilters, DebugHistoryEventRow, DebugHistoryFilterOption,
@@ -44,6 +43,6 @@ pub use service::{
 pub use types::*;
 pub use whatsapp::{
     LoggingWhatsAppDeliveryClient, ReqwestWhatsAppWebBridgeClient, WhatsAppConnector,
-    WhatsAppControlClient, WhatsAppControlStatus, WhatsAppDeliveryClient,
-    WhatsAppDeliveryError, WhatsAppGatewayError, WhatsAppGatewayHandle,
+    WhatsAppControlClient, WhatsAppControlStatus, WhatsAppDeliveryClient, WhatsAppDeliveryError,
+    WhatsAppGatewayError, WhatsAppGatewayHandle,
 };

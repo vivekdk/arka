@@ -18,8 +18,8 @@ use crate::{
         ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
         ModelStepDecision, SubagentDecision, SubagentStepRequest,
     },
-    prompt::{PromptAssembler, PromptRenderError, load_and_render_system_prompt},
     policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
+    prompt::{PromptAssembler, PromptRenderError, load_and_render_system_prompt},
     state::{
         DelegationTarget, LlmMessageRecord, LocalToolCallMessageRecord,
         LocalToolResultMessageRecord, McpCallMessageRecord, McpCapability, McpCapabilityTarget,
@@ -528,9 +528,8 @@ where
         let mut trace_messages = Vec::new();
         let mut subagent_messages = Vec::new();
         let mut executed_action_count = 0u32;
-        let mut last_tool_mask_plan = crate::policy::ToolMaskPlan::terminal_only(
-            "no delegated tools evaluated yet",
-        );
+        let mut last_tool_mask_plan =
+            crate::policy::ToolMaskPlan::terminal_only("no delegated tools evaluated yet");
 
         for subagent_step_number in 1..=request.limits.max_subagent_steps_per_invocation {
             ensure_turn_time_remaining(turn_start, request.limits.turn_timeout)?;
@@ -983,7 +982,14 @@ where
                         }),
                     });
                     let started = Instant::now();
-                    let result = execute_local_tool(&tool_name, &arguments, &request.working_directory);
+                    let remaining = remaining_turn_budget(turn_start, request.limits.turn_timeout)?;
+                    let result = execute_local_tool(
+                        &tool_name,
+                        &arguments,
+                        &request.working_directory,
+                        remaining,
+                    )
+                    .await;
                     let (result_message, was_error, response_payload, result_summary, error) =
                         match result {
                             Ok(result) => (
@@ -996,9 +1002,13 @@ where
                                     error: None,
                                 }),
                                 false,
-                                serde_json::to_value(&result).unwrap_or_else(|serialization_error| serde_json::json!({
-                                    "serialization_error": serialization_error.to_string(),
-                                })),
+                                serde_json::to_value(&result).unwrap_or_else(
+                                    |serialization_error| {
+                                        serde_json::json!({
+                                            "serialization_error": serialization_error.to_string(),
+                                        })
+                                    },
+                                ),
                                 result.summary,
                                 None,
                             ),
@@ -1496,7 +1506,13 @@ fn subagent_budget_result(
     } else {
         "cannot_execute"
     };
-    subagent_result_message(subagent_type, status, executed_action_count, reason, tool_mask)
+    subagent_result_message(
+        subagent_type,
+        status,
+        executed_action_count,
+        reason,
+        tool_mask,
+    )
 }
 
 fn subagent_policy_result(
@@ -1510,7 +1526,13 @@ fn subagent_policy_result(
     } else {
         "cannot_execute"
     };
-    subagent_result_message(subagent_type, status, executed_action_count, reason, tool_mask)
+    subagent_result_message(
+        subagent_type,
+        status,
+        executed_action_count,
+        reason,
+        tool_mask,
+    )
 }
 
 fn format_partial_detail(summary: &str, reason: &str) -> String {
@@ -1909,7 +1931,9 @@ canonical_text must be channel-neutral and semantically complete.\n\
 display_text must preserve the same meaning while matching the target client format.\n\n",
     );
     prompt.push_str("Response target:\n");
-    prompt.push_str(&format!("Client: {client}\nFormat: {format}\n{format_rules}\n\n"));
+    prompt.push_str(&format!(
+        "Client: {client}\nFormat: {format}\n{format_rules}\n\n"
+    ));
     prompt.push_str("User message:\n");
     prompt.push_str(user_message);
     prompt.push_str("\n\nConversation history:\n");

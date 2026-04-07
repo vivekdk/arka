@@ -501,10 +501,8 @@ fn parse_subagent_decision_text(
             resource_uri: wire.resource_uri.unwrap_or_default(),
         }),
         "local_tool_call" => Ok(SubagentDecision::LocalToolCall {
-            tool_name: agent_runtime::state::LocalToolName::new(
-                wire.tool_name.unwrap_or_default(),
-            )
-            .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?,
+            tool_name: agent_runtime::state::LocalToolName::new(wire.tool_name.unwrap_or_default())
+                .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?,
             arguments: serde_json::from_str(
                 &wire.arguments_json.unwrap_or_else(|| "{}".to_owned()),
             )
@@ -752,7 +750,11 @@ fn final_answer_render_schema() -> Value {
 }
 
 fn subagent_decision_schema(tool_mask_plan: &ToolMaskPlan) -> Value {
-    let mut action_types = vec!["done".to_owned(), "partial".to_owned(), "cannot_execute".to_owned()];
+    let mut action_types = vec![
+        "done".to_owned(),
+        "partial".to_owned(),
+        "cannot_execute".to_owned(),
+    ];
     if !tool_mask_plan.allowed_mcp_tools.is_empty() {
         action_types.push("mcp_tool_call".to_owned());
     }
@@ -891,8 +893,8 @@ fn non_empty_text(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use agent_runtime::{
-        policy::ToolMaskPlan,
         model::ModelStepRequest,
+        policy::ToolMaskPlan,
         state::{ModelConfig, PromptSection, PromptSnapshot, UsageSummary},
     };
     use reqwest::StatusCode;
@@ -950,12 +952,14 @@ mod tests {
                 delegation: agent_runtime::model::SubagentDelegationRequest {
                     subagent_type: "mcp-executor".to_owned(),
                     goal: "run a query".to_owned(),
-                    target: agent_runtime::state::DelegationTarget::McpCapability(agent_runtime::state::McpCapabilityTarget {
-                        server_name: agent_runtime::state::ServerName::new("postgres")
-                            .expect("valid server name"),
-                        capability_kind: mcp_metadata::CapabilityKind::Tool,
-                        capability_id: "run-sql".to_owned(),
-                    }),
+                    target: agent_runtime::state::DelegationTarget::McpCapability(
+                        agent_runtime::state::McpCapabilityTarget {
+                            server_name: agent_runtime::state::ServerName::new("postgres")
+                                .expect("valid server name"),
+                            capability_kind: mcp_metadata::CapabilityKind::Tool,
+                            capability_id: "run-sql".to_owned(),
+                        }
+                    ),
                 }
             }
         );

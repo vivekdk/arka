@@ -214,9 +214,11 @@ Current built-in executors:
 
 Current built-in local tools:
 
+- `glob`
 - `read_file`
 - `write_file`
 - `edit_file`
+- `bash`
 
 ### Tool policy
 
@@ -225,6 +227,7 @@ that adjusts the default Rust tool policy rules without changing the static tool
 catalog in the prompt.
 
 Start from `config/tool_policy.example.json` if you want an overlay.
+The default policy denies `file_write` and `command_exec` tools for WhatsApp delegated execution.
 
 ## Running It
 
@@ -394,7 +397,7 @@ For each user turn it:
 Important design points:
 
 - MCP calls are active
-- local runtime tools such as `read_file`, `edit_file`, and `write_file` are active and workspace-scoped
+- local runtime tools such as `glob`, `read_file`, `edit_file`, `write_file`, and `bash` are active and workspace-scoped
 - the prompt-visible tool catalog stays static while per-step tool availability is enforced by the harness
 - observability is exposed as typed events collected in memory and returned to callers
 
@@ -406,7 +409,7 @@ Implemented:
 - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`
 - single-turn runtime with guardrails and typed state
 - delegated `mcp-executor` and `tool-executor` flows
-- local `read_file`, `write_file`, and `edit_file` execution
+- local `glob`, `read_file`, `write_file`, `edit_file`, and `bash` execution
 - tool policy evaluation with optional JSON overlay config
 - OpenAI adapter
 - in-memory control-plane session orchestration
@@ -420,7 +423,7 @@ Not implemented yet:
 - persistent storage beyond the in-memory control-plane store
 - authentication and authorization
 - end-to-end automated tests against a real WhatsApp account; the local WhatsApp Web bridge is implemented, but live pairing still needs manual verification
-- additional local tools beyond `read_file`, `write_file`, and `edit_file`
+- additional local tools beyond the current built-in workspace tool set
 - long-running job queue or distributed workers
 
 ## Development

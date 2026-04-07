@@ -13,11 +13,11 @@ use std::{
 };
 
 use agent_controlplane::{
-    ApprovalDecision, ApprovalRequestRecord, ApprovalState, ChannelKind, CreateSessionRequest,
-    CompleteWhatsAppLoginRequest, ReceiveWhatsAppMessageRequest, ReceiveWhatsAppMessageResponse,
-    SendSessionMessageRequest, SendSessionMessageResponse, SessionEvent, SessionId, SessionRecord,
-    SessionStatus, StartWhatsAppLoginResponse, SubmitApprovalRequest, TurnRecordSummary,
-    WhatsAppGatewayStatus,
+    ApprovalDecision, ApprovalRequestRecord, ApprovalState, ChannelKind,
+    CompleteWhatsAppLoginRequest, CreateSessionRequest, ReceiveWhatsAppMessageRequest,
+    ReceiveWhatsAppMessageResponse, SendSessionMessageRequest, SendSessionMessageResponse,
+    SessionEvent, SessionId, SessionRecord, SessionStatus, StartWhatsAppLoginResponse,
+    SubmitApprovalRequest, TurnRecordSummary, WhatsAppGatewayStatus,
 };
 use agent_runtime::{RuntimeEvent, TerminationReason};
 use futures_util::StreamExt;
@@ -131,12 +131,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Some("complete-login") => {
                 let login_session_id = args.next().ok_or_else(|| usage(&bin))?;
-                let status = complete_whatsapp_login(
-                    &request_client,
-                    &base_url,
-                    &login_session_id,
-                )
-                .await?;
+                let status =
+                    complete_whatsapp_login(&request_client, &base_url, &login_session_id).await?;
                 print_whatsapp_status(&theme, &status);
             }
             Some("logout") => {
@@ -995,8 +991,16 @@ fn print_whatsapp_status(theme: &CliTheme, status: &WhatsAppGatewayStatus) {
     };
     let lines = vec![
         format_kv(theme, "Account", &status.account_id),
-        format_kv(theme, "State", &format!("{:?}", status.connection_state).to_lowercase()),
-        format_kv(theme, "DM Policy", &format!("{:?}", status.dm_policy).to_lowercase()),
+        format_kv(
+            theme,
+            "State",
+            &format!("{:?}", status.connection_state).to_lowercase(),
+        ),
+        format_kv(
+            theme,
+            "DM Policy",
+            &format!("{:?}", status.dm_policy).to_lowercase(),
+        ),
         format_kv(theme, "Allow From", &allow_from),
         format_kv(
             theme,

@@ -256,9 +256,11 @@ impl Default for CapabilityPlaceholders {
     fn default() -> Self {
         Self {
             local_tools: vec![
+                "glob".to_owned(),
                 "read_file".to_owned(),
                 "edit_file".to_owned(),
                 "write_file".to_owned(),
+                "bash".to_owned(),
             ],
             memory_description: "Memory capability exists structurally but is inactive.".to_owned(),
             skills_description: "Skill capability exists structurally but is inactive.".to_owned(),

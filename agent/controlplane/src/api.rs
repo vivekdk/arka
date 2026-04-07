@@ -38,12 +38,11 @@ use crate::{
     runner::TurnRunner,
     service::{ControlPlaneError, ConversationStore, SessionService},
     types::{
-        ApiResponseFormat, ChannelDeliveryTarget, ChannelKind,
-        CompleteWhatsAppLoginRequest, CreateSessionRequest, DeliveryStatus,
-        ReceiveWhatsAppMessageRequest, ReceiveWhatsAppMessageResponse,
-        SendSessionMessageRequest, SendSessionMessageResponse, SessionEvent, SessionId,
-        StartWhatsAppLoginResponse, SubmitApprovalRequest, WhatsAppGatewayStatus,
-        WhatsAppWebhookPayload,
+        ApiResponseFormat, ChannelDeliveryTarget, ChannelKind, CompleteWhatsAppLoginRequest,
+        CreateSessionRequest, DeliveryStatus, ReceiveWhatsAppMessageRequest,
+        ReceiveWhatsAppMessageResponse, SendSessionMessageRequest, SendSessionMessageResponse,
+        SessionEvent, SessionId, StartWhatsAppLoginResponse, SubmitApprovalRequest,
+        WhatsAppGatewayStatus, WhatsAppWebhookPayload,
     },
     whatsapp::{WhatsAppConnector, WhatsAppGatewayError, WhatsAppGatewayHandle},
 };
@@ -460,7 +459,10 @@ where
             get(get_debug_history_turn::<R, S>),
         )
         .route("/channels/slack/events", post(handle_slack_event::<R, S>))
-        .route("/channels/whatsapp/status", get(get_whatsapp_status::<R, S>))
+        .route(
+            "/channels/whatsapp/status",
+            get(get_whatsapp_status::<R, S>),
+        )
         .route(
             "/channels/whatsapp/login/start",
             post(start_whatsapp_login::<R, S>),
@@ -470,7 +472,10 @@ where
             post(complete_whatsapp_login::<R, S>),
         )
         .route("/channels/whatsapp/logout", post(logout_whatsapp::<R, S>))
-        .route("/channels/whatsapp/inbound", post(handle_whatsapp_inbound::<R, S>))
+        .route(
+            "/channels/whatsapp/inbound",
+            post(handle_whatsapp_inbound::<R, S>),
+        )
         .route(
             "/channels/whatsapp/webhook",
             post(handle_whatsapp_event::<R, S>),

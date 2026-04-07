@@ -436,7 +436,11 @@ impl JsonlConversationStore {
             }
 
             let session: SessionRecord = read_json_file(session_path.as_path())?;
-            if session.bindings.iter().any(|candidate| candidate == binding) {
+            if session
+                .bindings
+                .iter()
+                .any(|candidate| candidate == binding)
+            {
                 let session_id = session.session_id.clone();
                 self.ensure_session_loaded(inner, &session_id)?;
                 return Ok(Some(session_id));
@@ -446,7 +450,10 @@ impl JsonlConversationStore {
         Ok(None)
     }
 
-    fn idempotency_seen_on_disk(&self, idempotency_key: &str) -> Result<bool, ConversationStoreError> {
+    fn idempotency_seen_on_disk(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<bool, ConversationStoreError> {
         let path = self.idempotency_path();
         if !path.exists() {
             return Ok(false);
@@ -463,13 +470,14 @@ impl JsonlConversationStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry = serde_json::from_str::<PersistedIdempotencyKey>(&line).map_err(|source| {
-                ConversationStoreError::Deserialize {
-                    path: path.clone(),
-                    line: index + 1,
-                    source,
-                }
-            })?;
+            let entry =
+                serde_json::from_str::<PersistedIdempotencyKey>(&line).map_err(|source| {
+                    ConversationStoreError::Deserialize {
+                        path: path.clone(),
+                        line: index + 1,
+                        source,
+                    }
+                })?;
             if entry.key == idempotency_key {
                 return Ok(true);
             }
@@ -495,7 +503,10 @@ impl ConversationStore for JsonlConversationStore {
         };
 
         create_dir_all(self.session_dir(&session.session_id).as_path())?;
-        write_json_file(self.session_snapshot_path(&session.session_id).as_path(), &session)?;
+        write_json_file(
+            self.session_snapshot_path(&session.session_id).as_path(),
+            &session,
+        )?;
 
         for binding in bindings {
             inner.bindings.insert(binding, session.session_id.clone());
@@ -503,7 +514,9 @@ impl ConversationStore for JsonlConversationStore {
         inner
             .sessions
             .insert(session.session_id.clone(), session.clone());
-        inner.messages.insert(session.session_id.clone(), Vec::new());
+        inner
+            .messages
+            .insert(session.session_id.clone(), Vec::new());
         Ok(session)
     }
 
@@ -653,7 +666,10 @@ impl ConversationStore for JsonlConversationStore {
     ) -> Result<(), ConversationStoreError> {
         let mut inner = self.inner.lock().await;
         self.ensure_session_loaded(&mut inner, &approval.session_id)?;
-        append_jsonl_file(self.approvals_path(&approval.session_id).as_path(), &approval)?;
+        append_jsonl_file(
+            self.approvals_path(&approval.session_id).as_path(),
+            &approval,
+        )?;
         inner.approvals.insert(
             (approval.session_id.clone(), approval.approval_id.clone()),
             approval,
@@ -762,12 +778,11 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Conversat
         create_dir_all(parent)?;
     }
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let payload = serde_json::to_vec_pretty(value).map_err(|source| {
-        ConversationStoreError::Serialize {
+    let payload =
+        serde_json::to_vec_pretty(value).map_err(|source| ConversationStoreError::Serialize {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     fs::write(&temp_path, payload).map_err(|source| ConversationStoreError::Io {
         path: temp_path.clone(),
         source,
@@ -791,9 +806,11 @@ fn append_jsonl_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Convers
             path: path.to_path_buf(),
             source,
         })?;
-    serde_json::to_writer(&mut file, value).map_err(|source| ConversationStoreError::Serialize {
-        path: path.to_path_buf(),
-        source,
+    serde_json::to_writer(&mut file, value).map_err(|source| {
+        ConversationStoreError::Serialize {
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     file.write_all(b"\n")
         .map_err(|source| ConversationStoreError::Io {
