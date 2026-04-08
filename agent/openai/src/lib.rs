@@ -27,7 +27,9 @@ use agent_runtime::{
         ModelAdapterResponse, ModelStepDecision, ModelStepRequest, SubagentAdapterResponse,
         SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
     },
-    state::{ResponseClient, ResponseFormat, UsageSummary},
+    policy::ToolMaskPlan,
+    state::{DelegationTarget, ResponseClient, ResponseFormat, UsageSummary},
+    tools::{ToolDescriptor, ToolFamily},
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -137,7 +139,7 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "subagent_step_decision",
-                    "schema": subagent_decision_schema(),
+                    "schema": subagent_decision_schema(&request.tool_mask_plan, &request.registered_tools),
                     "strict": true
                 }
             },
@@ -270,11 +272,7 @@ impl ModelAdapter for OpenAiModelAdapter {
 
         // The Responses API can surface generated text in multiple places.
         // Normalize those variants into one decision string before parsing it.
-        let decision_text = payload.extract_output_text().ok_or_else(|| {
-            ModelAdapterError::InvalidDecision(
-                "missing output_text and no assistant text found in output".to_owned(),
-            )
-        })?;
+        let decision_text = payload.extract_output_text()?;
         let decision = parse_decision_text(&decision_text)?;
 
         Ok(ModelAdapterResponse {
@@ -292,11 +290,7 @@ impl ModelAdapter for OpenAiModelAdapter {
         let payload = self
             .execute_responses_call(body, "subagent request", "subagent response", debug_sink)
             .await?;
-        let decision_text = payload.extract_output_text().ok_or_else(|| {
-            ModelAdapterError::InvalidDecision(
-                "missing output_text and no assistant text found in output".to_owned(),
-            )
-        })?;
+        let decision_text = payload.extract_output_text()?;
         let decision = parse_subagent_decision_text(&decision_text)?;
         Ok(SubagentAdapterResponse {
             decision,
@@ -319,11 +313,7 @@ impl ModelAdapter for OpenAiModelAdapter {
                 debug_sink,
             )
             .await?;
-        let response_text = payload.extract_output_text().ok_or_else(|| {
-            ModelAdapterError::InvalidDecision(
-                "missing output_text and no assistant text found in output".to_owned(),
-            )
-        })?;
+        let response_text = payload.extract_output_text()?;
         let parsed = parse_final_answer_render_text(&response_text)?;
         let canonical_text = if parsed.canonical_text.trim().is_empty() {
             request.answer_brief.clone()
@@ -443,9 +433,9 @@ fn is_sensitive_key(key: &str) -> bool {
 /// decision enum.
 ///
 /// The wire shape is slightly different from the runtime shape:
-/// `arguments_json` is emitted as a string so the schema can stay simple and
-/// strict. This function performs the second-stage parse for every MCP action
-/// before constructing `ModelStepDecision`.
+/// sub-agent tool arguments are accepted as structured JSON, with temporary
+/// fallback support for the older `arguments_json` string field. This function
+/// normalizes those variants before constructing `SubagentDecision`.
 fn parse_decision_text(decision_text: &str) -> Result<ModelStepDecision, ModelAdapterError> {
     let wire: OpenAiDecisionWire = serde_json::from_str(decision_text)
         .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?;
@@ -477,26 +467,36 @@ fn parse_subagent_decision_text(
     let wire: OpenAiSubagentDecisionWire = serde_json::from_str(decision_text)
         .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?;
     match wire.decision_type.as_str() {
-        "tool_call" => Ok(SubagentDecision::ToolCall {
+        "mcp_tool_call" => {
+            let arguments = parse_subagent_arguments(&wire, "mcp_tool_call")?;
+            Ok(SubagentDecision::McpToolCall {
+                server_name: wire.server_name.ok_or_else(|| {
+                    ModelAdapterError::InvalidDecision(
+                        "mcp_tool_call requires server_name".to_owned(),
+                    )
+                })?,
+                tool_name: wire.tool_name.unwrap_or_default(),
+                arguments,
+            })
+        }
+        "mcp_resource_read" => Ok(SubagentDecision::McpResourceRead {
             server_name: wire.server_name.ok_or_else(|| {
-                ModelAdapterError::InvalidDecision("tool_call requires server_name".to_owned())
-            })?,
-            tool_name: wire.tool_name.unwrap_or_default(),
-            arguments: serde_json::from_str(
-                &wire.arguments_json.unwrap_or_else(|| "{}".to_owned()),
-            )
-            .map_err(|error| {
-                ModelAdapterError::InvalidDecision(format!(
-                    "invalid tool_call arguments_json: {error}"
-                ))
-            })?,
-        }),
-        "resource_read" => Ok(SubagentDecision::ResourceRead {
-            server_name: wire.server_name.ok_or_else(|| {
-                ModelAdapterError::InvalidDecision("resource_read requires server_name".to_owned())
+                ModelAdapterError::InvalidDecision(
+                    "mcp_resource_read requires server_name".to_owned(),
+                )
             })?,
             resource_uri: wire.resource_uri.unwrap_or_default(),
         }),
+        "local_tool_call" => {
+            let arguments = parse_subagent_arguments(&wire, "local_tool_call")?;
+            Ok(SubagentDecision::LocalToolCall {
+                tool_name: agent_runtime::state::LocalToolName::new(
+                    wire.tool_name.unwrap_or_default(),
+                )
+                .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?,
+                arguments,
+            })
+        }
         "done" => Ok(SubagentDecision::Done {
             summary: wire.summary.unwrap_or_default(),
         }),
@@ -510,6 +510,52 @@ fn parse_subagent_decision_text(
         other => Err(ModelAdapterError::InvalidDecision(format!(
             "unsupported subagent decision type `{other}`"
         ))),
+    }
+}
+
+fn parse_subagent_arguments(
+    wire: &OpenAiSubagentDecisionWire,
+    decision_type: &str,
+) -> Result<Value, ModelAdapterError> {
+    if let Some(arguments) = &wire.arguments {
+        return Ok(prune_null_json(arguments.clone()));
+    }
+
+    if let Some(arguments_json) = &wire.arguments_json {
+        return serde_json::from_str(arguments_json)
+            .map(prune_null_json)
+            .map_err(|error| {
+                ModelAdapterError::InvalidDecision(format!(
+                    "invalid {decision_type} arguments_json: {error}"
+                ))
+            });
+    }
+
+    Ok(json!({}))
+}
+
+fn prune_null_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter_map(|(key, value)| {
+                    let normalized = prune_null_json(value);
+                    if normalized.is_null() {
+                        None
+                    } else {
+                        Some((key, normalized))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(prune_null_json)
+                .filter(|item| !item.is_null())
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -548,22 +594,178 @@ struct ResponsesCreateResponse {
 }
 
 impl ResponsesCreateResponse {
-    /// Returns the first non-empty assistant text found in the response.
+    /// Returns the single distinct non-empty assistant text found in the response.
     ///
-    /// The top-level `output_text` shortcut is preferred when present. If it is
-    /// absent or blank, the adapter walks the nested `output` structure to find
-    /// the first text-bearing content item.
-    fn extract_output_text(&self) -> Option<String> {
-        self.output_text
-            .as_deref()
-            .and_then(non_empty_text)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                self.output
-                    .iter()
-                    .find_map(extract_text_from_output_value)
-                    .map(ToOwned::to_owned)
+    /// The Responses API can repeat the same structured decision in multiple
+    /// nested message phases. Those duplicates are tolerated, but multiple
+    /// distinct decision texts are rejected so the runtime never silently picks
+    /// an arbitrary tool action.
+    ///
+    /// When OpenAI emits both an actionable decision and a terminal summary in
+    /// the same response, prefer the actionable one. Within the same class,
+    /// prefer `phase="final_answer"` candidates over commentary candidates.
+    ///
+    /// If the model emits multiple actionable commentary candidates in one
+    /// response, execute the first one in response order and let the runtime
+    /// continue the delegated loop on the next turn.
+    fn extract_output_text(&self) -> Result<String, ModelAdapterError> {
+        let mut candidates = Vec::new();
+        if let Some(text) = self.output_text.as_deref().and_then(non_empty_text) {
+            push_unique_output_text_candidate(&mut candidates, text, None);
+        }
+        for item in &self.output {
+            let phase = output_value_phase(item);
+            collect_output_text_candidates_from_output_value(item, phase, &mut candidates);
+        }
+
+        if candidates.is_empty() {
+            return Err(ModelAdapterError::InvalidDecision(
+                "missing output_text and no assistant text found in output".to_owned(),
+            ));
+        }
+
+        if let Some(text) = select_output_text_candidate(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.kind.is_action())
+                .filter(|candidate| candidate.phase.as_deref() == Some("final_answer")),
+            OutputTextSelectionMode::RequireUnique,
+        )? {
+            return Ok(text);
+        }
+
+        if let Some(text) = select_output_text_candidate(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.kind.is_action()),
+            OutputTextSelectionMode::FirstInResponse,
+        )? {
+            return Ok(text);
+        }
+
+        if let Some(text) = select_output_text_candidate(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.phase.as_deref() == Some("final_answer")),
+            OutputTextSelectionMode::RequireUnique,
+        )? {
+            return Ok(text);
+        }
+
+        select_output_text_candidate(candidates.iter(), OutputTextSelectionMode::RequireUnique)?
+            .ok_or_else(|| {
+                ModelAdapterError::InvalidDecision(
+                    "missing output_text and no assistant text found in output".to_owned(),
+                )
             })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputTextCandidateKind {
+    Action,
+    Terminal,
+    Unknown,
+}
+
+impl OutputTextCandidateKind {
+    fn is_action(self) -> bool {
+        matches!(self, Self::Action)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OutputTextCandidate {
+    text: String,
+    phase: Option<String>,
+    kind: OutputTextCandidateKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputTextSelectionMode {
+    RequireUnique,
+    FirstInResponse,
+}
+
+fn output_value_phase(value: &Value) -> Option<&str> {
+    value.as_object()?.get("phase")?.as_str()
+}
+
+fn collect_output_text_candidates_from_output_value(
+    value: &Value,
+    phase: Option<&str>,
+    candidates: &mut Vec<OutputTextCandidate>,
+) {
+    match value {
+        Value::String(text) => {
+            if let Some(text) = non_empty_text(text) {
+                push_unique_output_text_candidate(candidates, text, phase);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_output_text_candidates_from_output_value(item, phase, candidates);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(content) = map.get("content") {
+                collect_output_text_candidates_from_output_value(content, phase, candidates);
+            }
+            if let Some(text) = map.get("text") {
+                collect_output_text_candidates_from_output_value(text, phase, candidates);
+            }
+            if let Some(value) = map.get("value") {
+                collect_output_text_candidates_from_output_value(value, phase, candidates);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_unique_output_text_candidate(
+    candidates: &mut Vec<OutputTextCandidate>,
+    text: &str,
+    phase: Option<&str>,
+) {
+    if candidates.iter().any(|candidate| candidate.text == text) {
+        return;
+    }
+
+    candidates.push(OutputTextCandidate {
+        text: text.to_owned(),
+        phase: phase.map(str::to_owned),
+        kind: classify_output_text_candidate(text),
+    });
+}
+
+fn classify_output_text_candidate(text: &str) -> OutputTextCandidateKind {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return OutputTextCandidateKind::Unknown;
+    };
+
+    match value.get("type").and_then(Value::as_str) {
+        Some("delegate_subagent" | "mcp_tool_call" | "mcp_resource_read" | "local_tool_call") => {
+            OutputTextCandidateKind::Action
+        }
+        Some("final" | "done" | "partial" | "cannot_execute") => OutputTextCandidateKind::Terminal,
+        _ => OutputTextCandidateKind::Unknown,
+    }
+}
+
+fn select_output_text_candidate<'a>(
+    candidates: impl Iterator<Item = &'a OutputTextCandidate>,
+    mode: OutputTextSelectionMode,
+) -> Result<Option<String>, ModelAdapterError> {
+    let selected: Vec<&OutputTextCandidate> = candidates.collect();
+    match selected.len() {
+        0 => Ok(None),
+        1 => Ok(Some(selected[0].text.clone())),
+        count => match mode {
+            OutputTextSelectionMode::RequireUnique => Err(ModelAdapterError::InvalidDecision(
+                format!("multiple distinct output_text candidates found in response: {count}"),
+            )),
+            OutputTextSelectionMode::FirstInResponse => Ok(Some(selected[0].text.clone())),
+        },
     }
 }
 
@@ -611,7 +813,7 @@ struct OpenAiDecisionWire {
     #[serde(default)]
     goal: String,
     #[serde(default)]
-    target: Option<agent_runtime::state::McpCapabilityTarget>,
+    target: Option<DelegationTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -622,6 +824,8 @@ struct OpenAiSubagentDecisionWire {
     server_name: Option<agent_runtime::state::ServerName>,
     #[serde(default)]
     tool_name: Option<String>,
+    #[serde(default)]
+    arguments: Option<Value>,
     #[serde(default)]
     arguments_json: Option<String>,
     #[serde(default)]
@@ -679,14 +883,43 @@ fn decision_schema() -> Value {
             "subagent_type": { "type": "string" },
             "goal": { "type": "string" },
             "target": {
-                "type": ["object", "null"],
-                "required": ["server_name", "capability_kind", "capability_id"],
-                "properties": {
-                    "server_name": { "type": "string", "minLength": 1 },
-                    "capability_kind": { "type": "string", "enum": ["tool", "resource"] },
-                    "capability_id": { "type": "string", "minLength": 1 }
-                },
-                "additionalProperties": false
+                "anyOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["mcp_capability"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["server_name", "capability_kind", "capability_id"],
+                                "properties": {
+                                    "server_name": { "type": "string", "minLength": 1 },
+                                    "capability_kind": { "type": "string", "enum": ["tool", "resource"] },
+                                    "capability_id": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["local_tools_scope"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["scope"],
+                                "properties": {
+                                    "scope": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                ]
             }
         },
         "additionalProperties": false
@@ -705,24 +938,275 @@ fn final_answer_render_schema() -> Value {
     })
 }
 
-fn subagent_decision_schema() -> Value {
+fn subagent_decision_schema(
+    tool_mask_plan: &ToolMaskPlan,
+    registered_tools: &[ToolDescriptor],
+) -> Value {
+    let action_types = supported_subagent_action_types(tool_mask_plan);
+    let server_names = supported_server_names(tool_mask_plan);
+    let tool_names = supported_tool_names(tool_mask_plan);
+    let resource_uris = supported_resource_uris(tool_mask_plan);
+    let arguments_schema = merged_arguments_schema(tool_mask_plan, registered_tools);
+
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["type", "server_name", "tool_name", "arguments_json", "resource_uri", "summary", "reason"],
+        "required": ["type", "server_name", "tool_name", "arguments", "resource_uri", "summary", "reason"],
         "properties": {
-            "type": {
-                "type": "string",
-                "enum": ["tool_call", "resource_read", "done", "partial", "cannot_execute"]
-            },
-            "server_name": { "type": ["string", "null"] },
-            "tool_name": { "type": ["string", "null"] },
-            "arguments_json": { "type": ["string", "null"] },
-            "resource_uri": { "type": ["string", "null"] },
+            "type": { "type": "string", "enum": action_types },
+            "server_name": enum_or_null_schema(&server_names),
+            "tool_name": enum_or_null_schema(&tool_names),
+            "arguments": arguments_schema,
+            "resource_uri": enum_or_null_schema(&resource_uris),
             "summary": { "type": ["string", "null"] },
             "reason": { "type": ["string", "null"] }
         }
     })
+}
+
+fn supported_subagent_action_types(tool_mask_plan: &ToolMaskPlan) -> Vec<String> {
+    let mut action_types = vec![
+        "done".to_owned(),
+        "partial".to_owned(),
+        "cannot_execute".to_owned(),
+    ];
+    if !tool_mask_plan.allowed_mcp_tools.is_empty() {
+        action_types.push("mcp_tool_call".to_owned());
+    }
+    if !tool_mask_plan.allowed_mcp_resources.is_empty() {
+        action_types.push("mcp_resource_read".to_owned());
+    }
+    if !tool_mask_plan.allowed_local_tools.is_empty() {
+        action_types.push("local_tool_call".to_owned());
+    }
+    action_types
+}
+
+fn supported_server_names(tool_mask_plan: &ToolMaskPlan) -> Vec<String> {
+    let mut names = tool_mask_plan
+        .allowed_mcp_tools
+        .iter()
+        .map(|tool| tool.server_name.clone())
+        .chain(
+            tool_mask_plan
+                .allowed_mcp_resources
+                .iter()
+                .map(|resource| resource.server_name.clone()),
+        )
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn supported_tool_names(tool_mask_plan: &ToolMaskPlan) -> Vec<String> {
+    let mut names = tool_mask_plan
+        .allowed_mcp_tools
+        .iter()
+        .map(|tool| tool.tool_name.clone())
+        .chain(tool_mask_plan.allowed_local_tools.iter().cloned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn supported_resource_uris(tool_mask_plan: &ToolMaskPlan) -> Vec<String> {
+    let mut uris = tool_mask_plan
+        .allowed_mcp_resources
+        .iter()
+        .map(|resource| resource.resource_uri.clone())
+        .collect::<Vec<_>>();
+    uris.sort();
+    uris.dedup();
+    uris
+}
+
+fn enum_or_null_schema(values: &[String]) -> Value {
+    if values.is_empty() {
+        json!({ "type": "null" })
+    } else {
+        json!({
+            "anyOf": [
+                { "type": "null" },
+                { "type": "string", "enum": values }
+            ]
+        })
+    }
+}
+
+fn merged_arguments_schema(
+    tool_mask_plan: &ToolMaskPlan,
+    registered_tools: &[ToolDescriptor],
+) -> Value {
+    let mut properties = serde_json::Map::new();
+
+    for allowed in &tool_mask_plan.allowed_local_tools {
+        if let Some(tool) = registered_tools
+            .iter()
+            .find(|tool| tool.family == ToolFamily::Local && tool.name == *allowed)
+        {
+            merge_argument_properties(&mut properties, &strict_json_schema(&tool.input_schema));
+        }
+    }
+
+    for allowed in &tool_mask_plan.allowed_mcp_tools {
+        if let Some(tool) = registered_tools.iter().find(|tool| {
+            tool.family == ToolFamily::McpTool
+                && tool.server_name.as_ref().map(|name| name.as_str())
+                    == Some(allowed.server_name.as_str())
+                && tool.name == allowed.tool_name
+        }) {
+            merge_argument_properties(&mut properties, &strict_json_schema(&tool.input_schema));
+        }
+    }
+
+    let mut required = properties.keys().cloned().collect::<Vec<_>>();
+    required.sort();
+
+    json!({
+        "anyOf": [
+            { "type": "null" },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": properties,
+                "required": required
+            }
+        ]
+    })
+}
+
+fn merge_argument_properties(
+    merged_properties: &mut serde_json::Map<String, Value>,
+    schema: &Value,
+) {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+
+    for (name, property_schema) in properties {
+        let nullable_schema = ensure_nullable_schema(property_schema.clone());
+        match merged_properties.get_mut(name) {
+            Some(existing) => {
+                if *existing != nullable_schema {
+                    *existing = merge_schema_variants(existing.clone(), nullable_schema);
+                }
+            }
+            None => {
+                merged_properties.insert(name.clone(), nullable_schema);
+            }
+        }
+    }
+}
+
+fn ensure_nullable_schema(schema: Value) -> Value {
+    if schema_allows_null(&schema) {
+        schema
+    } else {
+        json!({
+            "anyOf": [
+                schema,
+                { "type": "null" }
+            ]
+        })
+    }
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("null") {
+                return true;
+            }
+            map.get("anyOf")
+                .and_then(Value::as_array)
+                .map(|variants| variants.iter().any(schema_allows_null))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn merge_schema_variants(left: Value, right: Value) -> Value {
+    let mut variants = Vec::new();
+    append_schema_variant(&mut variants, left);
+    append_schema_variant(&mut variants, right);
+    json!({ "anyOf": variants })
+}
+
+fn append_schema_variant(variants: &mut Vec<Value>, schema: Value) {
+    if let Some(items) = schema.get("anyOf").and_then(Value::as_array) {
+        for item in items {
+            append_schema_variant(variants, item.clone());
+        }
+        return;
+    }
+
+    if !variants.iter().any(|existing| existing == &schema) {
+        variants.push(schema);
+    }
+}
+
+fn strict_json_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut normalized = serde_json::Map::new();
+            let mut property_keys = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>());
+            if let Some(keys) = property_keys.as_mut() {
+                keys.sort();
+            }
+            for (key, value) in map {
+                let normalized_value = match key.as_str() {
+                    "properties" => Value::Object(
+                        value
+                            .as_object()
+                            .map(|properties| {
+                                properties
+                                    .iter()
+                                    .map(|(name, schema)| {
+                                        (name.clone(), strict_json_schema(schema))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    "items" => strict_json_schema(value),
+                    "prefixItems" | "anyOf" | "oneOf" | "allOf" => Value::Array(
+                        value
+                            .as_array()
+                            .map(|items| items.iter().map(strict_json_schema).collect())
+                            .unwrap_or_default(),
+                    ),
+                    _ => strict_json_schema(value),
+                };
+                normalized.insert(key.clone(), normalized_value);
+            }
+
+            if map.get("type").and_then(Value::as_str) == Some("object")
+                || map.contains_key("properties")
+            {
+                normalized.insert("additionalProperties".to_owned(), Value::Bool(false));
+                normalized.insert(
+                    "required".to_owned(),
+                    Value::Array(
+                        property_keys
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(strict_json_schema).collect()),
+        _ => schema.clone(),
+    }
 }
 
 fn response_client_name(client: ResponseClient) -> &'static str {
@@ -743,43 +1227,6 @@ fn response_format_name(format: ResponseFormat) -> &'static str {
     }
 }
 
-/// Recursively searches a Responses API `output` item for the first text value.
-///
-/// The Responses API can nest text inside arrays of output items or inside a
-/// `content` list on message objects. This helper walks those structures
-/// without caring about unrelated keys.
-fn extract_text_from_output_value(value: &Value) -> Option<&str> {
-    match value {
-        Value::Array(items) => items.iter().find_map(extract_text_from_output_value),
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(extract_text_field) {
-                return Some(text);
-            }
-
-            map.get("content")
-                .and_then(Value::as_array)
-                .and_then(|items| items.iter().find_map(extract_text_from_output_value))
-        }
-        _ => None,
-    }
-}
-
-/// Extracts text from one `text` field in either string or object form.
-///
-/// Some Responses API payloads expose text directly as a string, while others
-/// wrap it in an object containing a `value` field. This helper normalizes both
-/// representations and rejects blank strings.
-fn extract_text_field(value: &Value) -> Option<&str> {
-    match value {
-        Value::String(text) => non_empty_text(text),
-        Value::Object(map) => map
-            .get("value")
-            .and_then(Value::as_str)
-            .and_then(non_empty_text),
-        _ => None,
-    }
-}
-
 /// Returns `Some(text)` only when the string contains non-whitespace content.
 fn non_empty_text(text: &str) -> Option<&str> {
     if text.trim().is_empty() {
@@ -793,7 +1240,9 @@ fn non_empty_text(text: &str) -> Option<&str> {
 mod tests {
     use agent_runtime::{
         model::ModelStepRequest,
+        policy::ToolMaskPlan,
         state::{ModelConfig, PromptSection, PromptSnapshot, UsageSummary},
+        tools::{ToolDescriptor, builtin_local_tool_catalog},
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -801,7 +1250,7 @@ mod tests {
     use super::{
         OpenAiAdapterError, OpenAiModelAdapter, OpenAiUsage, ResponsesCreateResponse,
         decision_schema, format_provider_error, parse_decision_text, parse_subagent_decision_text,
-        subagent_decision_schema,
+        prune_null_json, subagent_decision_schema,
     };
 
     #[test]
@@ -824,6 +1273,8 @@ mod tests {
                 }],
             },
             model_config: ModelConfig::new("gpt-5.4"),
+            registered_tools: Vec::new(),
+            tool_mask_plan: ToolMaskPlan::terminal_only("main agent has no direct tools"),
         };
 
         let body = adapter.build_request_body(&request);
@@ -838,7 +1289,7 @@ mod tests {
     #[test]
     fn parses_delegate_subagent_decision() {
         let decision = parse_decision_text(
-            r#"{"type":"delegate_subagent","content":"","subagent_type":"tool-executor","goal":"run a query","target":{"server_name":"postgres","capability_kind":"tool","capability_id":"run-sql"}}"#,
+            r#"{"type":"delegate_subagent","content":"","subagent_type":"mcp-executor","goal":"run a query","target":{"kind":"mcp_capability","value":{"server_name":"postgres","capability_kind":"tool","capability_id":"run-sql"}}}"#,
         )
         .expect("decision should parse");
 
@@ -846,14 +1297,16 @@ mod tests {
             decision,
             agent_runtime::model::ModelStepDecision::DelegateSubagent {
                 delegation: agent_runtime::model::SubagentDelegationRequest {
-                    subagent_type: "tool-executor".to_owned(),
+                    subagent_type: "mcp-executor".to_owned(),
                     goal: "run a query".to_owned(),
-                    target: agent_runtime::state::McpCapabilityTarget {
-                        server_name: agent_runtime::state::ServerName::new("postgres")
-                            .expect("valid server name"),
-                        capability_kind: mcp_metadata::CapabilityKind::Tool,
-                        capability_id: "run-sql".to_owned(),
-                    },
+                    target: agent_runtime::state::DelegationTarget::McpCapability(
+                        agent_runtime::state::McpCapabilityTarget {
+                            server_name: agent_runtime::state::ServerName::new("postgres")
+                                .expect("valid server name"),
+                            capability_kind: mcp_metadata::CapabilityKind::Tool,
+                            capability_id: "run-sql".to_owned(),
+                        }
+                    ),
                 }
             }
         );
@@ -877,7 +1330,7 @@ mod tests {
     #[test]
     fn parses_subagent_done_decision() {
         let decision = parse_subagent_decision_text(
-            r#"{"type":"done","server_name":null,"tool_name":null,"arguments_json":null,"resource_uri":null,"summary":"completed task","reason":null}"#,
+            r#"{"type":"done","server_name":null,"tool_name":null,"arguments":null,"resource_uri":null,"summary":"completed task","reason":null}"#,
         )
         .expect("subagent done should parse");
 
@@ -890,29 +1343,317 @@ mod tests {
     }
 
     #[test]
+    fn parses_subagent_local_tool_write_file_decision() {
+        let decision = parse_subagent_decision_text(
+            r#"{"type":"local_tool_call","server_name":null,"tool_name":"write_file","arguments":{"path":"scripts/chart.py","content":"print('ok')\n"},"resource_uri":null,"summary":"write plotting script","reason":"need a reproducible script"}"#,
+        )
+        .expect("local tool call should parse");
+
+        assert_eq!(
+            decision,
+            agent_runtime::model::SubagentDecision::LocalToolCall {
+                tool_name: agent_runtime::state::LocalToolName::new("write_file")
+                    .expect("valid local tool"),
+                arguments: json!({
+                    "path": "scripts/chart.py",
+                    "content": "print('ok')\n",
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_subagent_arguments_and_prunes_null_placeholders() {
+        let decision = parse_subagent_decision_text(
+            r#"{"type":"mcp_tool_call","server_name":"ex-vol","tool_name":"list_tables","arguments":{"database":"volonte","include_detailed_columns":true,"like":null},"resource_uri":null,"summary":"list tables","reason":"inspect schema"}"#,
+        )
+        .expect("mcp tool call should parse");
+
+        assert_eq!(
+            decision,
+            agent_runtime::model::SubagentDecision::McpToolCall {
+                server_name: agent_runtime::state::ServerName::new("ex-vol")
+                    .expect("valid server name"),
+                tool_name: "list_tables".to_owned(),
+                arguments: json!({
+                    "database": "volonte",
+                    "include_detailed_columns": true,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_legacy_subagent_local_tool_arguments_json() {
+        let decision = parse_subagent_decision_text(
+            r#"{"type":"local_tool_call","server_name":null,"tool_name":"write_file","arguments":null,"arguments_json":"{\"path\":\"scripts/chart.py\",\"content\":\"print('ok')\\n\"}","resource_uri":null,"summary":"write plotting script","reason":"need a reproducible script"}"#,
+        )
+        .expect("legacy arguments_json should still parse");
+
+        assert_eq!(
+            decision,
+            agent_runtime::model::SubagentDecision::LocalToolCall {
+                tool_name: agent_runtime::state::LocalToolName::new("write_file")
+                    .expect("valid local tool"),
+                arguments: json!({
+                    "path": "scripts/chart.py",
+                    "content": "print('ok')\n",
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_subagent_local_tool_call_with_unescaped_multiline_arguments_json() {
+        let error = parse_subagent_decision_text(
+            "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments_json\":\"{\\\"command\\\":\\\"python3 - <<'PY'\nprint('hi')\nPY\\\",\\\"timeout_ms\\\":10000}\",\"resource_uri\":null,\"summary\":\"run inline python\",\"reason\":\"test malformed nested json\"}",
+        )
+        .expect_err("malformed nested json should fail");
+
+        assert!(matches!(
+            error,
+            agent_runtime::model::ModelAdapterError::InvalidDecision(message)
+                if message.contains("control character")
+        ));
+    }
+
+    #[test]
     fn subagent_schema_supports_terminal_loop_variants() {
-        let schema = subagent_decision_schema();
+        let schema = subagent_decision_schema(&ToolMaskPlan::terminal_only("none"), &[]);
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("allOf").is_none());
+        assert!(schema.get("enum").is_none());
+        assert!(schema.get("not").is_none());
+        assert_eq!(
+            schema["properties"]["type"]["enum"],
+            json!(["done", "partial", "cannot_execute"])
+        );
+        assert_eq!(
+            schema["properties"]["arguments"]["anyOf"][0]["type"],
+            json!("null")
+        );
+        assert_eq!(
+            schema["properties"]["arguments"]["anyOf"][1]["required"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn subagent_schema_uses_strict_local_tool_arguments_schema() {
+        let tools = builtin_local_tool_catalog();
+        let schema = subagent_decision_schema(
+            &ToolMaskPlan {
+                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
+                allowed_tool_ids: vec!["local.write_file".to_owned()],
+                denied_tool_ids: Vec::new(),
+                decisions: Vec::new(),
+                allowed_local_tools: vec!["write_file".to_owned()],
+                allowed_mcp_tools: Vec::new(),
+                allowed_mcp_resources: Vec::new(),
+            },
+            &tools,
+        );
+        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
+
+        assert_eq!(arguments["additionalProperties"], json!(false));
+        assert_eq!(arguments["required"], json!(["content", "path"]));
+        assert_eq!(
+            arguments["properties"]["content"]["anyOf"],
+            json!([
+                { "type": "string" },
+                { "type": "null" }
+            ])
+        );
+    }
+
+    #[test]
+    fn subagent_schema_strictifies_mcp_tool_arguments_schema() {
+        let server = agent_runtime::state::ServerName::new("postgres").expect("valid server");
+        let tools = vec![ToolDescriptor::mcp_tool(
+            &server,
+            "run-sql",
+            None,
+            None,
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                }
+            }),
+        )];
+        let schema = subagent_decision_schema(
+            &ToolMaskPlan {
+                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
+                allowed_tool_ids: vec!["mcp.postgres.tool.run-sql".to_owned()],
+                denied_tool_ids: Vec::new(),
+                decisions: Vec::new(),
+                allowed_local_tools: Vec::new(),
+                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
+                    server_name: "postgres".to_owned(),
+                    tool_name: "run-sql".to_owned(),
+                }],
+                allowed_mcp_resources: Vec::new(),
+            },
+            &tools,
+        );
+        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
+
+        assert_eq!(arguments["additionalProperties"], json!(false));
+        assert_eq!(arguments["required"], json!(["query"]));
+    }
+
+    #[test]
+    fn subagent_schema_requires_all_mcp_argument_properties_for_strict_mode() {
+        let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
+        let tools = vec![ToolDescriptor::mcp_tool(
+            &server,
+            "list_tables",
+            None,
+            None,
+            json!({
+                "type": "object",
+                "required": ["database"],
+                "properties": {
+                    "database": { "type": "string" },
+                    "like": {
+                        "anyOf": [
+                            { "type": "string" },
+                            { "type": "null" }
+                        ],
+                        "default": null
+                    },
+                    "include_detailed_columns": {
+                        "type": "boolean",
+                        "default": true
+                    }
+                }
+            }),
+        )];
+        let schema = subagent_decision_schema(
+            &ToolMaskPlan {
+                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
+                allowed_tool_ids: vec!["mcp.ex-vol.tool.list_tables".to_owned()],
+                denied_tool_ids: Vec::new(),
+                decisions: Vec::new(),
+                allowed_local_tools: Vec::new(),
+                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
+                    server_name: "ex-vol".to_owned(),
+                    tool_name: "list_tables".to_owned(),
+                }],
+                allowed_mcp_resources: Vec::new(),
+            },
+            &tools,
+        );
+        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
+
+        assert_eq!(
+            arguments["required"],
+            json!(["database", "include_detailed_columns", "like"])
+        );
+    }
+
+    #[test]
+    fn subagent_schema_merges_multiple_allowed_tool_variants_without_top_level_branching() {
+        let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
+        let mut tools = builtin_local_tool_catalog();
+        tools.push(ToolDescriptor::mcp_tool(
+            &server,
+            "list_tables",
+            None,
+            None,
+            json!({
+                "type": "object",
+                "required": ["database"],
+                "properties": {
+                    "database": { "type": "string" },
+                    "include_detailed_columns": {
+                        "type": "boolean",
+                        "default": true
+                    }
+                }
+            }),
+        ));
+        let schema = subagent_decision_schema(
+            &ToolMaskPlan {
+                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
+                allowed_tool_ids: vec![
+                    "local.bash".to_owned(),
+                    "mcp.ex-vol.tool.list_tables".to_owned(),
+                    "mcp.ex-vol.resource.schema://users".to_owned(),
+                ],
+                denied_tool_ids: Vec::new(),
+                decisions: Vec::new(),
+                allowed_local_tools: vec!["bash".to_owned()],
+                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
+                    server_name: "ex-vol".to_owned(),
+                    tool_name: "list_tables".to_owned(),
+                }],
+                allowed_mcp_resources: vec![agent_runtime::policy::AllowedMcpResource {
+                    server_name: "ex-vol".to_owned(),
+                    resource_uri: "schema://users".to_owned(),
+                }],
+            },
+            &tools,
+        );
+
+        assert_eq!(schema["type"], json!("object"));
+        assert!(schema.get("anyOf").is_none());
         assert_eq!(
             schema["properties"]["type"]["enum"],
             json!([
-                "tool_call",
-                "resource_read",
                 "done",
                 "partial",
-                "cannot_execute"
+                "cannot_execute",
+                "mcp_tool_call",
+                "mcp_resource_read",
+                "local_tool_call"
             ])
         );
         assert_eq!(
-            schema["required"],
+            schema["properties"]["server_name"]["anyOf"][1]["enum"],
+            json!(["ex-vol"])
+        );
+        assert_eq!(
+            schema["properties"]["tool_name"]["anyOf"][1]["enum"],
+            json!(["bash", "list_tables"])
+        );
+        assert_eq!(
+            schema["properties"]["resource_uri"]["anyOf"][1]["enum"],
+            json!(["schema://users"])
+        );
+        assert_eq!(
+            schema["properties"]["arguments"]["anyOf"][1]["required"],
             json!([
-                "type",
-                "server_name",
-                "tool_name",
-                "arguments_json",
-                "resource_uri",
-                "summary",
-                "reason"
+                "command",
+                "database",
+                "include_detailed_columns",
+                "timeout_ms"
             ])
+        );
+    }
+
+    #[test]
+    fn prune_null_json_removes_nested_null_placeholders() {
+        assert_eq!(
+            prune_null_json(json!({
+                "database": "volonte",
+                "like": null,
+                "options": {
+                    "include_detailed_columns": true,
+                    "page_token": null
+                },
+                "items": [1, null, 2]
+            })),
+            json!({
+                "database": "volonte",
+                "options": {
+                    "include_detailed_columns": true
+                },
+                "items": [1, 2]
+            })
         );
     }
 
@@ -930,10 +1671,10 @@ mod tests {
         .expect("payload should parse");
 
         assert_eq!(
-            payload.extract_output_text().as_deref(),
-            Some(
-                "{\"type\":\"final\",\"content\":\"done\",\"subagent_type\":\"\",\"goal\":\"\",\"target\":null}"
-            )
+            payload
+                .extract_output_text()
+                .expect("payload should contain one decision"),
+            "{\"type\":\"final\",\"content\":\"done\",\"subagent_type\":\"\",\"goal\":\"\",\"target\":null}"
         );
     }
 
@@ -953,8 +1694,203 @@ mod tests {
         .expect("payload should parse");
 
         assert_eq!(
-            payload.extract_output_text().as_deref(),
-            Some("{\"type\":\"final\",\"content\":\"done\",\"calls\":[]}")
+            payload
+                .extract_output_text()
+                .expect("payload should contain one decision"),
+            "{\"type\":\"final\",\"content\":\"done\",\"calls\":[]}"
+        );
+    }
+
+    #[test]
+    fn extracts_decision_text_when_duplicate_candidates_match() {
+        let decision = "{\"type\":\"done\",\"server_name\":null,\"tool_name\":null,\"arguments\":null,\"resource_uri\":null,\"summary\":\"completed task\",\"reason\":null}";
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output_text": decision,
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": decision
+                }]
+            }]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_output_text()
+                .expect("duplicate candidates should collapse"),
+            decision
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_distinct_decision_text_candidates() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"write_file\",\"arguments\":{\"path\":\"outputs/data.csv\",\"content\":\"a,b\\n1,2\\n\"},\"resource_uri\":null,\"summary\":\"write csv\",\"reason\":\"stage data\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"python3 scripts/plot.py\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"run plot\",\"reason\":\"generate chart\"}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        let error = payload
+            .extract_output_text()
+            .expect_err("multiple distinct candidates should fail");
+        assert!(matches!(
+            error,
+            agent_runtime::model::ModelAdapterError::InvalidDecision(message)
+                if message.contains("multiple distinct output_text candidates")
+        ));
+    }
+
+    #[test]
+    fn extract_output_text_prefers_final_answer_phase_over_commentary_candidates() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":\"volonte\",\"include_detailed_columns\":false,\"like\":\"%checkin%\",\"not_like\":\"%response%\",\"page_size\":50,\"page_token\":null,\"query\":null},\"resource_uri\":null,\"summary\":\"Schema discovery suggests weekly active users may be inferred from check-in responses. Next step is to run a SELECT query for weekly distinct users and compare recent weeks.\",\"reason\":\"Need a query to compute week-on-week user counts from the most relevant engagement table(s).\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for Volonte.\",\"reason\":\"Execute the weekly distinct user count query on volonte.checkin_responses to complete the delegated goal.\"}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_output_text()
+                .expect("final answer candidate should win"),
+            "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for Volonte.\",\"reason\":\"Execute the weekly distinct user count query on volonte.checkin_responses to complete the delegated goal.\"}"
+        );
+    }
+
+    #[test]
+    fn extract_output_text_prefers_actionable_commentary_over_terminal_final_answer() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"delegate_subagent\",\"content\":\"Generate the requested bar/line combo visualization from the already-computed weekly series using a reproducible Python script and save output files in the workspace.\",\"goal\":\"Create chart artifact for week-on-week user count visualization\",\"subagent_type\":\"tool-executor\",\"target\":{\"kind\":\"local_tools_scope\",\"value\":{\"scope\":\"workspace\"}}}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"final\",\"content\":\"I’ve generated the chart and saved it in the workspace.\",\"goal\":\"Respond to user with completed visualization result and file paths\",\"subagent_type\":\"tool-executor\",\"target\":null}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_output_text()
+                .expect("actionable commentary candidate should win"),
+            "{\"type\":\"delegate_subagent\",\"content\":\"Generate the requested bar/line combo visualization from the already-computed weekly series using a reproducible Python script and save output files in the workspace.\",\"goal\":\"Create chart artifact for week-on-week user count visualization\",\"subagent_type\":\"tool-executor\",\"target\":{\"kind\":\"local_tools_scope\",\"value\":{\"scope\":\"workspace\"}}}"
+        );
+    }
+
+    #[test]
+    fn extract_output_text_prefers_actionable_tool_call_over_terminal_done() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"mkdir -p outputs scripts && python3 scripts/generate_missing_file_viz.py\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"Generate the visualization artifact and print its path.\",\"reason\":\"Need to create the missing visualization before returning a path.\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"done\",\"server_name\":null,\"tool_name\":null,\"arguments\":null,\"resource_uri\":null,\"summary\":\"Created a visualization artifact acknowledging the missing file/data context. Exact path: outputs/missing-file-visualization.png\",\"reason\":null}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_output_text()
+                .expect("actionable tool call should win over terminal done"),
+            "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"mkdir -p outputs scripts && python3 scripts/generate_missing_file_viz.py\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"Generate the visualization artifact and print its path.\",\"reason\":\"Need to create the missing visualization before returning a path.\"}"
+        );
+    }
+
+    #[test]
+    fn extract_output_text_uses_first_commentary_action_when_multiple_actions_are_emitted() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"mkdir -p outputs scripts && printf 'week_start,user_count\\n2026-04-05,25\\n' > outputs/week_on_week_user_count.csv\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"Materialize the computed rows into CSV.\",\"reason\":\"Need a local data file before plotting.\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"python3 scripts/plot_week_on_week_user_count.py\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"Generate the line chart from the CSV.\",\"reason\":\"Produce the requested visualization artifact.\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"done\",\"server_name\":null,\"tool_name\":null,\"arguments\":null,\"resource_uri\":null,\"summary\":\"Generated the requested line chart and saved it as outputs/week_on_week_user_count_line_chart.png.\",\"reason\":null}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_output_text()
+                .expect("first commentary action should be selected"),
+            "{\"type\":\"local_tool_call\",\"server_name\":null,\"tool_name\":\"bash\",\"arguments\":{\"command\":\"mkdir -p outputs scripts && printf 'week_start,user_count\\n2026-04-05,25\\n' > outputs/week_on_week_user_count.csv\",\"timeout_ms\":120000},\"resource_uri\":null,\"summary\":\"Materialize the computed rows into CSV.\",\"reason\":\"Need a local data file before plotting.\"}"
         );
     }
 

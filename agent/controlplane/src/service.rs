@@ -14,7 +14,8 @@ use std::{
 };
 
 use agent_runtime::{
-    ConversationMessage, ConversationRole, ResponseClient, ResponseFormat, ResponseTarget,
+    ConversationMessage, ConversationRole, MessageRecord, ResponseClient, ResponseFormat,
+    ResponseTarget, TurnRecord,
 };
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -25,15 +26,21 @@ use uuid::Uuid;
 
 use crate::{
     observability::{RuntimeHarnessListener, SseRuntimeHarnessListener},
-    runner::{TurnRunner, TurnRunnerError, TurnRunnerInput, TurnRunnerOutput},
+    runner::{
+        GeneratedArtifact, GeneratedArtifactKind, TurnRunner, TurnRunnerError, TurnRunnerInput,
+        TurnRunnerOutput,
+    },
     types::{
         ApprovalDecision, ApprovalId, ApprovalRequestRecord, ApprovalState, ChannelBinding,
         ChannelDeliveryTarget, ChannelDispatchResult, ChannelEnvelope, ChannelIntent, ChannelKind,
-        ChannelResponseEnvelope, CreateSessionRequest, DeliveryStatus, OutboundMessageKind,
-        SessionEvent, SessionId, SessionMessage, SessionMessageId, SessionMessageRole,
-        SessionRecord, SessionStatus, SubmitApprovalRequest, TurnRecordSummary,
+        ChannelLocalImageAttachment, ChannelResponseAttachment, ChannelResponseEnvelope,
+        CreateSessionRequest, DeliveryStatus, OutboundMessageKind, SessionEvent, SessionId,
+        SessionMessage, SessionMessageId, SessionMessageRole, SessionRecord, SessionStatus,
+        SubmitApprovalRequest, TurnRecordSummary,
     },
 };
+
+const RECENT_COMPUTED_RESULTS_LIMIT: usize = 6;
 
 /// Store abstraction so the session layer can later move beyond in-memory
 /// persistence without changing orchestration logic.
@@ -70,6 +77,20 @@ pub trait ConversationStore: Send + Sync {
 
     /// Lists messages for one session in insertion order.
     async fn list_messages(&self, session_id: &SessionId) -> Vec<SessionMessage>;
+
+    /// Stores reusable computed results emitted during one runtime turn.
+    async fn append_turn_trace(
+        &self,
+        session_id: &SessionId,
+        turn: &TurnRecord,
+    ) -> Result<(), ConversationStoreError>;
+
+    /// Lists recent computed results from prior turns in insertion order.
+    async fn list_recent_computed_results(
+        &self,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Vec<MessageRecord>;
 
     /// Updates the session status and optional turn summary.
     async fn update_session(
@@ -139,6 +160,7 @@ struct InMemoryState {
     sessions: HashMap<SessionId, SessionRecord>,
     bindings: HashMap<ChannelBinding, SessionId>,
     messages: HashMap<SessionId, Vec<SessionMessage>>,
+    computed_results: HashMap<SessionId, Vec<MessageRecord>>,
     approvals: HashMap<(SessionId, ApprovalId), ApprovalRequestRecord>,
     idempotency_keys: HashSet<String>,
 }
@@ -250,6 +272,37 @@ impl ConversationStore for InMemoryConversationStore {
             .unwrap_or_default()
     }
 
+    async fn append_turn_trace(
+        &self,
+        session_id: &SessionId,
+        turn: &TurnRecord,
+    ) -> Result<(), ConversationStoreError> {
+        let mut inner = self.inner.lock().await;
+        let computed = computed_results_from_turn(turn);
+        if computed.is_empty() {
+            return Ok(());
+        }
+        inner
+            .computed_results
+            .entry(session_id.clone())
+            .or_default()
+            .extend(computed);
+        Ok(())
+    }
+
+    async fn list_recent_computed_results(
+        &self,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Vec<MessageRecord> {
+        let inner = self.inner.lock().await;
+        let Some(messages) = inner.computed_results.get(session_id) else {
+            return Vec::new();
+        };
+        let start = messages.len().saturating_sub(limit);
+        messages[start..].to_vec()
+    }
+
     async fn update_session(
         &self,
         session_id: &SessionId,
@@ -357,6 +410,10 @@ impl JsonlConversationStore {
         self.session_dir(session_id).join("approvals.jsonl")
     }
 
+    fn computed_results_path(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir(session_id).join("computed_results.jsonl")
+    }
+
     fn idempotency_path(&self) -> PathBuf {
         self.root_dir.join("idempotency_keys.jsonl")
     }
@@ -394,6 +451,12 @@ impl JsonlConversationStore {
         } else {
             Vec::new()
         };
+        let computed_results_path = self.computed_results_path(session_id);
+        let computed_results = if computed_results_path.exists() {
+            read_jsonl_file::<MessageRecord>(computed_results_path.as_path())?
+        } else {
+            Vec::new()
+        };
 
         for binding in &session.bindings {
             inner.bindings.insert(binding.clone(), session_id.clone());
@@ -405,6 +468,9 @@ impl JsonlConversationStore {
             );
         }
         inner.messages.insert(session_id.clone(), messages);
+        inner
+            .computed_results
+            .insert(session_id.clone(), computed_results);
         inner.sessions.insert(session_id.clone(), session);
         Ok(())
     }
@@ -436,7 +502,11 @@ impl JsonlConversationStore {
             }
 
             let session: SessionRecord = read_json_file(session_path.as_path())?;
-            if session.bindings.iter().any(|candidate| candidate == binding) {
+            if session
+                .bindings
+                .iter()
+                .any(|candidate| candidate == binding)
+            {
                 let session_id = session.session_id.clone();
                 self.ensure_session_loaded(inner, &session_id)?;
                 return Ok(Some(session_id));
@@ -446,7 +516,10 @@ impl JsonlConversationStore {
         Ok(None)
     }
 
-    fn idempotency_seen_on_disk(&self, idempotency_key: &str) -> Result<bool, ConversationStoreError> {
+    fn idempotency_seen_on_disk(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<bool, ConversationStoreError> {
         let path = self.idempotency_path();
         if !path.exists() {
             return Ok(false);
@@ -463,13 +536,14 @@ impl JsonlConversationStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry = serde_json::from_str::<PersistedIdempotencyKey>(&line).map_err(|source| {
-                ConversationStoreError::Deserialize {
-                    path: path.clone(),
-                    line: index + 1,
-                    source,
-                }
-            })?;
+            let entry =
+                serde_json::from_str::<PersistedIdempotencyKey>(&line).map_err(|source| {
+                    ConversationStoreError::Deserialize {
+                        path: path.clone(),
+                        line: index + 1,
+                        source,
+                    }
+                })?;
             if entry.key == idempotency_key {
                 return Ok(true);
             }
@@ -495,7 +569,10 @@ impl ConversationStore for JsonlConversationStore {
         };
 
         create_dir_all(self.session_dir(&session.session_id).as_path())?;
-        write_json_file(self.session_snapshot_path(&session.session_id).as_path(), &session)?;
+        write_json_file(
+            self.session_snapshot_path(&session.session_id).as_path(),
+            &session,
+        )?;
 
         for binding in bindings {
             inner.bindings.insert(binding, session.session_id.clone());
@@ -503,7 +580,12 @@ impl ConversationStore for JsonlConversationStore {
         inner
             .sessions
             .insert(session.session_id.clone(), session.clone());
-        inner.messages.insert(session.session_id.clone(), Vec::new());
+        inner
+            .messages
+            .insert(session.session_id.clone(), Vec::new());
+        inner
+            .computed_results
+            .insert(session.session_id.clone(), Vec::new());
         Ok(session)
     }
 
@@ -607,6 +689,45 @@ impl ConversationStore for JsonlConversationStore {
         inner.messages.get(session_id).cloned().unwrap_or_default()
     }
 
+    async fn append_turn_trace(
+        &self,
+        session_id: &SessionId,
+        turn: &TurnRecord,
+    ) -> Result<(), ConversationStoreError> {
+        let mut inner = self.inner.lock().await;
+        self.ensure_session_loaded(&mut inner, session_id)?;
+        let computed = computed_results_from_turn(turn);
+        if computed.is_empty() {
+            return Ok(());
+        }
+        for message in &computed {
+            append_jsonl_file(self.computed_results_path(session_id).as_path(), message)?;
+        }
+        inner
+            .computed_results
+            .entry(session_id.clone())
+            .or_default()
+            .extend(computed);
+        Ok(())
+    }
+
+    async fn list_recent_computed_results(
+        &self,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Vec<MessageRecord> {
+        let mut inner = self.inner.lock().await;
+        if let Err(err) = self.ensure_session_loaded(&mut inner, session_id) {
+            error!(session_id = %session_id, error = %err, "failed to lazily load session computed results");
+            return Vec::new();
+        }
+        let Some(messages) = inner.computed_results.get(session_id) else {
+            return Vec::new();
+        };
+        let start = messages.len().saturating_sub(limit);
+        messages[start..].to_vec()
+    }
+
     async fn update_session(
         &self,
         session_id: &SessionId,
@@ -653,7 +774,10 @@ impl ConversationStore for JsonlConversationStore {
     ) -> Result<(), ConversationStoreError> {
         let mut inner = self.inner.lock().await;
         self.ensure_session_loaded(&mut inner, &approval.session_id)?;
-        append_jsonl_file(self.approvals_path(&approval.session_id).as_path(), &approval)?;
+        append_jsonl_file(
+            self.approvals_path(&approval.session_id).as_path(),
+            &approval,
+        )?;
         inner.approvals.insert(
             (approval.session_id.clone(), approval.approval_id.clone()),
             approval,
@@ -762,12 +886,11 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Conversat
         create_dir_all(parent)?;
     }
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let payload = serde_json::to_vec_pretty(value).map_err(|source| {
-        ConversationStoreError::Serialize {
+    let payload =
+        serde_json::to_vec_pretty(value).map_err(|source| ConversationStoreError::Serialize {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     fs::write(&temp_path, payload).map_err(|source| ConversationStoreError::Io {
         path: temp_path.clone(),
         source,
@@ -791,9 +914,11 @@ fn append_jsonl_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Convers
             path: path.to_path_buf(),
             source,
         })?;
-    serde_json::to_writer(&mut file, value).map_err(|source| ConversationStoreError::Serialize {
-        path: path.to_path_buf(),
-        source,
+    serde_json::to_writer(&mut file, value).map_err(|source| {
+        ConversationStoreError::Serialize {
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     file.write_all(b"\n")
         .map_err(|source| ConversationStoreError::Io {
@@ -805,6 +930,14 @@ fn append_jsonl_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Convers
         source,
     })?;
     Ok(())
+}
+
+fn computed_results_from_turn(turn: &TurnRecord) -> Vec<MessageRecord> {
+    turn.messages
+        .iter()
+        .filter(|message| matches!(message, MessageRecord::McpResult(_)))
+        .cloned()
+        .collect()
 }
 
 /// Session orchestration service shared by HTTP routes and channel adapters.
@@ -1160,6 +1293,7 @@ where
                         session_id: session.session_id.clone(),
                         kind: OutboundMessageKind::Status,
                         text: "started a new session for this thread".to_owned(),
+                        attachment: None,
                         delivery_target,
                     }],
                     approval: None,
@@ -1189,6 +1323,7 @@ where
                         session_id: session.session_id.clone(),
                         kind: OutboundMessageKind::Status,
                         text: format!("approval {} recorded", approval.approval_id),
+                        attachment: None,
                         delivery_target,
                     }],
                     approval: Some(approval),
@@ -1208,6 +1343,7 @@ where
                         session_id: session.session_id,
                         kind: OutboundMessageKind::Status,
                         text: "session interrupted".to_owned(),
+                        attachment: None,
                         delivery_target,
                     }],
                     approval: None,
@@ -1227,6 +1363,7 @@ where
                         session_id: session.session_id,
                         kind: OutboundMessageKind::Status,
                         text: "session resumed".to_owned(),
+                        attachment: None,
                         delivery_target,
                     }],
                     approval: None,
@@ -1254,6 +1391,7 @@ where
                         session_id: session.session_id.clone(),
                         kind: OutboundMessageKind::Status,
                         text: format!("session status: {:?}", session.status),
+                        attachment: None,
                         delivery_target,
                     }],
                     session,
@@ -1320,6 +1458,10 @@ where
                 SessionMessageRole::System => None,
             })
             .collect::<Vec<_>>();
+        let recent_session_messages = self
+            .store
+            .list_recent_computed_results(&session_id, RECENT_COMPUTED_RESULTS_LIMIT)
+            .await;
 
         let turn = self
             .runner
@@ -1327,6 +1469,7 @@ where
                 session_id: session_id.clone(),
                 turn_number,
                 conversation_history,
+                recent_session_messages,
                 user_message: text,
                 response_target,
                 runtime_harness_listeners: self
@@ -1347,8 +1490,10 @@ where
                 termination,
                 usage,
                 events: _events,
-                turn: _turn,
+                turn,
+                generated_artifacts,
             }) => {
+                self.store.append_turn_trace(&session_id, &turn).await?;
                 let assistant_message = SessionMessage {
                     message_id: SessionMessageId::new(),
                     session_id: session_id.clone(),
@@ -1388,6 +1533,7 @@ where
                         session_id,
                         kind: OutboundMessageKind::Reply,
                         text: display_text,
+                        attachment: slack_generated_attachment(channel, &generated_artifacts),
                         delivery_target,
                     }],
                     approval: None,
@@ -1412,6 +1558,7 @@ where
                         session_id,
                         kind: OutboundMessageKind::Error,
                         text: error.to_string(),
+                        attachment: None,
                         delivery_target,
                     }],
                     approval: None,
@@ -1458,6 +1605,157 @@ fn response_target_for_channel(channel: ChannelKind) -> ResponseTarget {
             client: ResponseClient::WhatsApp,
             format: ResponseFormat::WhatsAppText,
         },
+    }
+}
+
+fn slack_generated_attachment(
+    channel: ChannelKind,
+    generated_artifacts: &[GeneratedArtifact],
+) -> Option<ChannelResponseAttachment> {
+    if !matches!(channel, ChannelKind::Slack) {
+        return None;
+    }
+    let artifact = generated_artifacts
+        .iter()
+        .rev()
+        .find(|artifact| matches!(artifact.kind, GeneratedArtifactKind::Image))?;
+    Some(ChannelResponseAttachment::LocalImage(
+        ChannelLocalImageAttachment {
+            file_name: artifact.file_name.clone(),
+            alt_text: humanize_artifact_name(&artifact.file_name),
+            mime_type: artifact.mime_type.clone(),
+            caption: None,
+            local_path: Some(artifact.path.display().to_string()),
+        },
+    ))
+}
+
+fn humanize_artifact_name(file_name: &str) -> String {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    let mut label = String::with_capacity(stem.len());
+    let mut previous_was_space = false;
+    for ch in stem.chars() {
+        let mapped = if ch == '_' || ch == '-' { ' ' } else { ch };
+        if mapped == ' ' {
+            if !previous_was_space {
+                label.push(mapped);
+            }
+            previous_was_space = true;
+        } else {
+            label.push(mapped);
+            previous_was_space = false;
+        }
+    }
+    if label.trim().is_empty() {
+        "Generated chart".to_owned()
+    } else {
+        label
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use agent_runtime::{
+        MessageId, StepRecord, TerminationReason, TurnId, UsageSummary,
+        state::{McpCapabilityTarget, McpResultMessageRecord, UserMessageRecord},
+    };
+    use mcp_metadata::CapabilityKind;
+
+    use super::*;
+
+    #[test]
+    fn computed_results_from_turn_keeps_only_mcp_results() {
+        let turn = TurnRecord {
+            turn_id: TurnId::new(),
+            started_at: SystemTime::now(),
+            ended_at: SystemTime::now(),
+            steps: Vec::<StepRecord>::new(),
+            messages: vec![
+                MessageRecord::User(UserMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    content: "show weekly users".to_owned(),
+                }),
+                MessageRecord::McpResult(McpResultMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    target: McpCapabilityTarget {
+                        server_name: agent_runtime::ServerName::new("ex-vol")
+                            .expect("valid server"),
+                        capability_kind: CapabilityKind::Tool,
+                        capability_id: "run_select_query".to_owned(),
+                    },
+                    result_summary: "{\"rows\":[[\"2026-04-05\",8]]}".to_owned(),
+                    error: None,
+                }),
+            ],
+            final_text: Some("done".to_owned()),
+            termination: TerminationReason::Final,
+            usage: UsageSummary::default(),
+        };
+
+        let computed = computed_results_from_turn(&turn);
+
+        assert_eq!(computed.len(), 1);
+        assert!(matches!(computed[0], MessageRecord::McpResult(_)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_returns_recent_computed_results_in_order() {
+        let store = InMemoryConversationStore::default();
+        let session = store
+            .create_session(Vec::new())
+            .await
+            .expect("session should create");
+        let first = sample_turn("2026-03-29", 14);
+        let second = sample_turn("2026-04-05", 8);
+
+        store
+            .append_turn_trace(&session.session_id, &first)
+            .await
+            .expect("first turn should persist");
+        store
+            .append_turn_trace(&session.session_id, &second)
+            .await
+            .expect("second turn should persist");
+
+        let recent = store
+            .list_recent_computed_results(&session.session_id, 2)
+            .await;
+
+        assert_eq!(recent.len(), 2);
+        assert!(recent[0].summary_line().contains("2026-03-29"));
+        assert!(recent[1].summary_line().contains("2026-04-05"));
+    }
+
+    fn sample_turn(week_start: &str, new_users: u32) -> TurnRecord {
+        TurnRecord {
+            turn_id: TurnId::new(),
+            started_at: SystemTime::now(),
+            ended_at: SystemTime::now(),
+            steps: Vec::<StepRecord>::new(),
+            messages: vec![MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: agent_runtime::ServerName::new("ex-vol").expect("valid server"),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "run_select_query".to_owned(),
+                },
+                result_summary: format!(
+                    "{{\"columns\":[\"week_start\",\"new_users\"],\"rows\":[[\"{week_start}\",{new_users}]]}}"
+                ),
+                error: None,
+            })],
+            final_text: Some("done".to_owned()),
+            termination: TerminationReason::Final,
+            usage: UsageSummary::default(),
+        }
     }
 }
 

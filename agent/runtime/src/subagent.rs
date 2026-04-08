@@ -100,11 +100,30 @@ impl SubagentRegistry {
     ) -> Result<&ConfiguredSubagent, SubagentConfigError> {
         self.subagents
             .iter()
-            .find(|subagent| subagent.enabled && subagent.subagent_type == subagent_type)
+            .find(|subagent| {
+                subagent.enabled && matches_subagent_identifier(subagent, subagent_type)
+            })
             .ok_or_else(|| SubagentConfigError::UnknownSubagent {
                 subagent_type: subagent_type.to_owned(),
             })
     }
+}
+
+fn matches_subagent_identifier(configured: &ConfiguredSubagent, requested: &str) -> bool {
+    configured.subagent_type == requested
+        || configured.display_name == requested
+        || canonicalize_subagent_identifier(&configured.subagent_type)
+            == canonicalize_subagent_identifier(requested)
+        || canonicalize_subagent_identifier(&configured.display_name)
+            == canonicalize_subagent_identifier(requested)
+}
+
+fn canonicalize_subagent_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
 }
 
 pub fn load_subagent_prompt(
@@ -141,7 +160,10 @@ fn default_true() -> bool {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{ConfiguredSubagent, load_subagent_prompt, render_subagent_prompt};
+    use super::{
+        ConfiguredSubagent, SubagentConfigError, SubagentRegistry, load_subagent_prompt,
+        render_subagent_prompt,
+    };
 
     #[test]
     fn subagent_prompt_replaces_mcp_server_details_tag() {
@@ -179,8 +201,97 @@ mod tests {
         .expect("tool-executor prompt should load");
 
         assert!(rendered.contains("You are the `tool-executor` sub-agent."));
-        assert!(rendered.contains("# MCP Full: postgres"));
+        assert!(rendered.contains(
+            "`glob` finds workspace-relative file or directory paths matching a glob pattern, with optional exclude globs."
+        ));
+        assert!(rendered.contains("`read_file` reads the full UTF-8 contents of one file."));
+        assert!(rendered.contains("`write_file` writes the full UTF-8 contents of one file."));
+        assert!(rendered.contains(
+            "`edit_file` replaces exactly one matching `old_text` block with `new_text` in a UTF-8 file."
+        ));
+        assert!(rendered.contains(
+            "`bash` runs one non-interactive bash command in the working directory and returns the exit code plus captured stdout and stderr."
+        ));
+        assert!(rendered.contains("Prefer `glob` for path discovery before opening files."));
+        assert!(rendered.contains(
+            "Use `read_file` before mutating when the current file contents are not already known."
+        ));
+        assert!(rendered.contains(
+            "If `edit_file` cannot find the requested text, read the file again and reassess before continuing."
+        ));
+        assert!(rendered.contains(
+            "If `bash` output is noisy or truncated, narrow the command and try again instead of guessing."
+        ));
+        assert!(rendered.contains(
+            "The delegated prompt will include the working directory and the available local tools."
+        ));
         assert!(!rendered.contains("<dynamic variable: MCP server details>"));
+    }
+
+    #[test]
+    fn get_enabled_accepts_display_name_and_normalized_identifier() {
+        let registry = SubagentRegistry {
+            subagents: vec![ConfiguredSubagent {
+                subagent_type: "mcp-executor".to_owned(),
+                display_name: "Mcp Executor".to_owned(),
+                purpose: "Run MCP work".to_owned(),
+                when_to_use: "When an MCP action is needed".to_owned(),
+                target_requirements: "mcp capability".to_owned(),
+                result_summary: "Executes delegated MCP work".to_owned(),
+                prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+                enabled: true,
+                model_name: None,
+            }],
+        };
+
+        assert_eq!(
+            registry
+                .get_enabled("mcp-executor")
+                .expect("canonical type should resolve")
+                .display_name,
+            "Mcp Executor"
+        );
+        assert_eq!(
+            registry
+                .get_enabled("Mcp Executor")
+                .expect("display name should resolve")
+                .subagent_type,
+            "mcp-executor"
+        );
+        assert_eq!(
+            registry
+                .get_enabled("MCP Executor")
+                .expect("normalized display name should resolve")
+                .subagent_type,
+            "mcp-executor"
+        );
+    }
+
+    #[test]
+    fn get_enabled_still_rejects_unknown_identifier() {
+        let registry = SubagentRegistry {
+            subagents: vec![ConfiguredSubagent {
+                subagent_type: "tool-executor".to_owned(),
+                display_name: "Tool Executor".to_owned(),
+                purpose: "Run local tool work".to_owned(),
+                when_to_use: "When local tools are needed".to_owned(),
+                target_requirements: "local tools scope".to_owned(),
+                result_summary: "Executes delegated local tool work".to_owned(),
+                prompt_path: PathBuf::from("subagents/tool-executor.prompt.md"),
+                enabled: true,
+                model_name: None,
+            }],
+        };
+
+        let error = registry
+            .get_enabled("missing-subagent")
+            .expect_err("unknown identifier should fail");
+
+        assert!(matches!(
+            error,
+            SubagentConfigError::UnknownSubagent { subagent_type }
+                if subagent_type == "missing-subagent"
+        ));
     }
 
     fn workspace_root() -> PathBuf {

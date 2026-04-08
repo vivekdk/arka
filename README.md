@@ -23,9 +23,9 @@ The system is layered deliberately:
 2. `agent/runtime`
    - owns the single-turn execution loop
    - builds prompts from canonical state records
-   - executes MCP actions
+   - executes MCP actions and local tools
    - emits typed runtime events
-   - keeps local tools, memory, skills, and sub-agents as typed placeholders only
+   - evaluates tool-availability policy and produces per-step tool masks
 3. `agent/openai`
    - OpenAI Responses API adapter behind the runtime `ModelAdapter` trait
 4. `agent/controlplane`
@@ -70,9 +70,11 @@ Current variables:
 
 ```dotenv
 OPENAI_API_KEY=
-MODEL_NAME=gpt-5.4
+MODEL_NAME=gpt-5.4-mini
 SYSTEM_PROMPT=config/prompt.md
 MCP_REGISTRY_PATH=config/mcp_servers.json
+SUBAGENT_REGISTRY_PATH=config/subagents.json
+TOOL_POLICY_PATH=
 SESSION_STORE_DIR=data/sessions
 ```
 
@@ -80,10 +82,11 @@ SESSION_STORE_DIR=data/sessions
 
 Supported dynamic tags:
 
-- `<dynamic variable: working_directory>`
-- `<dynamic variable: current_date and time>`
+- `<dynamic variable: working_directory>`: renders the session workspace path, which defaults to `<cwd>/.arka/tmp/<session_id>`
+- `<dynamic variable: current_date and time>`: renders the local date only, in `YYYY-MM-DD` format
 - `<dynamic variable: available MCPs>`
-- `<dynamic variable: available tools>`
+- `<dynamic variable: available sub-agents>`
+- `<dynamic variable: available tools>`: renders a generic runtime-managed tools notice rather than enumerating the tool catalog
 
 Optional variables:
 
@@ -91,6 +94,7 @@ Optional variables:
 BIND_ADDR=127.0.0.1:8080
 ENABLED_MCP_SERVERS=sqlite
 AGENT_API_BASE_URL=http://127.0.0.1:8080
+AGENT_REQUEST_TIMEOUT_SECS=240
 SLACK_BOT_TOKEN=
 SLACK_SIGNING_SECRET=
 SLACK_API_BASE_URL=https://slack.com/api
@@ -104,13 +108,17 @@ WHATSAPP_EVENT_QUEUE_CAPACITY=256
 WHATSAPP_BRIDGE_BASE_URL=http://127.0.0.1:8091
 RUNTIME_MAX_STEPS_PER_TURN=8
 RUNTIME_MAX_MCP_CALLS_PER_STEP=4
-RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=8
+RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=25
 RUNTIME_MAX_SUBAGENT_MCP_CALLS_PER_INVOCATION=4
-RUNTIME_TURN_TIMEOUT_SECS=180
+RUNTIME_TURN_TIMEOUT_SECS=420
 RUNTIME_MCP_CALL_TIMEOUT_SECS=10
 ```
 
 Environment variables exported by your shell still override `.env`.
+
+`AGENT_REQUEST_TIMEOUT_SECS` controls how long the CLI waits for a message-send
+response from the control-plane API. Raise it if your turn budget or MCP work
+regularly exceeds the default.
 
 ### MCP registry
 
@@ -198,7 +206,34 @@ Validation rules enforced by `mcp-config`:
 
 `SESSION_STORE_DIR` defaults to `data/sessions`. That directory contains generated
 session state, message transcripts, and channel metadata and should remain local
-runtime data, not committed source.
+runtime data, not committed source. Generated analysis scripts and outputs live
+separately under `.arka/tmp/<session_id>/`.
+
+### Sub-agents
+
+The default sub-agent registry is `config/subagents.json`.
+
+Current built-in executors:
+
+- `mcp-executor`: delegated MCP tool/resource execution
+- `tool-executor`: delegated local tool execution inside the session working directory
+
+Current built-in local tools:
+
+- `glob`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `bash`
+
+### Tool policy
+
+`TOOL_POLICY_PATH` is optional. When set, it should point to a JSON overlay file
+that adjusts the default Rust tool policy rules without changing the static tool
+catalog in the prompt.
+
+Start from `config/tool_policy.example.json` if you want an overlay.
+The default policy denies `file_write` and `command_exec` tools for WhatsApp delegated execution.
 
 ## Running It
 
@@ -215,6 +250,25 @@ cargo run -p mcp-cli -- inspect --server sqlite --config /path/to/mcp_servers.js
 ```
 
 ### 2. Start the control-plane server
+
+Create a local `.env` first. A minimal setup is:
+
+```dotenv
+OPENAI_API_KEY=...
+MODEL_NAME=gpt-5.4-mini
+SYSTEM_PROMPT=config/prompt.md
+MCP_REGISTRY_PATH=config/mcp_servers.json
+SUBAGENT_REGISTRY_PATH=config/subagents.json
+SESSION_STORE_DIR=data/sessions
+```
+
+Optional policy overlay:
+
+```dotenv
+TOOL_POLICY_PATH=config/tool_policy.json
+```
+
+If you use a policy overlay, create it from `config/tool_policy.example.json`.
 
 ```bash
 cargo run -p agent-controlplane --bin server
@@ -340,14 +394,17 @@ For each user turn it:
 1. builds a prompt from typed conversation and turn records
 2. calls the model through the `ModelAdapter` trait
 3. validates the model decision
-4. executes MCP calls when requested
-5. records typed messages and runtime events
-6. returns a `TurnOutcome`
+4. delegates to `mcp-executor` or `tool-executor` when requested
+5. executes MCP calls or local tools through the delegated executor
+6. evaluates tool policy and emits per-step tool masks
+7. records typed messages and runtime events
+7. returns a `TurnOutcome`
 
 Important design points:
 
 - MCP calls are active
-- local runtime tools such as `read_file`, `edit_file`, and `write_file` are modeled separately from MCP and remain inactive placeholders
+- local runtime tools such as `glob`, `read_file`, `edit_file`, `write_file`, and `bash` are active and workspace-scoped
+- the prompt-visible tool catalog stays static while per-step tool availability is enforced by the harness
 - observability is exposed as typed events collected in memory and returned to callers
 
 ## Current State
@@ -357,6 +414,9 @@ Implemented:
 - MCP registry loading and validation
 - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`
 - single-turn runtime with guardrails and typed state
+- delegated `mcp-executor` and `tool-executor` flows
+- local `glob`, `read_file`, `write_file`, `edit_file`, and `bash` execution
+- tool policy evaluation with optional JSON overlay config
 - OpenAI adapter
 - in-memory control-plane session orchestration
 - API routes, SSE events, approvals, idempotency
@@ -369,7 +429,7 @@ Not implemented yet:
 - persistent storage beyond the in-memory control-plane store
 - authentication and authorization
 - end-to-end automated tests against a real WhatsApp account; the local WhatsApp Web bridge is implemented, but live pairing still needs manual verification
-- richer local tool execution
+- additional local tools beyond the current built-in workspace tool set
 - long-running job queue or distributed workers
 
 ## Development

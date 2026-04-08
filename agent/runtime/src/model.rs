@@ -8,8 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::state::{
-    McpCapabilityTarget, ModelConfig, PromptSnapshot, ResponseTarget, ServerName, UsageSummary,
+use crate::{
+    policy::ToolMaskPlan,
+    state::{
+        DelegationTarget, LocalToolName, ModelConfig, PromptSnapshot, ResponseTarget, ServerName,
+        UsageSummary,
+    },
+    tools::ToolDescriptor,
 };
 
 /// Request sent from the runtime to a model adapter for one step.
@@ -21,6 +26,10 @@ pub struct ModelStepRequest {
     pub prompt: PromptSnapshot,
     /// Provider and model selection for the call.
     pub model_config: ModelConfig,
+    /// Static registered tool catalog relevant to the current request.
+    pub registered_tools: Vec<ToolDescriptor>,
+    /// Harness-evaluated tool constraints for the current step.
+    pub tool_mask_plan: ToolMaskPlan,
 }
 
 /// Result returned by a model adapter after evaluating one step prompt.
@@ -107,7 +116,7 @@ pub struct SubagentDelegationRequest {
     #[serde(rename = "type")]
     pub subagent_type: String,
     /// Structured target selected by the main agent.
-    pub target: McpCapabilityTarget,
+    pub target: DelegationTarget,
     /// Short statement of what the delegated action should achieve.
     #[serde(default)]
     pub goal: String,
@@ -119,6 +128,8 @@ pub struct SubagentStepRequest {
     pub subagent_type: String,
     pub prompt: String,
     pub model_config: ModelConfig,
+    pub registered_tools: Vec<ToolDescriptor>,
+    pub tool_mask_plan: ToolMaskPlan,
 }
 
 /// Result returned by a sub-agent model call.
@@ -132,15 +143,20 @@ pub struct SubagentAdapterResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentDecision {
-    ToolCall {
+    McpToolCall {
         server_name: ServerName,
         tool_name: String,
         #[serde(default)]
         arguments: Value,
     },
-    ResourceRead {
+    McpResourceRead {
         server_name: ServerName,
         resource_uri: String,
+    },
+    LocalToolCall {
+        tool_name: LocalToolName,
+        #[serde(default)]
+        arguments: Value,
     },
     Done {
         summary: String,

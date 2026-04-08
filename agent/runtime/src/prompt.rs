@@ -6,19 +6,19 @@
 
 use std::{
     collections::BTreeMap,
-    env,
     fmt::Write,
     fs,
     path::{Path, PathBuf},
 };
 
 use thiserror::Error;
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::state::{
     ConversationMessage, McpCapability, MessageRecord, PromptSection, PromptSnapshot,
     ResponseClient, ResponseFormat, ResponseTarget, SubagentCard, format_system_time,
 };
+use crate::tools::ToolDescriptor;
 
 const WORKING_DIRECTORY_TAG: &str = "<dynamic variable: working_directory>";
 const CURRENT_DATE_TIME_TAG: &str = "<dynamic variable: current_date and time>";
@@ -36,10 +36,6 @@ pub enum PromptRenderError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to determine current working directory: {0}")]
-    CurrentWorkingDirectory(#[source] std::io::Error),
-    #[error("failed to format current date and time: {0}")]
-    CurrentDateTime(#[source] time::error::Format),
 }
 
 /// Builds prompt snapshots from canonical runtime state.
@@ -53,6 +49,7 @@ impl PromptAssembler {
         &self,
         system_prompt: &str,
         conversation_history: &[ConversationMessage],
+        recent_session_messages: &[MessageRecord],
         current_turn_messages: &[MessageRecord],
     ) -> PromptSnapshot {
         let mut sections = Vec::new();
@@ -65,6 +62,12 @@ impl PromptAssembler {
             title: "Conversation History".to_owned(),
             content: render_history(conversation_history),
         });
+        if !recent_session_messages.is_empty() {
+            sections.push(PromptSection {
+                title: "Recent Session Computed Results".to_owned(),
+                content: render_recent_session_results(recent_session_messages),
+            });
+        }
         sections.push(PromptSection {
             title: "Current Turn Context".to_owned(),
             content: render_turn_context(current_turn_messages),
@@ -83,8 +86,10 @@ impl PromptAssembler {
 /// Reads the prompt template from disk and replaces supported dynamic tags.
 pub fn load_and_render_system_prompt(
     path: &Path,
+    working_directory: &Path,
     mcp_capabilities: &[McpCapability],
     subagent_cards: &[SubagentCard],
+    available_tools: &[ToolDescriptor],
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
     let template =
@@ -93,41 +98,53 @@ pub fn load_and_render_system_prompt(
             source,
         })?;
 
-    render_system_prompt(&template, mcp_capabilities, subagent_cards, response_target)
+    render_system_prompt(
+        &template,
+        working_directory,
+        mcp_capabilities,
+        subagent_cards,
+        available_tools,
+        response_target,
+    )
 }
 
 fn render_system_prompt(
     template: &str,
+    working_directory: &Path,
     mcp_capabilities: &[McpCapability],
     subagent_cards: &[SubagentCard],
+    available_tools: &[ToolDescriptor],
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
     // Dynamic prompt tags are expanded late so each turn sees the current
-    // working directory, local time, and enabled MCP catalog.
-    let working_directory = env::current_dir()
-        .map_err(PromptRenderError::CurrentWorkingDirectory)?
-        .display()
-        .to_string();
-    let current_date_time = render_current_date_time()?;
+    // working directory, local date, and enabled MCP catalog.
+    let working_directory = working_directory.display().to_string();
+    let current_date = render_current_date();
 
     Ok(template
         .replace(WORKING_DIRECTORY_TAG, &working_directory)
-        .replace(CURRENT_DATE_TIME_TAG, &current_date_time)
+        .replace(CURRENT_DATE_TIME_TAG, &current_date)
         .replace(AVAILABLE_MCPS_TAG, &render_available_mcps(mcp_capabilities))
         .replace(
             AVAILABLE_SUBAGENTS_TAG,
             &render_available_subagents(subagent_cards),
         )
-        .replace(AVAILABLE_TOOLS_TAG, "None")
-        .replace(RESPONSE_TARGET_TAG, &render_response_target(response_target)))
+        .replace(
+            AVAILABLE_TOOLS_TAG,
+            &render_available_tools(available_tools),
+        )
+        .replace(
+            RESPONSE_TARGET_TAG,
+            &render_response_target(response_target),
+        ))
 }
 
-fn render_current_date_time() -> Result<String, PromptRenderError> {
+fn render_current_date() -> String {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     OffsetDateTime::now_utc()
         .to_offset(offset)
-        .format(&Rfc3339)
-        .map_err(PromptRenderError::CurrentDateTime)
+        .date()
+        .to_string()
 }
 
 fn render_history(history: &[ConversationMessage]) -> String {
@@ -159,6 +176,20 @@ fn render_turn_context(messages: &[MessageRecord]) -> String {
         .map(MessageRecord::summary_line)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_recent_session_results(messages: &[MessageRecord]) -> String {
+    let rendered = messages
+        .iter()
+        .filter(|message| matches!(message, MessageRecord::McpResult(_)))
+        .map(MessageRecord::summary_line)
+        .collect::<Vec<_>>();
+
+    if rendered.is_empty() {
+        "No recent computed results from prior turns are available.".to_owned()
+    } else {
+        rendered.join("\n")
+    }
 }
 
 fn render_available_mcps(capabilities: &[McpCapability]) -> String {
@@ -228,6 +259,15 @@ fn render_available_subagents(cards: &[SubagentCard]) -> String {
         .join("\n\n")
 }
 
+fn render_available_tools(tools: &[ToolDescriptor]) -> String {
+    if tools.is_empty() {
+        return "No runtime-managed tools are currently enabled.".to_owned();
+    }
+
+    "Tool availability is managed by the runtime harness and policy engine. Use only the tools exposed at execution time."
+        .to_owned()
+}
+
 fn render_response_target(target: &ResponseTarget) -> String {
     let client = match target.client {
         ResponseClient::Api => "api",
@@ -266,10 +306,11 @@ mod tests {
         ids::MessageId,
         prompt::load_and_render_system_prompt,
         state::{
-            ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability, MessageRecord,
-            ResponseClient, ResponseFormat, ResponseTarget, ServerName, SubagentCard,
-            format_system_time,
+            ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability,
+            McpCapabilityTarget, McpResultMessageRecord, MessageRecord, ResponseClient,
+            ResponseFormat, ResponseTarget, ServerName, SubagentCard, format_system_time,
         },
+        tools::builtin_local_tool_catalog,
     };
 
     use super::PromptAssembler;
@@ -284,6 +325,7 @@ mod tests {
                 role: ConversationRole::User,
                 content: "hello".to_owned(),
             }],
+            &[],
             &[MessageRecord::Llm(LlmMessageRecord {
                 message_id: MessageId::new(),
                 timestamp: std::time::SystemTime::now(),
@@ -305,6 +347,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_recent_session_computed_results_section_when_present() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            &[],
+            &[MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: std::time::SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: ServerName::new("ex-vol").expect("valid server"),
+                    capability_kind: mcp_metadata::CapabilityKind::Tool,
+                    capability_id: "run_select_query".to_owned(),
+                },
+                result_summary: "{\"rows\":[[\"2026-04-05\",8]]}".to_owned(),
+                error: None,
+            })],
+            &[],
+        );
+
+        assert!(
+            prompt
+                .rendered
+                .contains("## Recent Session Computed Results")
+        );
+        assert!(prompt.rendered.contains("run_select_query"));
+        assert!(prompt.rendered.contains("2026-04-05"));
+    }
+
+    #[test]
     fn system_prompt_template_replaces_supported_dynamic_tags() {
         let temp_dir =
             std::env::temp_dir().join(format!("agent-runtime-prompt-test-{}", std::process::id()));
@@ -318,6 +389,7 @@ mod tests {
 
         let rendered = load_and_render_system_prompt(
             &template_path,
+            &temp_dir,
             &[McpCapability {
                 server_name: ServerName::new("sqlite").expect("valid server"),
                 server_description: Some("SQLite workspace access".to_owned()),
@@ -334,6 +406,7 @@ mod tests {
                 target_requirements: "server_name, capability_kind, capability_id".to_owned(),
                 result_summary: "Returns a tool call or resource read".to_owned(),
             }],
+            &builtin_local_tool_catalog(),
             &ResponseTarget {
                 client: ResponseClient::Slack,
                 format: ResponseFormat::SlackMrkdwn,
@@ -341,15 +414,37 @@ mod tests {
         )
         .expect("prompt should render");
 
-        assert!(rendered.contains("CWD: "));
-        assert!(rendered.contains("Date: "));
+        let cwd_line = rendered
+            .lines()
+            .find(|line| line.starts_with("CWD: "))
+            .expect("cwd line should render");
+        assert_eq!(cwd_line, format!("CWD: {}", temp_dir.display()));
+
+        let date_line = rendered
+            .lines()
+            .find(|line| line.starts_with("Date: "))
+            .expect("date line should render");
+        let date_value = date_line.trim_start_matches("Date: ");
+        assert_eq!(date_value.len(), 10);
+        assert!(
+            date_value
+                .chars()
+                .enumerate()
+                .all(|(index, ch)| match index {
+                    4 | 7 => ch == '-',
+                    _ => ch.is_ascii_digit(),
+                })
+        );
+        assert!(!date_value.contains('T'));
         assert!(rendered.contains("Server: sqlite"));
         assert!(rendered.contains("Server Description: SQLite workspace access"));
         assert!(rendered.contains("Capability: run-sql"));
         assert!(rendered.contains("Description: Execute SQL"));
         assert!(rendered.contains("Sub-agents:"));
         assert!(rendered.contains("Type: tool-executor"));
-        assert!(rendered.contains("Tools:\nNone"));
+        assert!(rendered.contains(
+            "Tools:\nTool availability is managed by the runtime harness and policy engine. Use only the tools exposed at execution time."
+        ));
         assert!(rendered.contains("Client: slack"));
         assert!(rendered.contains("Format: slack_mrkdwn"));
         assert!(rendered.contains("Unknown: <dynamic variable: future>"));
@@ -358,5 +453,6 @@ mod tests {
         assert!(!rendered.contains("<dynamic variable: available MCPs>"));
         assert!(!rendered.contains("<dynamic variable: available tools>"));
         assert!(!rendered.contains("<dynamic variable: response target>"));
+        assert!(!rendered.contains("Tool: read_file"));
     }
 }

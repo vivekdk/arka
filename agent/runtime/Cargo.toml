@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+glob = "0.3"
 mcp-client = { path = "../../mcp/client" }
 mcp-config = { path = "../../mcp/config" }
 mcp-metadata = { path = "../../mcp/metadata" }

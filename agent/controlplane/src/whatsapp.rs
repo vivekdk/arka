@@ -21,8 +21,8 @@ use crate::{
     adapters::{ChannelAdapter, ChannelAdapterError, WhatsAppChannelAdapter},
     service::SessionService,
     types::{
-        ChannelDeliveryTarget, ChannelDispatchResult, ChannelKind, DeliveryStatus,
-        ReceiveWhatsAppMessageRequest, ReceiveWhatsAppMessageResponse, SessionId,
+        ChannelDeliveryTarget, ChannelDispatchResult, ChannelKind, ChannelResponseAttachment,
+        DeliveryStatus, ReceiveWhatsAppMessageRequest, ReceiveWhatsAppMessageResponse, SessionId,
         StartWhatsAppLoginResponse, WhatsAppDmPolicy, WhatsAppGatewayConnectionState,
         WhatsAppGatewayStatus, WhatsAppWebhookPayload,
     },
@@ -75,12 +75,28 @@ pub struct WhatsAppConnector {
 
 #[async_trait]
 pub trait WhatsAppDeliveryClient: Send + Sync {
+    async fn send_message(
+        &self,
+        account_id: &str,
+        target: &ChannelDeliveryTarget,
+        message: &WhatsAppMessagePayload,
+    ) -> Result<(), WhatsAppDeliveryError>;
+
     async fn send_text(
         &self,
         account_id: &str,
         target: &ChannelDeliveryTarget,
         text: &str,
-    ) -> Result<(), WhatsAppDeliveryError>;
+    ) -> Result<(), WhatsAppDeliveryError> {
+        self.send_message(
+            account_id,
+            target,
+            &WhatsAppMessagePayload::Text {
+                text: text.to_owned(),
+            },
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -114,22 +130,40 @@ pub struct WhatsAppControlStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WhatsAppMessagePayload {
+    Text {
+        text: String,
+    },
+    Image {
+        url: String,
+        caption: Option<String>,
+    },
+    Document {
+        url: String,
+        file_name: String,
+        mime_type: Option<String>,
+        caption: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LoggingWhatsAppDeliveryClient;
 
 #[async_trait]
 impl WhatsAppDeliveryClient for LoggingWhatsAppDeliveryClient {
-    async fn send_text(
+    async fn send_message(
         &self,
         account_id: &str,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &WhatsAppMessagePayload,
     ) -> Result<(), WhatsAppDeliveryError> {
         info!(
             account_id,
             conversation = %target.external_conversation_id,
             user = %target.external_user_id,
-            text,
+            ?message,
             "whatsapp outbound delivery emitted"
         );
         Ok(())
@@ -157,20 +191,76 @@ impl ReqwestWhatsAppWebBridgeClient {
 
 #[async_trait]
 impl WhatsAppDeliveryClient for ReqwestWhatsAppWebBridgeClient {
-    async fn send_text(
+    async fn send_message(
         &self,
         account_id: &str,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &WhatsAppMessagePayload,
     ) -> Result<(), WhatsAppDeliveryError> {
+        let mut body = serde_json::Map::from_iter([
+            (
+                "account_id".to_owned(),
+                serde_json::Value::String(account_id.to_owned()),
+            ),
+            (
+                "to".to_owned(),
+                serde_json::Value::String(target.external_user_id.clone()),
+            ),
+        ]);
+        match message {
+            WhatsAppMessagePayload::Text { text } => {
+                body.insert(
+                    "kind".to_owned(),
+                    serde_json::Value::String("text".to_owned()),
+                );
+                body.insert("text".to_owned(), serde_json::Value::String(text.clone()));
+            }
+            WhatsAppMessagePayload::Image { url, caption } => {
+                body.insert(
+                    "kind".to_owned(),
+                    serde_json::Value::String("image".to_owned()),
+                );
+                body.insert("url".to_owned(), serde_json::Value::String(url.clone()));
+                if let Some(caption) = caption {
+                    body.insert(
+                        "caption".to_owned(),
+                        serde_json::Value::String(caption.clone()),
+                    );
+                }
+            }
+            WhatsAppMessagePayload::Document {
+                url,
+                file_name,
+                mime_type,
+                caption,
+            } => {
+                body.insert(
+                    "kind".to_owned(),
+                    serde_json::Value::String("document".to_owned()),
+                );
+                body.insert("url".to_owned(), serde_json::Value::String(url.clone()));
+                body.insert(
+                    "file_name".to_owned(),
+                    serde_json::Value::String(file_name.clone()),
+                );
+                if let Some(mime_type) = mime_type {
+                    body.insert(
+                        "mime_type".to_owned(),
+                        serde_json::Value::String(mime_type.clone()),
+                    );
+                }
+                if let Some(caption) = caption {
+                    body.insert(
+                        "caption".to_owned(),
+                        serde_json::Value::String(caption.clone()),
+                    );
+                }
+            }
+        }
         let response = self
             .http
             .post(self.endpoint("messages"))
-            .json(&serde_json::json!({
-                "account_id": account_id,
-                "to": target.external_user_id,
-                "text": text,
-            }))
+            .json(&serde_json::Value::Object(body))
             .send()
             .await
             .map_err(|error| WhatsAppDeliveryError::Transport(error.to_string()))?;
@@ -294,7 +384,7 @@ struct WhatsAppGatewayRuntimeState {
 struct WhatsAppOutboundMessage {
     session_id: SessionId,
     target: ChannelDeliveryTarget,
-    text: String,
+    payload: WhatsAppMessagePayload,
 }
 
 #[derive(Clone)]
@@ -442,13 +532,11 @@ impl WhatsAppGatewayHandle {
     {
         self.ensure_ready_and_allowed(&request.from_user_id).await?;
         let payload = normalized_payload(request);
-        let envelope = self
-            .adapter
-            .ingest(payload)
-            .map_err(map_adapter_error)?;
-        let dispatch = service.dispatch_envelope(envelope).await.map_err(|error| {
-            WhatsAppGatewayError::InvalidPayload(error.to_string())
-        })?;
+        let envelope = self.adapter.ingest(payload).map_err(map_adapter_error)?;
+        let dispatch = service
+            .dispatch_envelope(envelope)
+            .await
+            .map_err(|error| WhatsAppGatewayError::InvalidPayload(error.to_string()))?;
         self.queue_outbound(dispatch).await
     }
 
@@ -476,9 +564,7 @@ impl WhatsAppGatewayHandle {
             let message = WhatsAppOutboundMessage {
                 session_id: dispatch.session.session_id.clone(),
                 target,
-                text: self
-                    .adapter
-                    .render(outbound)
+                payload: whatsapp_message_payload(&self.adapter, outbound)
                     .map_err(map_adapter_error)?,
             };
             {
@@ -504,7 +590,10 @@ impl WhatsAppGatewayHandle {
         })
     }
 
-    async fn ensure_ready_and_allowed(&self, from_user_id: &str) -> Result<(), WhatsAppGatewayError> {
+    async fn ensure_ready_and_allowed(
+        &self,
+        from_user_id: &str,
+    ) -> Result<(), WhatsAppGatewayError> {
         if let Some(control_client) = self.control_client.as_ref() {
             if let Ok(remote) = control_client.status(&self.account_id).await {
                 let mut state = self.state.lock().await;
@@ -522,7 +611,11 @@ impl WhatsAppGatewayHandle {
             return Err(WhatsAppGatewayError::NotReady);
         }
         if matches!(state.persisted.dm_policy, WhatsAppDmPolicy::Allowlist)
-            && !state.persisted.allow_from.iter().any(|known| known == from_user_id)
+            && !state
+                .persisted
+                .allow_from
+                .iter()
+                .any(|known| known == from_user_id)
         {
             return Err(WhatsAppGatewayError::SenderBlocked(from_user_id.to_owned()));
         }
@@ -543,7 +636,7 @@ async fn run_whatsapp_worker<R, S>(
 {
     while let Some(message) = rx.recv().await {
         let result = delivery_client
-            .send_text(&account_id, &message.target, &message.text)
+            .send_message(&account_id, &message.target, &message.payload)
             .await;
         let mut state_guard = state.lock().await;
         state_guard.pending_outbound = state_guard.pending_outbound.saturating_sub(1);
@@ -588,6 +681,66 @@ fn normalized_payload(request: ReceiveWhatsAppMessageRequest) -> WhatsAppWebhook
         from_user_id: request.from_user_id,
         text,
     }
+}
+
+fn whatsapp_message_payload(
+    adapter: &WhatsAppChannelAdapter,
+    outbound: &crate::types::ChannelResponseEnvelope,
+) -> Result<WhatsAppMessagePayload, ChannelAdapterError> {
+    match outbound.attachment.as_ref() {
+        Some(ChannelResponseAttachment::Image(image)) => Ok(WhatsAppMessagePayload::Image {
+            url: image.url.clone(),
+            caption: whatsapp_attachment_caption(
+                &outbound.text,
+                image.caption.as_deref(),
+                image.cta_url.as_deref(),
+                image.cta_label.as_deref(),
+            ),
+        }),
+        Some(ChannelResponseAttachment::Document(document)) => {
+            Ok(WhatsAppMessagePayload::Document {
+                url: document.url.clone(),
+                file_name: document.file_name.clone(),
+                mime_type: document.mime_type.clone(),
+                caption: whatsapp_attachment_caption(
+                    &outbound.text,
+                    document.caption.as_deref(),
+                    document.cta_url.as_deref(),
+                    document.cta_label.as_deref(),
+                ),
+            })
+        }
+        Some(ChannelResponseAttachment::LocalImage(_)) => Ok(WhatsAppMessagePayload::Text {
+            text: adapter.render(outbound)?,
+        }),
+        None => Ok(WhatsAppMessagePayload::Text {
+            text: adapter.render(outbound)?,
+        }),
+    }
+}
+
+fn whatsapp_attachment_caption(
+    body_text: &str,
+    attachment_caption: Option<&str>,
+    cta_url: Option<&str>,
+    cta_label: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let body_text = body_text.trim();
+    if !body_text.is_empty() {
+        parts.push(body_text.to_owned());
+    }
+    if let Some(caption) = attachment_caption.filter(|value| !value.trim().is_empty()) {
+        parts.push(caption.trim().to_owned());
+    }
+    if let Some(url) = cta_url.map(str::trim).filter(|value| !value.is_empty()) {
+        let label = cta_label
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Open dashboard");
+        parts.push(format!("{label}: {url}"));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn build_status(state: &WhatsAppGatewayRuntimeState) -> WhatsAppGatewayStatus {
@@ -647,12 +800,11 @@ fn persist_gateway_state(
             source,
         })?;
     }
-    let payload = serde_json::to_vec_pretty(state).map_err(|source| {
-        WhatsAppGatewayError::Serialize {
+    let payload =
+        serde_json::to_vec_pretty(state).map_err(|source| WhatsAppGatewayError::Serialize {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     fs::write(path, payload).map_err(|source| WhatsAppGatewayError::Io {
         path: path.to_path_buf(),
         source,
@@ -677,5 +829,91 @@ fn map_adapter_error(error: ChannelAdapterError) -> WhatsAppGatewayError {
         | ChannelAdapterError::NotConfigured(message) => {
             WhatsAppGatewayError::InvalidPayload(message)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WhatsAppMessagePayload, whatsapp_attachment_caption, whatsapp_message_payload};
+    use crate::{
+        WhatsAppChannelAdapter,
+        types::{
+            ChannelDocumentAttachment, ChannelImageAttachment, ChannelResponseAttachment,
+            ChannelResponseEnvelope, OutboundMessageKind, SessionId,
+        },
+    };
+
+    #[test]
+    fn whatsapp_message_payload_renders_image_caption_with_cta() {
+        let payload = whatsapp_message_payload(
+            &WhatsAppChannelAdapter,
+            &ChannelResponseEnvelope {
+                session_id: SessionId::new(),
+                kind: OutboundMessageKind::Reply,
+                text: "Revenue is above target.".to_owned(),
+                attachment: Some(ChannelResponseAttachment::Image(ChannelImageAttachment {
+                    url: "https://example.com/chart.png".to_owned(),
+                    alt_text: "Revenue chart".to_owned(),
+                    caption: Some("Updated five minutes ago".to_owned()),
+                    cta_url: Some("https://example.com/dashboard".to_owned()),
+                    cta_label: Some("Open dashboard".to_owned()),
+                })),
+                delivery_target: None,
+            },
+        )
+        .expect("payload should render");
+
+        assert_eq!(
+            payload,
+            WhatsAppMessagePayload::Image {
+                url: "https://example.com/chart.png".to_owned(),
+                caption: Some(
+                    "Revenue is above target.\n\nUpdated five minutes ago\n\nOpen dashboard: https://example.com/dashboard"
+                        .to_owned(),
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn whatsapp_message_payload_renders_document_metadata() {
+        let payload = whatsapp_message_payload(
+            &WhatsAppChannelAdapter,
+            &ChannelResponseEnvelope {
+                session_id: SessionId::new(),
+                kind: OutboundMessageKind::Reply,
+                text: String::new(),
+                attachment: Some(ChannelResponseAttachment::Document(
+                    ChannelDocumentAttachment {
+                        url: "https://example.com/report.pdf".to_owned(),
+                        file_name: "weekly-report.pdf".to_owned(),
+                        mime_type: Some("application/pdf".to_owned()),
+                        caption: Some("Weekly digest".to_owned()),
+                        cta_url: None,
+                        cta_label: None,
+                    },
+                )),
+                delivery_target: None,
+            },
+        )
+        .expect("payload should render");
+
+        assert_eq!(
+            payload,
+            WhatsAppMessagePayload::Document {
+                url: "https://example.com/report.pdf".to_owned(),
+                file_name: "weekly-report.pdf".to_owned(),
+                mime_type: Some("application/pdf".to_owned()),
+                caption: Some("Weekly digest".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn whatsapp_attachment_caption_omits_empty_parts() {
+        assert_eq!(
+            whatsapp_attachment_caption("  ", None, Some(" "), None),
+            None
+        );
     }
 }

@@ -906,8 +906,11 @@ fn runtime_event_type(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::AnswerRenderCompleted { .. } => "answer_render_completed",
         RuntimeEvent::AnswerRenderFailed { .. } => "answer_render_failed",
         RuntimeEvent::HandoffToMainAgent { .. } => "handoff_to_main_agent",
+        RuntimeEvent::ToolMaskEvaluated { .. } => "tool_mask_evaluated",
         RuntimeEvent::McpCalled { .. } => "mcp_called",
         RuntimeEvent::McpResponded { .. } => "mcp_responded",
+        RuntimeEvent::LocalToolCalled { .. } => "local_tool_called",
+        RuntimeEvent::LocalToolResponded { .. } => "local_tool_responded",
         RuntimeEvent::StepEnded { .. } => "step_ended",
         RuntimeEvent::TurnEnded { .. } => "turn_ended",
     }
@@ -1003,6 +1006,20 @@ fn runtime_event_payload(event: &RuntimeEvent) -> Value {
             "subagent_type": subagent_type,
             "status": status,
         }),
+        RuntimeEvent::ToolMaskEvaluated {
+            executor,
+            enforcement_mode,
+            allowed_tool_ids,
+            denied_tool_ids,
+            decisions,
+            ..
+        } => serde_json::json!({
+            "executor": executor,
+            "enforcement_mode": enforcement_mode,
+            "allowed_tool_ids": allowed_tool_ids,
+            "denied_tool_ids": denied_tool_ids,
+            "decisions": decisions,
+        }),
         RuntimeEvent::McpCalled {
             server_name,
             tool_name,
@@ -1025,6 +1042,32 @@ fn runtime_event_payload(event: &RuntimeEvent) -> Value {
             ..
         } => serde_json::json!({
             "server_name": server_name,
+            "tool_name": tool_name,
+            "latency": latency,
+            "was_error": was_error,
+            "result_summary": result_summary,
+            "error": error,
+            "response_payload": response_payload,
+            "executor": executor,
+        }),
+        RuntimeEvent::LocalToolCalled {
+            tool_name,
+            executor,
+            ..
+        } => serde_json::json!({
+            "tool_name": tool_name,
+            "executor": executor,
+        }),
+        RuntimeEvent::LocalToolResponded {
+            tool_name,
+            latency,
+            was_error,
+            result_summary,
+            error,
+            response_payload,
+            executor,
+            ..
+        } => serde_json::json!({
             "tool_name": tool_name,
             "latency": latency,
             "was_error": was_error,
@@ -1062,8 +1105,11 @@ fn runtime_event_executor(event: &RuntimeEvent) -> &RuntimeExecutor {
         | RuntimeEvent::AnswerRenderCompleted { executor, .. }
         | RuntimeEvent::AnswerRenderFailed { executor, .. }
         | RuntimeEvent::HandoffToMainAgent { executor, .. }
+        | RuntimeEvent::ToolMaskEvaluated { executor, .. }
         | RuntimeEvent::McpCalled { executor, .. }
         | RuntimeEvent::McpResponded { executor, .. }
+        | RuntimeEvent::LocalToolCalled { executor, .. }
+        | RuntimeEvent::LocalToolResponded { executor, .. }
         | RuntimeEvent::StepEnded { executor, .. }
         | RuntimeEvent::TurnEnded { executor, .. } => executor,
     }
@@ -1082,8 +1128,11 @@ fn runtime_event_turn_id(event: &RuntimeEvent) -> Uuid {
         | RuntimeEvent::AnswerRenderCompleted { turn_id, .. }
         | RuntimeEvent::AnswerRenderFailed { turn_id, .. }
         | RuntimeEvent::HandoffToMainAgent { turn_id, .. }
+        | RuntimeEvent::ToolMaskEvaluated { turn_id, .. }
         | RuntimeEvent::McpCalled { turn_id, .. }
         | RuntimeEvent::McpResponded { turn_id, .. }
+        | RuntimeEvent::LocalToolCalled { turn_id, .. }
+        | RuntimeEvent::LocalToolResponded { turn_id, .. }
         | RuntimeEvent::StepEnded { turn_id, .. }
         | RuntimeEvent::TurnEnded { turn_id, .. } => turn_id.as_uuid(),
     }
@@ -1101,8 +1150,11 @@ fn runtime_event_step_id(event: &RuntimeEvent) -> Option<Uuid> {
         | RuntimeEvent::AnswerRenderCompleted { step_id, .. }
         | RuntimeEvent::AnswerRenderFailed { step_id, .. }
         | RuntimeEvent::HandoffToMainAgent { step_id, .. }
+        | RuntimeEvent::ToolMaskEvaluated { step_id, .. }
         | RuntimeEvent::McpCalled { step_id, .. }
         | RuntimeEvent::McpResponded { step_id, .. }
+        | RuntimeEvent::LocalToolCalled { step_id, .. }
+        | RuntimeEvent::LocalToolResponded { step_id, .. }
         | RuntimeEvent::StepEnded { step_id, .. } => Some(step_id.as_uuid()),
         RuntimeEvent::TurnStarted { .. } | RuntimeEvent::TurnEnded { .. } => None,
     }
@@ -1121,8 +1173,11 @@ fn runtime_event_at(event: &RuntimeEvent) -> SystemTime {
         | RuntimeEvent::AnswerRenderCompleted { at, .. }
         | RuntimeEvent::AnswerRenderFailed { at, .. }
         | RuntimeEvent::HandoffToMainAgent { at, .. }
+        | RuntimeEvent::ToolMaskEvaluated { at, .. }
         | RuntimeEvent::McpCalled { at, .. }
         | RuntimeEvent::McpResponded { at, .. }
+        | RuntimeEvent::LocalToolCalled { at, .. }
+        | RuntimeEvent::LocalToolResponded { at, .. }
         | RuntimeEvent::StepEnded { at, .. }
         | RuntimeEvent::TurnEnded { at, .. } => *at,
     }
@@ -1136,6 +1191,10 @@ fn raw_artifact_kind(kind: &RuntimeRawArtifactKind) -> &'static str {
         RuntimeRawArtifactKind::McpRequest => "mcp_request",
         RuntimeRawArtifactKind::McpResponse => "mcp_response",
         RuntimeRawArtifactKind::McpError => "mcp_error",
+        RuntimeRawArtifactKind::LocalToolRequest => "local_tool_request",
+        RuntimeRawArtifactKind::LocalToolResponse => "local_tool_response",
+        RuntimeRawArtifactKind::LocalToolError => "local_tool_error",
+        RuntimeRawArtifactKind::PolicyDecision => "policy_decision",
     }
 }
 

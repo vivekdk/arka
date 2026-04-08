@@ -82,17 +82,20 @@ app.post("/logout", async (_req, res) => {
 
 app.post("/messages", async (req, res) => {
   const to = resolveRecipientJid(req.body?.to);
-  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-  if (!to || !text) {
-    return res.status(400).json({ error: "to and text are required" });
+  const kind = typeof req.body?.kind === "string" ? req.body.kind.trim() : "text";
+  if (!to) {
+    return res.status(400).json({ error: "to is required" });
   }
   try {
     await ensureSocket(false);
     if (state.connectionState !== "ready" || !state.sock) {
       return res.status(409).json({ error: "whatsapp web is not connected" });
     }
-    console.log(`Sending WhatsApp reply to ${to}: ${truncateForLog(text)}`);
-    await state.sock.sendMessage(jidNormalizedUser(to), { text });
+    const payload = outboundMessagePayload(req.body, kind);
+    console.log(
+      `Sending WhatsApp ${kind} reply to ${to}: ${truncateForLog(describeOutboundPayload(payload))}`
+    );
+    await state.sock.sendMessage(jidNormalizedUser(to), payload);
     res.json({ ok: true });
   } catch (error) {
     state.lastError = String(error);
@@ -351,6 +354,65 @@ function extractText(message) {
 
 function truncateForLog(text) {
   return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+}
+
+function outboundMessagePayload(body, kind) {
+  if (kind === "text") {
+    const text = typeof body?.text === "string" ? body.text.trim() : "";
+    if (!text) {
+      throw new Error("text is required for text messages");
+    }
+    return { text };
+  }
+
+  if (kind === "image") {
+    const url = typeof body?.url === "string" ? body.url.trim() : "";
+    if (!url) {
+      throw new Error("url is required for image messages");
+    }
+    const caption = typeof body?.caption === "string" ? body.caption.trim() : "";
+    return {
+      image: { url },
+      ...(caption ? { caption } : {}),
+    };
+  }
+
+  if (kind === "document") {
+    const url = typeof body?.url === "string" ? body.url.trim() : "";
+    const fileName = typeof body?.file_name === "string" ? body.file_name.trim() : "";
+    if (!url || !fileName) {
+      throw new Error("url and file_name are required for document messages");
+    }
+    const caption = typeof body?.caption === "string" ? body.caption.trim() : "";
+    const mimeType = typeof body?.mime_type === "string" ? body.mime_type.trim() : "";
+    return {
+      document: { url },
+      fileName,
+      ...(mimeType ? { mimetype: mimeType } : {}),
+      ...(caption ? { caption } : {}),
+    };
+  }
+
+  throw new Error(`unsupported outbound message kind: ${kind}`);
+}
+
+function describeOutboundPayload(payload) {
+  if (typeof payload.text === "string" && payload.text) {
+    return payload.text;
+  }
+  if (typeof payload.caption === "string" && payload.caption) {
+    return payload.caption;
+  }
+  if (typeof payload.fileName === "string" && payload.fileName) {
+    return payload.fileName;
+  }
+  if (payload.image?.url) {
+    return payload.image.url;
+  }
+  if (payload.document?.url) {
+    return payload.document.url;
+  }
+  return JSON.stringify(payload);
 }
 
 async function bootstrapSocket() {
