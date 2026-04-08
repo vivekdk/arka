@@ -12,6 +12,7 @@ fn main() {
     let mut args = env::args().skip(1);
     let mut log_file = None;
     let mut tool_mode = "default".to_owned();
+    let mut poisoned = false;
     while let Some(arg) = args.next() {
         if arg == "--log-file" {
             log_file = args.next();
@@ -114,38 +115,64 @@ fn main() {
                 log_tool_call(log_file.as_deref(), tool_name);
 
                 match tool_name {
-                    "run-sql" => respond(
-                        &mut writer,
-                        id,
-                        json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "rows returned: 3"
-                                }
-                            ],
-                            "structuredContent": {
-                                "rowCount": 3
-                            },
-                            "isError": false
-                        }),
-                    ),
-                    "fail-tool" => respond(
-                        &mut writer,
-                        id,
-                        json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "simulated MCP tool failure"
-                                }
-                            ],
-                            "structuredContent": {
-                                "reason": "simulated"
-                            },
-                            "isError": true
-                        }),
-                    ),
+                    "run-sql" => {
+                        if tool_mode == "poison-after-tool-error" && poisoned {
+                            respond(
+                                &mut writer,
+                                id,
+                                json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "connection is poisoned until the process restarts"
+                                        }
+                                    ],
+                                    "structuredContent": {
+                                        "reason": "poisoned_connection"
+                                    },
+                                    "isError": true
+                                }),
+                            );
+                        } else {
+                            respond(
+                                &mut writer,
+                                id,
+                                json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "rows returned: 3"
+                                        }
+                                    ],
+                                    "structuredContent": {
+                                        "rowCount": 3
+                                    },
+                                    "isError": false
+                                }),
+                            );
+                        }
+                    }
+                    "fail-tool" => {
+                        if tool_mode == "poison-after-tool-error" {
+                            poisoned = true;
+                        }
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "simulated MCP tool failure"
+                                    }
+                                ],
+                                "structuredContent": {
+                                    "reason": "simulated"
+                                },
+                                "isError": true
+                            }),
+                        );
+                    }
                     "list_tables" => respond(
                         &mut writer,
                         id,

@@ -82,8 +82,8 @@ SESSION_STORE_DIR=data/sessions
 
 Supported dynamic tags:
 
-- `<dynamic variable: working_directory>`
-- `<dynamic variable: current_date and time>`
+- `<dynamic variable: working_directory>`: renders the session workspace path, which defaults to `<cwd>/.arka/tmp/<session_id>`
+- `<dynamic variable: current_date and time>`: renders the local date only, in `YYYY-MM-DD` format
 - `<dynamic variable: available MCPs>`
 - `<dynamic variable: available sub-agents>`
 - `<dynamic variable: available tools>`: renders a generic runtime-managed tools notice rather than enumerating the tool catalog
@@ -94,6 +94,7 @@ Optional variables:
 BIND_ADDR=127.0.0.1:8080
 ENABLED_MCP_SERVERS=sqlite
 AGENT_API_BASE_URL=http://127.0.0.1:8080
+AGENT_REQUEST_TIMEOUT_SECS=240
 SLACK_BOT_TOKEN=
 SLACK_SIGNING_SECRET=
 SLACK_API_BASE_URL=https://slack.com/api
@@ -107,13 +108,17 @@ WHATSAPP_EVENT_QUEUE_CAPACITY=256
 WHATSAPP_BRIDGE_BASE_URL=http://127.0.0.1:8091
 RUNTIME_MAX_STEPS_PER_TURN=8
 RUNTIME_MAX_MCP_CALLS_PER_STEP=4
-RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=8
+RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=25
 RUNTIME_MAX_SUBAGENT_MCP_CALLS_PER_INVOCATION=4
-RUNTIME_TURN_TIMEOUT_SECS=180
+RUNTIME_TURN_TIMEOUT_SECS=420
 RUNTIME_MCP_CALL_TIMEOUT_SECS=10
 ```
 
 Environment variables exported by your shell still override `.env`.
+
+`AGENT_REQUEST_TIMEOUT_SECS` controls how long the CLI waits for a message-send
+response from the control-plane API. Raise it if your turn budget or MCP work
+regularly exceeds the default.
 
 ### MCP registry
 
@@ -201,7 +206,8 @@ Validation rules enforced by `mcp-config`:
 
 `SESSION_STORE_DIR` defaults to `data/sessions`. That directory contains generated
 session state, message transcripts, and channel metadata and should remain local
-runtime data, not committed source.
+runtime data, not committed source. Generated analysis scripts and outputs live
+separately under `.arka/tmp/<session_id>/`.
 
 ### Sub-agents
 
@@ -210,7 +216,7 @@ The default sub-agent registry is `config/subagents.json`.
 Current built-in executors:
 
 - `mcp-executor`: delegated MCP tool/resource execution
-- `tool-executor`: delegated local tool execution inside the working directory
+- `tool-executor`: delegated local tool execution inside the session working directory
 
 Current built-in local tools:
 

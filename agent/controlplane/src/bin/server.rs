@@ -3,7 +3,12 @@
 //! This binary wires together environment loading, the OpenAI-backed runtime,
 //! the session service, and the Axum router used by API and channel clients.
 
-use std::{env, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 use agent_controlplane::{
     DebugHistoryStore, JsonlConversationStore, LoggingWhatsAppDeliveryClient,
@@ -25,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_key = env::var("OPENAI_API_KEY")?;
     let model_name = env::var("MODEL_NAME").unwrap_or_else(|_| "gpt-5.4".to_owned());
     let system_prompt_path = load_system_prompt_path();
-    let working_directory = env::current_dir()?;
+    let workspace_root = prepare_runtime_workspace_root()?;
     let registry_path =
         env::var("MCP_REGISTRY_PATH").unwrap_or_else(|_| "config/mcp_servers.json".to_owned());
     let subagent_registry_path =
@@ -109,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         runtime,
         RuntimeExecutionConfig {
             system_prompt_path,
-            working_directory,
+            workspace_root,
             registry_path: registry_path.into(),
             subagent_registry_path: subagent_registry_path.into(),
             tool_policy_path,
@@ -225,6 +230,21 @@ fn load_system_prompt_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("config/prompt.md"))
 }
 
+fn prepare_runtime_workspace_root() -> Result<PathBuf, std::io::Error> {
+    let current_dir = env::current_dir()?;
+    prepare_runtime_workspace_root_at(&current_dir)
+}
+
+fn prepare_runtime_workspace_root_at(current_dir: &Path) -> Result<PathBuf, std::io::Error> {
+    let workspace_root = runtime_workspace_root_path(current_dir);
+    fs::create_dir_all(&workspace_root)?;
+    Ok(workspace_root)
+}
+
+fn runtime_workspace_root_path(current_dir: &Path) -> PathBuf {
+    current_dir.join(".arka").join("tmp")
+}
+
 fn read_env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
@@ -244,4 +264,48 @@ fn read_env_bool(name: &str, default: bool) -> bool {
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{prepare_runtime_workspace_root_at, runtime_workspace_root_path};
+
+    #[test]
+    fn runtime_workspace_root_path_uses_arka_tmp() {
+        let current_dir = PathBuf::from("/tmp/arka-project");
+        assert_eq!(
+            runtime_workspace_root_path(&current_dir),
+            current_dir.join(".arka").join("tmp")
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_workspace_root_creates_missing_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let sandbox_root = std::env::temp_dir().join(format!(
+            "agent-controlplane-working-directory-test-{}-{unique}",
+            std::process::id()
+        ));
+        let expected = sandbox_root.join(".arka").join("tmp");
+        if sandbox_root.exists() {
+            fs::remove_dir_all(&sandbox_root).expect("old temp directory should be removable");
+        }
+
+        let prepared = prepare_runtime_workspace_root_at(&sandbox_root)
+            .expect("workspace root should be prepared");
+
+        assert_eq!(prepared, expected);
+        assert!(prepared.is_dir());
+
+        fs::remove_dir_all(&sandbox_root).expect("temp directory should be removable");
+    }
 }

@@ -14,10 +14,10 @@ use agent_controlplane::{
     ChannelIntent, ChannelKind, ConversationStore, CreateSessionRequest, InMemoryConversationStore,
     JsonlConversationStore, RuntimeHarnessEventEnvelope, RuntimeHarnessObservation,
     SendSessionMessageRequest, SessionService, SlackConnector, SlackDeliveryClient,
-    SubmitApprovalRequest, TurnRunner, TurnRunnerInput, TurnRunnerOutput, WhatsAppConnector,
-    WhatsAppDeliveryClient, WhatsAppDeliveryError, WhatsAppDmPolicy, WhatsAppGatewayStatus,
-    WhatsAppWebhookPayload, api::SlackStreamHandle, router, router_with_channels,
-    router_with_slack,
+    SlackFileUpload, SlackMessagePayload, SubmitApprovalRequest, TurnRunner, TurnRunnerInput,
+    TurnRunnerOutput, WhatsAppConnector, WhatsAppDeliveryClient, WhatsAppDeliveryError,
+    WhatsAppDmPolicy, WhatsAppGatewayStatus, WhatsAppMessagePayload, WhatsAppWebhookPayload,
+    api::SlackStreamHandle, router, router_with_channels, router_with_slack,
 };
 use agent_runtime::{
     ConversationRole, ResponseClient, ResponseFormat, ResponseTarget, RuntimeError, RuntimeEvent,
@@ -225,7 +225,7 @@ async fn slack_webhook_is_idempotent_and_session_scoped() {
 
     let delivery_log = deliveries.lock().expect("delivery log should lock");
     assert_eq!(delivery_log.len(), 1);
-    assert_eq!(delivery_log[0].text, "<@user-1> from slack");
+    assert_eq!(delivery_log[0].payload.text, "<@user-1> from slack");
     drop(delivery_log);
 
     let second_session = service
@@ -308,6 +308,75 @@ async fn slack_webhook_streams_reply_when_client_supports_streaming() {
 }
 
 #[tokio::test]
+async fn slack_webhook_uploads_generated_chart_as_file() {
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let uploads = Arc::new(Mutex::new(Vec::new()));
+    let chart_dir = unique_test_store_dir("slack-chart");
+    fs::create_dir_all(&chart_dir).expect("chart directory should exist");
+    let chart_path = chart_dir.join("chart.png");
+    fs::write(&chart_path, b"png-bytes").expect("chart image should write");
+
+    let mut output = turn_output("chart ready");
+    output.generated_artifacts = vec![agent_controlplane::runner::GeneratedArtifact {
+        kind: agent_controlplane::runner::GeneratedArtifactKind::Image,
+        path: chart_path.clone(),
+        file_name: "chart.png".to_owned(),
+        mime_type: Some("image/png".to_owned()),
+    }];
+    let service = SessionService::new(
+        FakeTurnRunner::new(vec![Ok(output)]),
+        InMemoryConversationStore::default(),
+    );
+    let app = router_with_slack(
+        service,
+        None,
+        Some(SlackConnector {
+            signing_secret: "secret".to_owned(),
+            delivery_client: Arc::new(FakeSlackDeliveryClient::with_uploads(
+                Arc::clone(&deliveries),
+                Arc::clone(&uploads),
+            )),
+            event_queue_capacity: 8,
+        }),
+    );
+
+    let payload = br#"{
+        "type": "event_callback",
+        "team_id": "T1",
+        "event_id": "event-upload-1",
+        "event": {
+            "type": "app_mention",
+            "user": "user-1",
+            "channel": "channel-1",
+            "text": "<@B1> make chart",
+            "thread_ts": "thread-1",
+            "ts": "thread-1"
+        }
+    }"#;
+
+    let response = post_signed_slack_json(&app, payload, "secret").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_slack_upload_count(&uploads, 1).await;
+
+    assert!(
+        deliveries
+            .lock()
+            .expect("delivery log should lock")
+            .is_empty()
+    );
+    let uploads = uploads.lock().expect("upload log should lock");
+    assert_eq!(uploads[0].upload.file_name, "chart.png");
+    assert_eq!(uploads[0].upload.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        uploads[0].upload.initial_comment.as_deref(),
+        Some("<@user-1> chart ready")
+    );
+    assert_eq!(uploads[0].upload.bytes, b"png-bytes");
+
+    cleanup_test_store_dir(&chart_dir);
+}
+
+#[tokio::test]
 async fn whatsapp_webhook_creates_session_and_reply() {
     let app = test_router(vec![Ok(turn_output("from whatsapp"))]);
     let payload = WhatsAppWebhookPayload {
@@ -383,8 +452,10 @@ async fn whatsapp_gateway_login_status_and_delivery_flow() {
     assert_eq!(response.queued_outbound, 1);
     wait_for_whatsapp_delivery_count(&deliveries, 1).await;
     assert_eq!(
-        deliveries.lock().expect("delivery log should lock")[0].text,
-        "from whatsapp gateway"
+        deliveries.lock().expect("delivery log should lock")[0].payload,
+        WhatsAppMessagePayload::Text {
+            text: "from whatsapp gateway".to_owned()
+        }
     );
 
     cleanup_test_store_dir(&state_path.parent().expect("state parent").to_path_buf());
@@ -922,6 +993,7 @@ fn turn_output(final_text: &str) -> TurnRunnerOutput {
                 total_tokens: 2,
             },
         },
+        generated_artifacts: Vec::new(),
     }
 }
 
@@ -1043,6 +1115,16 @@ async fn wait_for_stream_op_count(
     panic!("timed out waiting for slack stream ops");
 }
 
+async fn wait_for_slack_upload_count(uploads: &Arc<Mutex<Vec<FakeSlackUpload>>>, expected: usize) {
+    for _ in 0..20 {
+        if uploads.lock().expect("upload log should lock").len() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for slack uploads");
+}
+
 #[derive(Debug)]
 struct FakeTurnRunner {
     outputs:
@@ -1055,10 +1137,10 @@ struct CapturingTurnRunner {
     seen_targets: Arc<Mutex<Vec<ResponseTarget>>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct FakeSlackMessage {
     target: ChannelDeliveryTarget,
-    text: String,
+    payload: SlackMessagePayload,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1083,13 +1165,20 @@ enum FakeSlackStreamOp {
 struct FakeSlackDeliveryClient {
     deliveries: Arc<Mutex<Vec<FakeSlackMessage>>>,
     stream_ops: Option<Arc<Mutex<Vec<FakeSlackStreamOp>>>>,
+    uploads: Arc<Mutex<Vec<FakeSlackUpload>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FakeWhatsAppMessage {
     account_id: String,
     target: ChannelDeliveryTarget,
-    text: String,
+    payload: WhatsAppMessagePayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FakeSlackUpload {
+    target: ChannelDeliveryTarget,
+    upload: SlackFileUpload,
 }
 
 #[derive(Debug)]
@@ -1108,6 +1197,7 @@ impl FakeSlackDeliveryClient {
         Self {
             deliveries,
             stream_ops: None,
+            uploads: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1118,6 +1208,18 @@ impl FakeSlackDeliveryClient {
         Self {
             deliveries,
             stream_ops: Some(stream_ops),
+            uploads: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_uploads(
+        deliveries: Arc<Mutex<Vec<FakeSlackMessage>>>,
+        uploads: Arc<Mutex<Vec<FakeSlackUpload>>>,
+    ) -> Self {
+        Self {
+            deliveries,
+            stream_ops: None,
+            uploads,
         }
     }
 }
@@ -1127,14 +1229,14 @@ impl SlackDeliveryClient for FakeSlackDeliveryClient {
     async fn post_message(
         &self,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &SlackMessagePayload,
     ) -> Result<(), agent_controlplane::SlackDeliveryError> {
         self.deliveries
             .lock()
             .expect("delivery log should lock")
             .push(FakeSlackMessage {
                 target: target.clone(),
-                text: text.to_owned(),
+                payload: message.clone(),
             });
         Ok(())
     }
@@ -1206,15 +1308,30 @@ impl SlackDeliveryClient for FakeSlackDeliveryClient {
             });
         Ok(())
     }
+
+    async fn share_file(
+        &self,
+        target: &ChannelDeliveryTarget,
+        upload: &SlackFileUpload,
+    ) -> Result<(), agent_controlplane::SlackDeliveryError> {
+        self.uploads
+            .lock()
+            .expect("upload log should lock")
+            .push(FakeSlackUpload {
+                target: target.clone(),
+                upload: upload.clone(),
+            });
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl WhatsAppDeliveryClient for FakeWhatsAppDeliveryClient {
-    async fn send_text(
+    async fn send_message(
         &self,
         account_id: &str,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &WhatsAppMessagePayload,
     ) -> Result<(), WhatsAppDeliveryError> {
         self.deliveries
             .lock()
@@ -1222,7 +1339,7 @@ impl WhatsAppDeliveryClient for FakeWhatsAppDeliveryClient {
             .push(FakeWhatsAppMessage {
                 account_id: account_id.to_owned(),
                 target: target.clone(),
-                text: text.to_owned(),
+                payload: message.clone(),
             });
         Ok(())
     }

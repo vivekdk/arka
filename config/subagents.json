@@ -13,8 +13,8 @@
     {
       "type": "tool-executor",
       "display_name": "Tool Executor",
-      "purpose": "Complete delegated local tool work inside the working directory using glob for path discovery, read_file for UTF-8 reads, write_file/edit_file for mutations, and bash for workspace-scoped command execution.",
-      "when_to_use": "Use this when the user request requires workspace inspection, command execution, targeted edits, or full rewrites.",
+      "purpose": "Complete delegated local tool work inside the session working directory using glob for path discovery, read_file for UTF-8 reads, write_file/edit_file for mutations, bash for execution, and reproducible script-based analysis when needed.",
+      "when_to_use": "Use this when the user request requires workspace inspection, command execution, targeted edits, full rewrites, or complex data analysis through scripts and generated outputs.",
       "target_requirements": "Requires a local tools scope selected by the main agent.",
       "result_summary": "Executes delegated local tool work and returns a terminal completed, partial, or cannot_execute report.",
       "prompt_path": "subagents/tool-executor.prompt.md",

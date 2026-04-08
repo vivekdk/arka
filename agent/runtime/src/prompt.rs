@@ -12,7 +12,7 @@ use std::{
 };
 
 use thiserror::Error;
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::state::{
     ConversationMessage, McpCapability, MessageRecord, PromptSection, PromptSnapshot,
@@ -36,10 +36,6 @@ pub enum PromptRenderError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to determine current working directory: {0}")]
-    CurrentWorkingDirectory(#[source] std::io::Error),
-    #[error("failed to format current date and time: {0}")]
-    CurrentDateTime(#[source] time::error::Format),
 }
 
 /// Builds prompt snapshots from canonical runtime state.
@@ -53,6 +49,7 @@ impl PromptAssembler {
         &self,
         system_prompt: &str,
         conversation_history: &[ConversationMessage],
+        recent_session_messages: &[MessageRecord],
         current_turn_messages: &[MessageRecord],
     ) -> PromptSnapshot {
         let mut sections = Vec::new();
@@ -65,6 +62,12 @@ impl PromptAssembler {
             title: "Conversation History".to_owned(),
             content: render_history(conversation_history),
         });
+        if !recent_session_messages.is_empty() {
+            sections.push(PromptSection {
+                title: "Recent Session Computed Results".to_owned(),
+                content: render_recent_session_results(recent_session_messages),
+            });
+        }
         sections.push(PromptSection {
             title: "Current Turn Context".to_owned(),
             content: render_turn_context(current_turn_messages),
@@ -114,13 +117,13 @@ fn render_system_prompt(
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
     // Dynamic prompt tags are expanded late so each turn sees the current
-    // working directory, local time, and enabled MCP catalog.
+    // working directory, local date, and enabled MCP catalog.
     let working_directory = working_directory.display().to_string();
-    let current_date_time = render_current_date_time()?;
+    let current_date = render_current_date();
 
     Ok(template
         .replace(WORKING_DIRECTORY_TAG, &working_directory)
-        .replace(CURRENT_DATE_TIME_TAG, &current_date_time)
+        .replace(CURRENT_DATE_TIME_TAG, &current_date)
         .replace(AVAILABLE_MCPS_TAG, &render_available_mcps(mcp_capabilities))
         .replace(
             AVAILABLE_SUBAGENTS_TAG,
@@ -136,12 +139,12 @@ fn render_system_prompt(
         ))
 }
 
-fn render_current_date_time() -> Result<String, PromptRenderError> {
+fn render_current_date() -> String {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     OffsetDateTime::now_utc()
         .to_offset(offset)
-        .format(&Rfc3339)
-        .map_err(PromptRenderError::CurrentDateTime)
+        .date()
+        .to_string()
 }
 
 fn render_history(history: &[ConversationMessage]) -> String {
@@ -173,6 +176,20 @@ fn render_turn_context(messages: &[MessageRecord]) -> String {
         .map(MessageRecord::summary_line)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_recent_session_results(messages: &[MessageRecord]) -> String {
+    let rendered = messages
+        .iter()
+        .filter(|message| matches!(message, MessageRecord::McpResult(_)))
+        .map(MessageRecord::summary_line)
+        .collect::<Vec<_>>();
+
+    if rendered.is_empty() {
+        "No recent computed results from prior turns are available.".to_owned()
+    } else {
+        rendered.join("\n")
+    }
 }
 
 fn render_available_mcps(capabilities: &[McpCapability]) -> String {
@@ -289,9 +306,9 @@ mod tests {
         ids::MessageId,
         prompt::load_and_render_system_prompt,
         state::{
-            ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability, MessageRecord,
-            ResponseClient, ResponseFormat, ResponseTarget, ServerName, SubagentCard,
-            format_system_time,
+            ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability,
+            McpCapabilityTarget, McpResultMessageRecord, MessageRecord, ResponseClient,
+            ResponseFormat, ResponseTarget, ServerName, SubagentCard, format_system_time,
         },
         tools::builtin_local_tool_catalog,
     };
@@ -308,6 +325,7 @@ mod tests {
                 role: ConversationRole::User,
                 content: "hello".to_owned(),
             }],
+            &[],
             &[MessageRecord::Llm(LlmMessageRecord {
                 message_id: MessageId::new(),
                 timestamp: std::time::SystemTime::now(),
@@ -326,6 +344,35 @@ mod tests {
                 .rendered
                 .contains(&format_system_time(std::time::SystemTime::UNIX_EPOCH))
         );
+    }
+
+    #[test]
+    fn prompt_includes_recent_session_computed_results_section_when_present() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            &[],
+            &[MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: std::time::SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: ServerName::new("ex-vol").expect("valid server"),
+                    capability_kind: mcp_metadata::CapabilityKind::Tool,
+                    capability_id: "run_select_query".to_owned(),
+                },
+                result_summary: "{\"rows\":[[\"2026-04-05\",8]]}".to_owned(),
+                error: None,
+            })],
+            &[],
+        );
+
+        assert!(
+            prompt
+                .rendered
+                .contains("## Recent Session Computed Results")
+        );
+        assert!(prompt.rendered.contains("run_select_query"));
+        assert!(prompt.rendered.contains("2026-04-05"));
     }
 
     #[test]
@@ -367,8 +414,28 @@ mod tests {
         )
         .expect("prompt should render");
 
-        assert!(rendered.contains("CWD: "));
-        assert!(rendered.contains("Date: "));
+        let cwd_line = rendered
+            .lines()
+            .find(|line| line.starts_with("CWD: "))
+            .expect("cwd line should render");
+        assert_eq!(cwd_line, format!("CWD: {}", temp_dir.display()));
+
+        let date_line = rendered
+            .lines()
+            .find(|line| line.starts_with("Date: "))
+            .expect("date line should render");
+        let date_value = date_line.trim_start_matches("Date: ");
+        assert_eq!(date_value.len(), 10);
+        assert!(
+            date_value
+                .chars()
+                .enumerate()
+                .all(|(index, ch)| match index {
+                    4 | 7 => ch == '-',
+                    _ => ch.is_ascii_digit(),
+                })
+        );
+        assert!(!date_value.contains('T'));
         assert!(rendered.contains("Server: sqlite"));
         assert!(rendered.contains("Server Description: SQLite workspace access"));
         assert!(rendered.contains("Capability: run-sql"));

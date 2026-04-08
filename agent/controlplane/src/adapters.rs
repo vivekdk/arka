@@ -446,6 +446,7 @@ mod tests {
             session_id: SessionId::new(),
             kind: OutboundMessageKind::Reply,
             text: text.clone(),
+            attachment: None,
             delivery_target: None,
         };
 
@@ -464,6 +465,7 @@ mod tests {
             session_id: SessionId::new(),
             kind: OutboundMessageKind::Reply,
             text: "hello".to_owned(),
+            attachment: None,
             delivery_target: Some(ChannelDeliveryTarget {
                 channel: ChannelKind::Slack,
                 external_workspace_id: Some("T1".to_owned()),

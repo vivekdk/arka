@@ -253,6 +253,7 @@ where
             let prompt = self.prompt_assembler.build(
                 &system_prompt,
                 &request.conversation_history,
+                &request.recent_session_messages,
                 &prompt_messages,
             );
             sink.record(RuntimeEvent::PromptBuilt {
@@ -375,6 +376,7 @@ where
                             &delegation.subagent_type,
                             &delegation.target,
                             &delegation.goal,
+                            &all_messages,
                             turn_start,
                             sink,
                             &turn_id,
@@ -503,11 +505,18 @@ where
         subagent_type: &str,
         target: &DelegationTarget,
         goal: &str,
+        current_turn_messages: &[MessageRecord],
         turn_start: Instant,
         sink: &mut dyn RuntimeDebugSink,
         turn_id: &TurnId,
         step_id: &StepId,
     ) -> Result<(MessageRecord, DelegatedExecutionOutcome), RuntimeError> {
+        let subagent_context_messages = request
+            .recent_session_messages
+            .iter()
+            .cloned()
+            .chain(current_turn_messages.iter().cloned())
+            .collect::<Vec<_>>();
         let configured = registry.get_enabled(subagent_type)?;
         let base_prompt = build_subagent_prompt(
             &request.subagent_registry_path,
@@ -517,6 +526,7 @@ where
             goal,
             &request.user_message,
             &request.working_directory,
+            &subagent_context_messages,
         )?;
         let model_config = configured
             .model_name
@@ -1307,6 +1317,7 @@ fn build_subagent_prompt(
     goal: &str,
     user_message: &str,
     working_directory: &Path,
+    current_turn_messages: &[MessageRecord],
 ) -> Result<String, RuntimeError> {
     let registry_dir = registry_path
         .parent()
@@ -1363,14 +1374,76 @@ fn build_subagent_prompt(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let recent_results_block = render_recent_mcp_results_context(current_turn_messages);
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n\n## Local Tools\n{}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n\n{}\n## Local Tools\n{}",
                 scope.scope,
                 working_directory.display(),
+                recent_results_block,
                 tools_block
             ))
         }
     }
+}
+
+fn render_recent_mcp_results_context(messages: &[MessageRecord]) -> String {
+    const MAX_RECENT_RESULTS: usize = 3;
+    const MAX_RESULT_SUMMARY_CHARS: usize = 1_500;
+
+    let recent_results = messages
+        .iter()
+        .rev()
+        .filter_map(|message| match message {
+            MessageRecord::McpResult(record) => Some(record),
+            _ => None,
+        })
+        .take(MAX_RECENT_RESULTS)
+        .collect::<Vec<_>>();
+
+    if recent_results.is_empty() {
+        return "## Recent Computed Results\nNo recent MCP-derived results are available in this turn. If a visualization is needed, compute or fetch the data first, then write it to a local file before plotting.\n".to_owned();
+    }
+
+    let rendered_results = recent_results
+        .into_iter()
+        .rev()
+        .map(|record| {
+            format!(
+                "- server={} kind={:?} target={} error={}\n  result_summary:\n{}",
+                record.target.server_name,
+                record.target.capability_kind,
+                record.target.capability_id,
+                record.error.is_some(),
+                indent_block(&truncate_for_prompt(
+                    &record.result_summary,
+                    MAX_RESULT_SUMMARY_CHARS
+                ))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "## Recent Computed Results\nUse these recent MCP-derived results as available analysis context. If you need a chart or follow-up calculation, first write the relevant rows into a local file under `outputs/` or `scripts/`, then build the visualization from that file.\n{}\n",
+        rendered_results
+    )
+}
+
+fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_owned();
+    }
+
+    let mut truncated = input.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn indent_block(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn build_subagent_loop_prompt(
@@ -1614,11 +1687,20 @@ async fn execute_tool_call(
     .await;
     match result {
         Ok(Ok(value)) => {
-            info!(
-                server = %server_name,
-                tool = tool_name,
-                "completed MCP tool call"
-            );
+            if value.is_error {
+                warn!(
+                    server = %server_name,
+                    tool = tool_name,
+                    "MCP tool returned isError=true; resetting connection"
+                );
+                server.connection.take();
+            } else {
+                info!(
+                    server = %server_name,
+                    tool = tool_name,
+                    "completed MCP tool call"
+                );
+            }
             Ok(value)
         }
         Ok(Err(error)) => {
@@ -2021,6 +2103,106 @@ fn select_servers(
             .iter()
             .map(|server| ServerName::new(server.name.clone()).map_err(RuntimeError::State))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        time::SystemTime,
+    };
+
+    use mcp_metadata::CapabilityKind;
+
+    use crate::{
+        ids::MessageId,
+        state::{
+            DelegationTarget, LocalToolsScopeTarget, McpCapabilityTarget, McpResultMessageRecord,
+            MessageRecord, ServerName,
+        },
+        subagent::ConfiguredSubagent,
+    };
+
+    use super::{McpSession, build_subagent_prompt, render_recent_mcp_results_context};
+
+    #[test]
+    fn recent_mcp_results_context_renders_recent_results_and_guidance() {
+        let messages = vec![MessageRecord::McpResult(McpResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            target: McpCapabilityTarget {
+                server_name: ServerName::new("ex-vol").expect("valid server"),
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "run_select_query".to_owned(),
+            },
+            result_summary: "{\"columns\":[\"week_start\",\"new_users\"],\"rows\":[[\"2026-03-30\",14],[\"2026-04-06\",8]]}".to_owned(),
+            error: None,
+        })];
+
+        let rendered = render_recent_mcp_results_context(&messages);
+
+        assert!(rendered.contains("## Recent Computed Results"));
+        assert!(rendered.contains("server=ex-vol"));
+        assert!(rendered.contains("target=run_select_query"));
+        assert!(rendered.contains("\"week_start\""));
+        assert!(rendered.contains("write the relevant rows into a local file"));
+    }
+
+    #[test]
+    fn local_tools_subagent_prompt_includes_recent_mcp_results() {
+        let registry_path = workspace_root().join("config").join("subagents.json");
+        let configured = ConfiguredSubagent {
+            subagent_type: "tool-executor".to_owned(),
+            display_name: "Tool Executor".to_owned(),
+            purpose: "Complete delegated local tool work".to_owned(),
+            when_to_use: "For local scripts".to_owned(),
+            target_requirements: "local scope".to_owned(),
+            result_summary: "Returns local tool work".to_owned(),
+            prompt_path: PathBuf::from("subagents/tool-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+        let messages = vec![MessageRecord::McpResult(McpResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            target: McpCapabilityTarget {
+                server_name: ServerName::new("ex-vol").expect("valid server"),
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "run_select_query".to_owned(),
+            },
+            result_summary: "{\"columns\":[\"week_start\",\"new_users\"],\"rows\":[[\"2026-03-30\",14],[\"2026-04-06\",8]]}".to_owned(),
+            error: None,
+        })];
+
+        let prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &McpSession {
+                servers: HashMap::new(),
+            },
+            &DelegationTarget::LocalToolsScope(LocalToolsScopeTarget {
+                scope: "workspace".to_owned(),
+            }),
+            "Create a weekly new users chart",
+            "give me a visualization for this",
+            Path::new("/tmp/arka-session"),
+            &messages,
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.contains("## Recent Computed Results"));
+        assert!(prompt.contains("\"new_users\""));
+        assert!(prompt.contains("write them into a local file"));
+        assert!(prompt.contains("## Local Tools"));
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root should resolve")
     }
 }
 

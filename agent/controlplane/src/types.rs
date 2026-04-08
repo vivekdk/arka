@@ -300,8 +300,80 @@ pub struct ChannelResponseEnvelope {
     pub kind: OutboundMessageKind,
     /// Channel-neutral text payload.
     pub text: String,
+    /// Optional rich attachment delivered alongside the text payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<ChannelResponseAttachment>,
     /// Optional delivery target used by channel-specific connectors.
     pub delivery_target: Option<ChannelDeliveryTarget>,
+}
+
+/// Optional rich attachment rendered by channel-specific connectors.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChannelResponseAttachment {
+    /// Static image asset such as a chart snapshot.
+    Image(ChannelImageAttachment),
+    /// Static document asset such as a PDF digest.
+    Document(ChannelDocumentAttachment),
+    /// Locally generated image artifact to be uploaded by the channel adapter.
+    LocalImage(ChannelLocalImageAttachment),
+}
+
+/// Metadata required to deliver one image attachment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelImageAttachment {
+    /// Publicly reachable image URL.
+    pub url: String,
+    /// Accessible fallback text describing the image.
+    pub alt_text: String,
+    /// Optional image-specific caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Optional deep link to the richer web view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta_url: Option<String>,
+    /// Optional label shown next to the CTA URL when the channel supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta_label: Option<String>,
+}
+
+/// Metadata required to deliver one document attachment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelDocumentAttachment {
+    /// Publicly reachable document URL.
+    pub url: String,
+    /// Stable filename used by channels that surface downloadable files.
+    pub file_name: String,
+    /// Optional MIME type hint for upload clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional document-specific caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Optional deep link to the richer web view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta_url: Option<String>,
+    /// Optional label shown next to the CTA URL when the channel supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta_label: Option<String>,
+}
+
+/// Metadata required to deliver one locally generated image attachment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelLocalImageAttachment {
+    /// Stable filename surfaced to upload-capable channels.
+    pub file_name: String,
+    /// Accessible fallback text describing the image.
+    pub alt_text: String,
+    /// Optional MIME type hint for upload clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional caption delivered with the image when no text body is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Absolute local path used only by server-side upload adapters.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub local_path: Option<String>,
 }
 
 /// Delivery address used by connectors to send one outbound message.

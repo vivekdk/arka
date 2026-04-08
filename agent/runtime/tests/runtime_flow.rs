@@ -102,6 +102,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
                 role: ConversationRole::Assistant,
                 content: "Prior answer".to_owned(),
             }],
+            recent_session_messages: vec![],
             user_message: "How many rows?".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -217,6 +218,7 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
             ),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Show sample leads".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -322,6 +324,7 @@ async fn delegated_subagent_follow_up_prompt_keeps_full_mcp_result_text() {
             ),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Preview the latest leads".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -425,6 +428,7 @@ async fn prepared_session_skips_discovery_until_first_execution() {
                 system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
                 working_directory: temp_dir.clone(),
                 conversation_history: vec![],
+                recent_session_messages: vec![],
                 user_message: "Run it".to_owned(),
                 response_target: default_response_target(),
                 registry_path,
@@ -498,6 +502,7 @@ async fn runtime_reads_resource_via_tool_executor() {
             system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Show the dashboard".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -591,6 +596,7 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
             system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Get me the final count".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -625,6 +631,124 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
             .filter(|message| matches!(message, MessageRecord::McpResult(_)))
             .count()
             == 2
+    );
+}
+
+#[tokio::test]
+async fn runtime_resets_connection_after_mcp_tool_error_payload() {
+    cleanup_mcp_metadata("fake");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
+                            server_name: ServerName::new("fake").expect("valid server"),
+                            capability_kind: mcp_metadata::CapabilityKind::Tool,
+                            capability_id: "run-sql".to_owned(),
+                        }),
+                        goal: "Recover from a poisoned MCP session".to_owned(),
+                    },
+                },
+                usage: token_usage(2, 2),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "recovered".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "run-sql".to_owned(),
+                    arguments: json!({"query": "select 1"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "fail-tool".to_owned(),
+                    arguments: json!({}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "run-sql".to_owned(),
+                    arguments: json!({"query": "select 2"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::Done {
+                    summary: "Recovered after reconnect".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-reset-on-tool-error");
+    let log_path = temp_dir.join("mcp-log.txt");
+    let registry_path = write_registry(
+        &temp_dir,
+        FAKE_SERVER_BIN,
+        vec![
+            "--log-file".to_owned(),
+            log_path.to_str().expect("utf-8 path").to_owned(),
+            "--tool-mode".to_owned(),
+            "poison-after-tool-error".to_owned(),
+        ],
+    );
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>"),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Run the recovery flow".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "recovered");
+    let tool_results = outcome
+        .turn
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            MessageRecord::McpResult(record) => Some((
+                record.target.capability_id.as_str().to_owned(),
+                record.error.is_some(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_results,
+        vec![
+            ("run-sql".to_owned(), false),
+            ("fail-tool".to_owned(), true),
+            ("run-sql".to_owned(), false),
+        ],
+        "runtime should recover with a fresh MCP connection after an isError=true tool payload"
     );
 }
 
@@ -688,6 +812,7 @@ async fn runtime_delegates_tool_executor_and_executes_glob() {
             ),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Find Rust files".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -782,6 +907,7 @@ async fn delegated_tool_follow_up_prompt_keeps_bash_output() {
             ),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Run a bash check".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -830,6 +956,7 @@ async fn runtime_fails_when_metadata_is_missing() {
             system_prompt_path: write_prompt(&temp_dir, "Be precise."),
             working_directory: temp_dir.clone(),
             conversation_history: vec![],
+            recent_session_messages: vec![],
             user_message: "Hello".to_owned(),
             response_target: default_response_target(),
             registry_path,
@@ -854,7 +981,7 @@ fn write_mcp_metadata(_temp_dir: &Path, logical_name: &str) {
     let families = McpCapabilityFamilies {
         tools: McpCapabilityFamilySummary {
             supported: true,
-            count: 2,
+            count: 3,
         },
         resources: McpCapabilityFamilySummary {
             supported: true,
@@ -880,6 +1007,11 @@ fn write_mcp_metadata(_temp_dir: &Path, logical_name: &str) {
                 description: Some("Execute a SQL query".to_owned()),
             },
             MinimalToolMetadata {
+                name: "fail-tool".to_owned(),
+                title: Some("Fail Tool".to_owned()),
+                description: Some("Return an MCP-level error payload".to_owned()),
+            },
+            MinimalToolMetadata {
                 name: "preview_leads".to_owned(),
                 title: Some("Preview Leads".to_owned()),
                 description: Some("Preview sample leads rows".to_owned()),
@@ -903,6 +1035,12 @@ fn write_mcp_metadata(_temp_dir: &Path, logical_name: &str) {
                 title: Some("Run SQL".to_owned()),
                 description: Some("Execute a SQL query".to_owned()),
                 input_schema: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            },
+            FullToolMetadata {
+                name: "fail-tool".to_owned(),
+                title: Some("Fail Tool".to_owned()),
+                description: Some("Return an MCP-level error payload".to_owned()),
+                input_schema: json!({"type":"object"}),
             },
             FullToolMetadata {
                 name: "preview_leads".to_owned(),

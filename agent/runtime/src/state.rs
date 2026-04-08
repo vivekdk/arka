@@ -333,6 +333,8 @@ pub struct RunRequest {
     pub working_directory: PathBuf,
     /// Prior conversation history to inject before the new user message.
     pub conversation_history: Vec<ConversationMessage>,
+    /// Recent session-scoped runtime messages carried over from prior turns.
+    pub recent_session_messages: Vec<MessageRecord>,
     /// Fresh user message that starts this turn.
     pub user_message: String,
     /// Resolved client and formatting target for the final reply.

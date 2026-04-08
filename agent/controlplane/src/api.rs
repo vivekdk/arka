@@ -62,8 +62,20 @@ pub trait SlackDeliveryClient: Send + Sync {
     async fn post_message(
         &self,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &SlackMessagePayload,
     ) -> Result<(), SlackDeliveryError>;
+
+    async fn share_file(
+        &self,
+        target: &ChannelDeliveryTarget,
+        upload: &SlackFileUpload,
+    ) -> Result<(), SlackDeliveryError> {
+        let _ = target;
+        let _ = upload;
+        Err(SlackDeliveryError::Api(
+            "slack file upload is not supported by this client".to_owned(),
+        ))
+    }
 
     async fn start_stream(
         &self,
@@ -108,6 +120,22 @@ pub struct SlackStreamHandle {
     pub ts: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlackMessagePayload {
+    pub text: String,
+    pub blocks: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlackFileUpload {
+    pub file_name: String,
+    pub title: Option<String>,
+    pub mime_type: Option<String>,
+    pub alt_text: Option<String>,
+    pub bytes: Vec<u8>,
+    pub initial_comment: Option<String>,
+}
+
 /// Reqwest-backed Slack Web API client.
 #[derive(Clone)]
 pub struct ReqwestSlackDeliveryClient {
@@ -131,7 +159,7 @@ impl SlackDeliveryClient for ReqwestSlackDeliveryClient {
     async fn post_message(
         &self,
         target: &ChannelDeliveryTarget,
-        text: &str,
+        message: &SlackMessagePayload,
     ) -> Result<(), SlackDeliveryError> {
         let channel = target.external_channel_id.as_ref().ok_or_else(|| {
             SlackDeliveryError::InvalidTarget(
@@ -143,6 +171,26 @@ impl SlackDeliveryClient for ReqwestSlackDeliveryClient {
                 "slack delivery target is missing thread id".to_owned(),
             )
         })?;
+        let mut body = serde_json::Map::from_iter([
+            (
+                "channel".to_owned(),
+                serde_json::Value::String(channel.clone()),
+            ),
+            (
+                "thread_ts".to_owned(),
+                serde_json::Value::String(thread_ts.clone()),
+            ),
+            (
+                "text".to_owned(),
+                serde_json::Value::String(message.text.clone()),
+            ),
+        ]);
+        if let Some(blocks) = &message.blocks {
+            body.insert(
+                "blocks".to_owned(),
+                serde_json::Value::Array(blocks.clone()),
+            );
+        }
         let response = self
             .http
             .post(format!(
@@ -150,15 +198,119 @@ impl SlackDeliveryClient for ReqwestSlackDeliveryClient {
                 self.api_base_url.trim_end_matches('/')
             ))
             .bearer_auth(&self.bot_token)
-            .json(&serde_json::json!({
-                "channel": channel,
-                "thread_ts": thread_ts,
-                "text": text,
-            }))
+            .json(&serde_json::Value::Object(body))
             .send()
             .await?
             .error_for_status()?;
         let payload: SlackPostMessageResponse = response.json().await?;
+        if payload.ok {
+            Ok(())
+        } else {
+            Err(SlackDeliveryError::Api(payload.error.unwrap_or_else(
+                || "slack api returned ok=false".to_owned(),
+            )))
+        }
+    }
+
+    async fn share_file(
+        &self,
+        target: &ChannelDeliveryTarget,
+        upload: &SlackFileUpload,
+    ) -> Result<(), SlackDeliveryError> {
+        let channel = target.external_channel_id.as_ref().ok_or_else(|| {
+            SlackDeliveryError::InvalidTarget(
+                "slack delivery target is missing channel id".to_owned(),
+            )
+        })?;
+        let upload_length = upload.bytes.len().to_string();
+        let get_upload = self
+            .http
+            .get(format!(
+                "{}/files.getUploadURLExternal",
+                self.api_base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.bot_token)
+            .query(&[
+                ("filename", upload.file_name.as_str()),
+                ("length", upload_length.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?;
+        let upload_target: SlackExternalUploadUrlResponse = get_upload.json().await?;
+        if !upload_target.ok {
+            return Err(SlackDeliveryError::Api(
+                upload_target
+                    .error
+                    .unwrap_or_else(|| "slack api returned ok=false".to_owned()),
+            ));
+        }
+        let upload_url = upload_target.upload_url.ok_or_else(|| {
+            SlackDeliveryError::Api(
+                "slack files.getUploadURLExternal response is missing upload_url".to_owned(),
+            )
+        })?;
+        let file_id = upload_target.file_id.ok_or_else(|| {
+            SlackDeliveryError::Api(
+                "slack files.getUploadURLExternal response is missing file_id".to_owned(),
+            )
+        })?;
+        self.http
+            .post(upload_url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                upload
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+            )
+            .body(upload.bytes.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut body = serde_json::Map::from_iter([
+            (
+                "files".to_owned(),
+                serde_json::json!([{
+                    "id": file_id,
+                    "title": upload.title.as_deref().unwrap_or(upload.file_name.as_str()),
+                }]),
+            ),
+            (
+                "channel_id".to_owned(),
+                serde_json::Value::String(channel.clone()),
+            ),
+        ]);
+        if let Some(thread_ts) = target.external_thread_id.as_ref() {
+            body.insert(
+                "thread_ts".to_owned(),
+                serde_json::Value::String(thread_ts.clone()),
+            );
+        }
+        if let Some(initial_comment) = upload
+            .initial_comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            body.insert(
+                "initial_comment".to_owned(),
+                serde_json::Value::String(initial_comment.to_owned()),
+            );
+        }
+        let complete = self
+            .http
+            .post(format!(
+                "{}/files.completeUploadExternal",
+                self.api_base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.bot_token)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await?
+            .error_for_status()?;
+        let payload: SlackPostMessageResponse = complete.json().await?;
         if payload.ok {
             Ok(())
         } else {
@@ -292,6 +444,14 @@ pub enum SlackDeliveryError {
 struct SlackPostMessageResponse {
     ok: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SlackExternalUploadUrlResponse {
+    ok: bool,
+    error: Option<String>,
+    upload_url: Option<String>,
+    file_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1124,24 +1284,25 @@ async fn run_slack_worker<R, S>(
         }
 
         for outbound in dispatch.outbound {
-            if matches!(
+            let suppress_text_body = matches!(
                 outbound.kind,
                 crate::types::OutboundMessageKind::Reply | crate::types::OutboundMessageKind::Error
-            ) && stream_replaced_reply
-            {
+            ) && stream_replaced_reply;
+            if suppress_text_body && outbound.attachment.is_none() {
                 continue;
             }
             let target = outbound
                 .delivery_target
                 .clone()
                 .unwrap_or_else(|| request.delivery_target.clone());
-            if let Err(error) = deliver_slack_text(
+            if let Err(error) = deliver_slack_outbound(
                 &service,
                 &adapter,
                 delivery_client.as_ref(),
                 &target,
                 Some(dispatch.session.session_id.clone()),
-                outbound.text.clone(),
+                &outbound,
+                suppress_text_body,
             )
             .await
             {
@@ -1255,16 +1416,256 @@ where
         session_id: session_id.clone().unwrap_or_default(),
         kind: crate::types::OutboundMessageKind::Reply,
         text,
+        attachment: None,
         delivery_target: Some(target.clone()),
     };
-    let rendered = adapter
-        .render(&outbound)
-        .map_err(|error| SlackDeliveryError::Api(error.to_string()))?;
+    deliver_slack_outbound(
+        service,
+        adapter,
+        delivery_client,
+        target,
+        session_id,
+        &outbound,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn deliver_slack_outbound<R, S>(
+    service: &SessionService<R, S>,
+    adapter: &SlackChannelAdapter,
+    delivery_client: &dyn SlackDeliveryClient,
+    target: &ChannelDeliveryTarget,
+    session_id: Option<SessionId>,
+    outbound: &crate::types::ChannelResponseEnvelope,
+    suppress_text_body: bool,
+) -> Result<(), SlackDeliveryError>
+where
+    R: TurnRunner + Send + Sync + 'static,
+    S: ConversationStore + Send + Sync + 'static,
+{
+    if let Some(upload) = slack_file_upload(adapter, target, outbound, suppress_text_body).await? {
+        delivery_client.share_file(target, &upload).await?;
+        if let Some(session_id) = session_id {
+            service.emit_channel_delivery(session_id, ChannelKind::Slack, DeliveryStatus::Sent);
+        }
+        return Ok(());
+    }
+    let rendered = slack_message_payload(adapter, target, outbound, suppress_text_body)?;
     delivery_client.post_message(target, &rendered).await?;
     if let Some(session_id) = session_id {
         service.emit_channel_delivery(session_id, ChannelKind::Slack, DeliveryStatus::Sent);
     }
     Ok(())
+}
+
+async fn slack_file_upload(
+    adapter: &SlackChannelAdapter,
+    target: &ChannelDeliveryTarget,
+    outbound: &crate::types::ChannelResponseEnvelope,
+    suppress_text_body: bool,
+) -> Result<Option<SlackFileUpload>, SlackDeliveryError> {
+    let crate::types::ChannelResponseAttachment::LocalImage(image) =
+        (match outbound.attachment.as_ref() {
+            Some(attachment) => attachment,
+            None => return Ok(None),
+        })
+    else {
+        return Ok(None);
+    };
+    let local_path = image
+        .local_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| SlackDeliveryError::Api("local slack image is missing a path".to_owned()))?;
+    let bytes = tokio::fs::read(local_path)
+        .await
+        .map_err(|error| SlackDeliveryError::Api(format!("failed to read local image: {error}")))?;
+    Ok(Some(SlackFileUpload {
+        file_name: image.file_name.clone(),
+        title: Some(image.file_name.clone()),
+        mime_type: image.mime_type.clone(),
+        alt_text: Some(image.alt_text.clone()),
+        bytes,
+        initial_comment: Some(slack_file_comment(
+            adapter,
+            target,
+            outbound,
+            suppress_text_body,
+            image.caption.as_deref(),
+        )?),
+    }))
+}
+
+fn slack_message_payload(
+    adapter: &SlackChannelAdapter,
+    target: &ChannelDeliveryTarget,
+    outbound: &crate::types::ChannelResponseEnvelope,
+    suppress_text_body: bool,
+) -> Result<SlackMessagePayload, SlackDeliveryError> {
+    let text = if suppress_text_body {
+        slack_attachment_fallback_text(target, outbound)
+    } else {
+        adapter
+            .render(outbound)
+            .map_err(|error| SlackDeliveryError::Api(error.to_string()))?
+    };
+    let blocks = slack_blocks_for_outbound(target, outbound, suppress_text_body);
+    Ok(SlackMessagePayload { text, blocks })
+}
+
+fn slack_attachment_fallback_text(
+    target: &ChannelDeliveryTarget,
+    outbound: &crate::types::ChannelResponseEnvelope,
+) -> String {
+    let prefix = format!("<@{}> ", target.external_user_id);
+    match outbound.attachment.as_ref() {
+        Some(crate::types::ChannelResponseAttachment::Image(image)) => {
+            let caption = image
+                .caption
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("shared a chart image");
+            format!("{prefix}{caption}")
+        }
+        Some(crate::types::ChannelResponseAttachment::Document(document)) => {
+            let caption = document
+                .caption
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("shared a document");
+            format!("{prefix}{caption}")
+        }
+        Some(crate::types::ChannelResponseAttachment::LocalImage(image)) => {
+            let caption = image
+                .caption
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("shared a chart image");
+            format!("{prefix}{caption}")
+        }
+        None => prefix,
+    }
+}
+
+fn slack_blocks_for_outbound(
+    target: &ChannelDeliveryTarget,
+    outbound: &crate::types::ChannelResponseEnvelope,
+    suppress_text_body: bool,
+) -> Option<Vec<serde_json::Value>> {
+    let mut blocks = Vec::new();
+    if !suppress_text_body {
+        let text = outbound.text.trim();
+        if !text.is_empty() {
+            blocks.push(serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": format!("<@{}> {}", target.external_user_id, text),
+                }
+            }));
+        }
+    }
+    match outbound.attachment.as_ref() {
+        Some(crate::types::ChannelResponseAttachment::Image(image)) => {
+            blocks.push(serde_json::json!({
+                "type": "image",
+                "image_url": image.url,
+                "alt_text": image.alt_text,
+            }));
+            if let Some(context) = slack_attachment_context(
+                image.caption.as_deref(),
+                image.cta_url.as_deref(),
+                image.cta_label.as_deref(),
+            ) {
+                blocks.push(context);
+            }
+        }
+        Some(crate::types::ChannelResponseAttachment::Document(document)) => {
+            let mut text = format!("*Attachment:* <{}|{}>", document.url, document.file_name);
+            if let Some(caption) = document
+                .caption
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                text.push_str(&format!("\n{caption}"));
+            }
+            if let Some((url, label)) =
+                slack_cta(document.cta_url.as_deref(), document.cta_label.as_deref())
+            {
+                text.push_str(&format!("\n<{url}|{label}>"));
+            }
+            blocks.push(serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text,
+                }
+            }));
+        }
+        Some(crate::types::ChannelResponseAttachment::LocalImage(_)) => {}
+        None => {}
+    }
+    (!blocks.is_empty()).then_some(blocks)
+}
+
+fn slack_file_comment(
+    adapter: &SlackChannelAdapter,
+    target: &ChannelDeliveryTarget,
+    outbound: &crate::types::ChannelResponseEnvelope,
+    suppress_text_body: bool,
+    fallback_caption: Option<&str>,
+) -> Result<String, SlackDeliveryError> {
+    if suppress_text_body {
+        let prefix = format!("<@{}> ", target.external_user_id);
+        let caption = fallback_caption
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("shared a chart image");
+        return Ok(format!("{prefix}{caption}"));
+    }
+    adapter
+        .render(outbound)
+        .map_err(|error| SlackDeliveryError::Api(error.to_string()))
+}
+
+fn slack_attachment_context(
+    caption: Option<&str>,
+    cta_url: Option<&str>,
+    cta_label: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut parts = Vec::new();
+    if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+        parts.push(caption.to_owned());
+    }
+    if let Some((url, label)) = slack_cta(cta_url, cta_label) {
+        parts.push(format!("<{url}|{label}>"));
+    }
+    (!parts.is_empty()).then(|| {
+        serde_json::json!({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": parts.join(" • "),
+            }]
+        })
+    })
+}
+
+fn slack_cta<'a>(
+    cta_url: Option<&'a str>,
+    cta_label: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    let url = cta_url?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let label = cta_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Open dashboard");
+    Some((url, label))
 }
 
 const ARKA_LOGO_SVG: &str = include_str!("../../../assets/arka-logo.svg");
@@ -2647,8 +3048,15 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        DebugHistoryTurnQuery, SlackStreamHandle, parse_debug_history_turn_filters,
-        slack_stop_stream_body,
+        DebugHistoryTurnQuery, SlackMessagePayload, SlackStreamHandle,
+        parse_debug_history_turn_filters, slack_message_payload, slack_stop_stream_body,
+    };
+    use crate::{
+        SlackChannelAdapter,
+        types::{
+            ChannelDeliveryTarget, ChannelImageAttachment, ChannelKind, ChannelResponseAttachment,
+            ChannelResponseEnvelope, OutboundMessageKind, SessionId,
+        },
     };
 
     #[test]
@@ -2716,5 +3124,96 @@ mod tests {
             Some("1743076800.000100")
         );
         assert!(body.get("markdown_text").is_none());
+    }
+
+    #[test]
+    fn slack_message_payload_renders_image_block_and_cta() {
+        let payload = slack_message_payload(
+            &SlackChannelAdapter::default(),
+            &slack_target(),
+            &ChannelResponseEnvelope {
+                session_id: SessionId::new(),
+                kind: OutboundMessageKind::Reply,
+                text: "Sales are up 18% week over week.".to_owned(),
+                attachment: Some(ChannelResponseAttachment::Image(ChannelImageAttachment {
+                    url: "https://example.com/chart.png".to_owned(),
+                    alt_text: "Weekly sales line chart".to_owned(),
+                    caption: Some("Updated five minutes ago".to_owned()),
+                    cta_url: Some("https://example.com/dashboard".to_owned()),
+                    cta_label: Some("Open dashboard".to_owned()),
+                })),
+                delivery_target: Some(slack_target()),
+            },
+            false,
+        )
+        .expect("payload should render");
+
+        assert_eq!(payload.text, "<@U123> Sales are up 18% week over week.");
+        let blocks = payload.blocks.expect("blocks should be present");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["image_url"], "https://example.com/chart.png");
+        assert!(
+            blocks[2]["elements"][0]["text"]
+                .as_str()
+                .expect("context should render")
+                .contains("<https://example.com/dashboard|Open dashboard>")
+        );
+    }
+
+    #[test]
+    fn slack_message_payload_can_send_attachment_without_duplicate_text_block() {
+        let payload = slack_message_payload(
+            &SlackChannelAdapter::default(),
+            &slack_target(),
+            &ChannelResponseEnvelope {
+                session_id: SessionId::new(),
+                kind: OutboundMessageKind::Reply,
+                text: "This text was already streamed.".to_owned(),
+                attachment: Some(ChannelResponseAttachment::Image(ChannelImageAttachment {
+                    url: "https://example.com/chart.png".to_owned(),
+                    alt_text: "Chart".to_owned(),
+                    caption: Some("Latest chart snapshot".to_owned()),
+                    cta_url: None,
+                    cta_label: None,
+                })),
+                delivery_target: Some(slack_target()),
+            },
+            true,
+        )
+        .expect("payload should render");
+
+        assert_eq!(payload.text, "<@U123> Latest chart snapshot");
+        assert_eq!(
+            payload,
+            SlackMessagePayload {
+                text: "<@U123> Latest chart snapshot".to_owned(),
+                blocks: Some(vec![
+                    serde_json::json!({
+                        "type": "image",
+                        "image_url": "https://example.com/chart.png",
+                        "alt_text": "Chart",
+                    }),
+                    serde_json::json!({
+                        "type": "context",
+                        "elements": [{
+                            "type": "mrkdwn",
+                            "text": "Latest chart snapshot",
+                        }]
+                    }),
+                ]),
+            }
+        );
+    }
+
+    fn slack_target() -> ChannelDeliveryTarget {
+        ChannelDeliveryTarget {
+            channel: ChannelKind::Slack,
+            external_workspace_id: Some("T123".to_owned()),
+            external_conversation_id: "thread-1".to_owned(),
+            external_channel_id: Some("C123".to_owned()),
+            external_thread_id: Some("thread-1".to_owned()),
+            external_user_id: "U123".to_owned(),
+        }
     }
 }

@@ -40,7 +40,8 @@ use uuid::Uuid;
 const CONNECT_RETRY_COUNT: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 500;
 const SESSION_START_TIMEOUT_SECS: u64 = 30;
-const REQUEST_TIMEOUT_SECS: u64 = 60;
+const REQUEST_TIMEOUT_SECS: u64 = 240;
+const REQUEST_TIMEOUT_ENV: &str = "AGENT_REQUEST_TIMEOUT_SECS";
 const APP_NAME: &str = "Arka";
 const APP_TAGLINE: &str = "Data analyst assistant";
 const USER_LABEL: &str = "You";
@@ -65,9 +66,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let theme = CliTheme::detect();
     let base_url =
         env::var("AGENT_API_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+    let request_timeout_secs = env_u64(REQUEST_TIMEOUT_ENV).unwrap_or(REQUEST_TIMEOUT_SECS);
     let command = args.next();
     let session_client = build_http_client(Some(Duration::from_secs(SESSION_START_TIMEOUT_SECS)))?;
-    let request_client = build_http_client(Some(Duration::from_secs(REQUEST_TIMEOUT_SECS)))?;
+    let request_client = build_http_client(Some(Duration::from_secs(request_timeout_secs)))?;
     let stream_client = build_http_client(None)?;
 
     match command.as_deref() {
@@ -427,6 +429,12 @@ fn build_http_client(
         builder = builder.timeout(timeout);
     }
     Ok(builder.build()?)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 async fn create_cli_session(

@@ -10,7 +10,7 @@ server:
 capability_families:
   tools:
     supported: true
-    count: 2
+    count: 3
   resources:
     supported: true
     count: 1
@@ -22,6 +22,11 @@ tools:
     properties:
       query:
         type: string
+    type: object
+- name: fail-tool
+  title: Fail Tool
+  description: Return an MCP-level error payload
+  input_schema:
     type: object
 - name: preview_leads
   title: Preview Leads
@@ -53,6 +58,7 @@ extensions: {}
 
 ## Tools
 - `run-sql`: Execute a SQL query
+- `fail-tool`: Return an MCP-level error payload
 - `preview_leads`: Preview sample leads rows
 
 ## Resources

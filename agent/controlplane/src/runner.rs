@@ -5,6 +5,8 @@
 
 use std::{
     collections::HashMap,
+    fs,
+    path::Path,
     path::PathBuf,
     sync::Arc,
     time::{Instant, SystemTime},
@@ -18,9 +20,9 @@ use crate::{
     types::SessionId,
 };
 use agent_runtime::{
-    AgentRuntime, ConversationMessage, EventSink, McpSession, ModelConfig, ResponseTarget,
-    RuntimeError as AgentRuntimeError, RuntimeEvent, RuntimeExecutor, RuntimeLimits, ServerName,
-    TerminationReason, TurnId, TurnRecord, UsageSummary,
+    AgentRuntime, ConversationMessage, EventSink, McpSession, MessageRecord, ModelConfig,
+    ResponseTarget, RuntimeError as AgentRuntimeError, RuntimeEvent, RuntimeExecutor,
+    RuntimeLimits, ServerName, TerminationReason, TurnId, TurnRecord, UsageSummary,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -35,6 +37,8 @@ pub struct TurnRunnerInput {
     pub turn_number: u32,
     /// Prior conversation history normalized into runtime records.
     pub conversation_history: Vec<ConversationMessage>,
+    /// Recent persisted runtime messages from prior turns in this session.
+    pub recent_session_messages: Vec<MessageRecord>,
     /// Fresh user text for the turn.
     pub user_message: String,
     /// Resolved client and formatting target for the turn reply.
@@ -62,6 +66,24 @@ pub struct TurnRunnerOutput {
     pub events: Vec<agent_runtime::RuntimeEvent>,
     /// Canonical runtime turn record.
     pub turn: agent_runtime::TurnRecord,
+    /// New local artifacts produced during the turn inside the session workspace.
+    pub generated_artifacts: Vec<GeneratedArtifact>,
+}
+
+/// Kind of local artifact generated during a runtime turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedArtifactKind {
+    Image,
+    Document,
+}
+
+/// One local artifact generated during a runtime turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedArtifact {
+    pub kind: GeneratedArtifactKind,
+    pub path: PathBuf,
+    pub file_name: String,
+    pub mime_type: Option<String>,
 }
 
 /// Static runtime configuration used by the control plane for every turn.
@@ -69,8 +91,8 @@ pub struct TurnRunnerOutput {
 pub struct RuntimeExecutionConfig {
     /// Prompt template path used for every turn.
     pub system_prompt_path: PathBuf,
-    /// Working directory used for prompt rendering and local tools.
-    pub working_directory: PathBuf,
+    /// Root directory under which per-session workspaces are created.
+    pub workspace_root: PathBuf,
     /// MCP registry path used to prepare sessions.
     pub registry_path: PathBuf,
     /// Sub-agent registry path used to render prompts and delegate execution.
@@ -163,6 +185,7 @@ where
     A: agent_runtime::model::ModelAdapter,
 {
     async fn prepare_session(&self, session_id: &SessionId) -> Result<(), TurnRunnerError> {
+        let _ = prepare_session_workspace_at(&self.config.workspace_root, session_id)?;
         let _ = self.get_or_prepare_mcp_session(session_id).await?;
         Ok(())
     }
@@ -175,11 +198,15 @@ where
     async fn run_turn(&self, input: TurnRunnerInput) -> Result<TurnRunnerOutput, TurnRunnerError> {
         let session_mcp = self.get_or_prepare_mcp_session(&input.session_id).await?;
         let mut session_mcp = session_mcp.lock().await;
+        let turn_started_at = SystemTime::now();
         let started = Instant::now();
+        let working_directory =
+            prepare_session_workspace_at(&self.config.workspace_root, &input.session_id)?;
         let request = agent_runtime::RunRequest {
             system_prompt_path: self.config.system_prompt_path.clone(),
-            working_directory: self.config.working_directory.clone(),
+            working_directory: working_directory.clone(),
             conversation_history: input.conversation_history,
+            recent_session_messages: input.recent_session_messages,
             user_message: input.user_message,
             response_target: input.response_target,
             registry_path: self.config.registry_path.clone(),
@@ -225,6 +252,8 @@ where
                 };
                 sink.emit_turn_snapshot(snapshot);
                 let events = sink.into_events();
+                let generated_artifacts =
+                    collect_generated_artifacts(&working_directory, turn_started_at)?;
                 Ok(TurnRunnerOutput {
                     final_text: outcome.final_text,
                     display_text: outcome.display_text,
@@ -234,6 +263,7 @@ where
                     usage: outcome.usage,
                     events,
                     turn,
+                    generated_artifacts,
                 })
             }
             Err(error) => {
@@ -334,4 +364,165 @@ fn failure_termination(error: &AgentRuntimeError) -> TerminationReason {
 pub enum TurnRunnerError {
     #[error("runtime turn failed: {0}")]
     Runtime(#[from] AgentRuntimeError),
+    #[error("failed to prepare session workspace: {0}")]
+    WorkspaceIo(#[from] std::io::Error),
+}
+
+fn prepare_session_workspace_at(
+    workspace_root: &Path,
+    session_id: &SessionId,
+) -> Result<PathBuf, std::io::Error> {
+    let workspace = session_workspace_path(workspace_root, session_id);
+    fs::create_dir_all(workspace.join("scripts"))?;
+    fs::create_dir_all(workspace.join("outputs"))?;
+    Ok(workspace)
+}
+
+fn session_workspace_path(workspace_root: &Path, session_id: &SessionId) -> PathBuf {
+    workspace_root.join(session_id.to_string())
+}
+
+fn collect_generated_artifacts(
+    working_directory: &Path,
+    since: SystemTime,
+) -> Result<Vec<GeneratedArtifact>, std::io::Error> {
+    let outputs_dir = working_directory.join("outputs");
+    let mut artifacts = Vec::new();
+    for entry in fs::read_dir(outputs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if modified < since {
+            continue;
+        }
+        let Some((kind, mime_type)) = generated_artifact_kind(&path) else {
+            continue;
+        };
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        artifacts.push((
+            modified,
+            GeneratedArtifact {
+                kind,
+                path,
+                file_name,
+                mime_type: Some(mime_type.to_owned()),
+            },
+        ));
+    }
+    artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(artifacts
+        .into_iter()
+        .map(|(_, artifact)| artifact)
+        .collect())
+}
+
+fn generated_artifact_kind(path: &Path) -> Option<(GeneratedArtifactKind, &'static str)> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some((GeneratedArtifactKind::Image, "image/png")),
+        "jpg" | "jpeg" => Some((GeneratedArtifactKind::Image, "image/jpeg")),
+        "gif" => Some((GeneratedArtifactKind::Image, "image/gif")),
+        "webp" => Some((GeneratedArtifactKind::Image, "image/webp")),
+        "pdf" => Some((GeneratedArtifactKind::Document, "application/pdf")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::types::SessionId;
+
+    use super::{
+        GeneratedArtifactKind, collect_generated_artifacts, prepare_session_workspace_at,
+        session_workspace_path,
+    };
+
+    #[test]
+    fn session_workspace_path_uses_session_id_under_workspace_root() {
+        let workspace_root = PathBuf::from("/tmp/arka-workspaces");
+        let session_id = SessionId::new();
+
+        assert_eq!(
+            session_workspace_path(&workspace_root, &session_id),
+            workspace_root.join(session_id.to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_session_workspace_creates_session_scripts_and_outputs_dirs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "agent-controlplane-session-workspace-test-{}-{unique}",
+            std::process::id()
+        ));
+        let session_id = SessionId::new();
+
+        let workspace = prepare_session_workspace_at(&workspace_root, &session_id)
+            .expect("session workspace should be prepared");
+
+        assert_eq!(workspace, workspace_root.join(session_id.to_string()));
+        assert!(workspace.is_dir());
+        assert!(workspace.join("scripts").is_dir());
+        assert!(workspace.join("outputs").is_dir());
+
+        fs::remove_dir_all(&workspace_root).expect("temp directory should be removable");
+    }
+
+    #[test]
+    fn prepare_session_workspace_isolates_each_session_directory() {
+        let workspace_root = PathBuf::from("/tmp/arka-workspaces");
+        let first = SessionId::new();
+        let second = SessionId::new();
+
+        assert_ne!(
+            session_workspace_path(&workspace_root, &first),
+            session_workspace_path(&workspace_root, &second)
+        );
+    }
+
+    #[test]
+    fn collect_generated_artifacts_reads_recent_output_images() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "agent-controlplane-generated-artifacts-test-{}-{unique}",
+            std::process::id()
+        ));
+        let session_id = SessionId::new();
+        let workspace = prepare_session_workspace_at(&workspace_root, &session_id)
+            .expect("session workspace should be prepared");
+        let image_path = workspace.join("outputs").join("chart.png");
+        fs::write(&image_path, b"png-bytes").expect("image output should write");
+
+        let artifacts =
+            collect_generated_artifacts(&workspace, SystemTime::UNIX_EPOCH).expect("scan works");
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, GeneratedArtifactKind::Image);
+        assert_eq!(artifacts[0].file_name, "chart.png");
+        assert_eq!(artifacts[0].mime_type.as_deref(), Some("image/png"));
+
+        fs::remove_dir_all(&workspace_root).expect("temp directory should be removable");
+    }
 }

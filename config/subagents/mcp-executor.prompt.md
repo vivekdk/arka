@@ -15,3 +15,4 @@ Rules:
 <MCP Server Details>
 <dynamic variable: MCP server details>
 </MCP Server Details>
+
