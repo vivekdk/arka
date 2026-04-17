@@ -139,7 +139,10 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "subagent_step_decision",
-                    "schema": subagent_decision_schema(&request.tool_mask_plan, &request.registered_tools),
+                    "schema": subagent_decision_schema(
+                        &request.tool_mask_plan,
+                        &request.registered_tools,
+                    ),
                     "strict": true
                 }
             },
@@ -907,6 +910,22 @@ fn decision_schema() -> Value {
                         "type": "object",
                         "required": ["kind", "value"],
                         "properties": {
+                            "kind": { "type": "string", "enum": ["mcp_server_scope"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["server_name"],
+                                "properties": {
+                                    "server_name": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
                             "kind": { "type": "string", "enum": ["local_tools_scope"] },
                             "value": {
                                 "type": "object",
@@ -1313,6 +1332,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_server_scoped_delegate_subagent_decision() {
+        let decision = parse_decision_text(
+            r#"{"type":"delegate_subagent","content":"","subagent_type":"mcp-executor","goal":"inspect one server","target":{"kind":"mcp_server_scope","value":{"server_name":"postgres"}}}"#,
+        )
+        .expect("decision should parse");
+
+        assert_eq!(
+            decision,
+            agent_runtime::model::ModelStepDecision::DelegateSubagent {
+                delegation: agent_runtime::model::SubagentDelegationRequest {
+                    subagent_type: "mcp-executor".to_owned(),
+                    goal: "inspect one server".to_owned(),
+                    target: agent_runtime::state::DelegationTarget::McpServerScope(
+                        agent_runtime::state::McpServerScopeTarget {
+                            server_name: agent_runtime::state::ServerName::new("postgres")
+                                .expect("valid server name"),
+                        }
+                    ),
+                }
+            }
+        );
+    }
+
+    #[test]
     fn parses_final_decision_with_required_calls_field() {
         let decision = parse_decision_text(
             r#"{"type":"final","content":"done","subagent_type":"","goal":"","target":null}"#,
@@ -1423,7 +1466,6 @@ mod tests {
         assert_eq!(schema["type"], json!("object"));
         assert_eq!(schema["additionalProperties"], json!(false));
         assert!(schema.get("anyOf").is_none());
-        assert!(schema.get("oneOf").is_none());
         assert!(schema.get("allOf").is_none());
         assert!(schema.get("enum").is_none());
         assert!(schema.get("not").is_none());
@@ -1439,124 +1481,14 @@ mod tests {
             schema["properties"]["arguments"]["anyOf"][1]["required"],
             json!([])
         );
-    }
-
-    #[test]
-    fn subagent_schema_uses_strict_local_tool_arguments_schema() {
-        let tools = builtin_local_tool_catalog();
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["local.write_file".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: vec!["write_file".to_owned()],
-                allowed_mcp_tools: Vec::new(),
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(arguments["additionalProperties"], json!(false));
-        assert_eq!(arguments["required"], json!(["content", "path"]));
         assert_eq!(
-            arguments["properties"]["content"]["anyOf"],
-            json!([
-                { "type": "string" },
-                { "type": "null" }
-            ])
+            schema["properties"]["arguments"]["anyOf"][1]["additionalProperties"],
+            json!(false)
         );
     }
 
     #[test]
-    fn subagent_schema_strictifies_mcp_tool_arguments_schema() {
-        let server = agent_runtime::state::ServerName::new("postgres").expect("valid server");
-        let tools = vec![ToolDescriptor::mcp_tool(
-            &server,
-            "run-sql",
-            None,
-            None,
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                }
-            }),
-        )];
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["mcp.postgres.tool.run-sql".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: Vec::new(),
-                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
-                    server_name: "postgres".to_owned(),
-                    tool_name: "run-sql".to_owned(),
-                }],
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(arguments["additionalProperties"], json!(false));
-        assert_eq!(arguments["required"], json!(["query"]));
-    }
-
-    #[test]
-    fn subagent_schema_requires_all_mcp_argument_properties_for_strict_mode() {
-        let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
-        let tools = vec![ToolDescriptor::mcp_tool(
-            &server,
-            "list_tables",
-            None,
-            None,
-            json!({
-                "type": "object",
-                "required": ["database"],
-                "properties": {
-                    "database": { "type": "string" },
-                    "like": {
-                        "anyOf": [
-                            { "type": "string" },
-                            { "type": "null" }
-                        ],
-                        "default": null
-                    },
-                    "include_detailed_columns": {
-                        "type": "boolean",
-                        "default": true
-                    }
-                }
-            }),
-        )];
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["mcp.ex-vol.tool.list_tables".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: Vec::new(),
-                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
-                    server_name: "ex-vol".to_owned(),
-                    tool_name: "list_tables".to_owned(),
-                }],
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(
-            arguments["required"],
-            json!(["database", "include_detailed_columns", "like"])
-        );
-    }
-
-    #[test]
-    fn subagent_schema_merges_multiple_allowed_tool_variants_without_top_level_branching() {
+    fn subagent_schema_lists_allowed_identifiers_without_conditionals() {
         let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
         let mut tools = builtin_local_tool_catalog();
         tools.push(ToolDescriptor::mcp_tool(
@@ -1601,6 +1533,8 @@ mod tests {
 
         assert_eq!(schema["type"], json!("object"));
         assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("allOf").is_none());
         assert_eq!(
             schema["properties"]["type"]["enum"],
             json!([
@@ -1631,6 +1565,13 @@ mod tests {
                 "database",
                 "include_detailed_columns",
                 "timeout_ms"
+            ])
+        );
+        assert_eq!(
+            schema["properties"]["arguments"]["anyOf"][1]["properties"]["database"]["anyOf"],
+            json!([
+                { "type": "string" },
+                { "type": "null" }
             ])
         );
     }

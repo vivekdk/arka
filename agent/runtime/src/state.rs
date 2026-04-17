@@ -539,6 +539,12 @@ pub struct McpCapabilityTarget {
     pub capability_id: String,
 }
 
+/// One MCP server scope selected by the main agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerScopeTarget {
+    pub server_name: ServerName,
+}
+
 /// One local-tools delegation scope selected by the main agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalToolsScopeTarget {
@@ -558,6 +564,7 @@ impl LocalToolsScopeTarget {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DelegationTarget {
     McpCapability(McpCapabilityTarget),
+    McpServerScope(McpServerScopeTarget),
     LocalToolsScope(LocalToolsScopeTarget),
 }
 
@@ -568,6 +575,7 @@ impl DelegationTarget {
                 "{}::{:?}::{}",
                 target.server_name, target.capability_kind, target.capability_id
             ),
+            Self::McpServerScope(target) => format!("{}::server_scope", target.server_name),
             Self::LocalToolsScope(target) => format!("local_tools::{}", target.scope),
         }
     }

@@ -1,7 +1,7 @@
 //! Agent runtime implementation.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
@@ -14,9 +14,9 @@ use crate::{
     },
     ids::{MessageId, StepId, TurnId},
     model::{
-        FinalAnswerRenderRequest, FinalAnswerRenderResponse, FinalAnswerStreamSink, ModelAdapter,
-        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
-        ModelStepDecision, SubagentDecision, SubagentStepRequest,
+        FinalAnswerRenderRequest, FinalAnswerRenderResponse, ModelAdapter, ModelAdapterArtifact,
+        ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError, ModelStepDecision,
+        SubagentDecision, SubagentStepRequest,
     },
     policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
     prompt::{PromptAssembler, PromptRenderError, load_and_render_system_prompt},
@@ -39,6 +39,7 @@ use mcp_metadata::{
     CapabilityKind, FullResourceMetadata, FullToolMetadata, McpFullCatalog, McpMinimalCatalog,
     artifact_paths, load_full_catalog, load_minimal_catalog,
 };
+use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -281,8 +282,14 @@ where
             let mut step_messages = Vec::new();
             match decision.clone() {
                 ModelStepDecision::Final { content } => {
-                    let rendered = self
-                        .render_final_answer(
+                    let rendered = if should_skip_final_answer_render(&content) {
+                        FinalAnswerRenderResponse {
+                            canonical_text: content.clone(),
+                            display_text: content.clone(),
+                            usage: UsageSummary::default(),
+                        }
+                    } else {
+                        self.render_final_answer(
                             &request,
                             &prompt_messages,
                             request.model_config.clone(),
@@ -292,7 +299,8 @@ where
                             &step_id,
                             &main_executor,
                         )
-                        .await?;
+                        .await?
+                    };
                     usage.add_assign(rendered.usage);
                     let message = MessageRecord::Llm(LlmMessageRecord {
                         message_id: MessageId::new(),
@@ -538,6 +546,7 @@ where
         let mut trace_messages = Vec::new();
         let mut subagent_messages = Vec::new();
         let mut executed_action_count = 0u32;
+        let mut seen_mcp_actions = HashSet::new();
         let mut last_tool_mask_plan =
             crate::policy::ToolMaskPlan::terminal_only("no delegated tools evaluated yet");
 
@@ -712,11 +721,77 @@ where
                         }
                     };
 
+                    let sanitized = match sanitize_mcp_tool_arguments(
+                        &registered_tools,
+                        &call_target,
+                        &arguments,
+                    ) {
+                        Ok(result) => {
+                            emit_mcp_argument_validation_debug(
+                                sink,
+                                turn_id,
+                                step_id,
+                                &executor,
+                                &call_target,
+                                &result,
+                                &arguments,
+                            );
+                            result
+                        }
+                        Err(error) => {
+                            let validation = SanitizedMcpArguments::rejected(error.clone());
+                            emit_mcp_argument_validation_debug(
+                                sink,
+                                turn_id,
+                                step_id,
+                                &executor,
+                                &call_target,
+                                &validation,
+                                &arguments,
+                            );
+                            let validation_message =
+                                MessageRecord::McpResult(McpResultMessageRecord {
+                                    message_id: MessageId::new(),
+                                    timestamp: SystemTime::now(),
+                                    target: call_target.clone(),
+                                    result_summary: error.clone(),
+                                    error: Some(error),
+                                });
+                            subagent_messages.push(validation_message);
+                            continue;
+                        }
+                    };
+                    let sanitized_arguments = sanitized.arguments.clone().unwrap_or(Value::Null);
+
+                    let action_signature = format!(
+                        "tool::{}::{}::{}",
+                        call_target.server_name,
+                        call_target.capability_id,
+                        canonicalize_action_arguments(&sanitized_arguments)
+                    );
+                    if !seen_mcp_actions.insert(action_signature) {
+                        return Ok((
+                            subagent_policy_result(
+                                subagent_type,
+                                executed_action_count,
+                                format!(
+                                    "duplicate MCP tool call `{}` on server `{}` was blocked; choose a different next action or terminate",
+                                    call_target.capability_id, call_target.server_name
+                                ),
+                                Some(tool_mask_plan),
+                            ),
+                            DelegatedExecutionOutcome {
+                                usage,
+                                trace_messages,
+                            },
+                        ));
+                    }
+
                     let call_message = MessageRecord::McpCall(McpCallMessageRecord {
                         message_id: MessageId::new(),
                         timestamp: SystemTime::now(),
                         target: call_target.clone(),
-                        arguments: arguments.clone(),
+                        arguments: sanitized_arguments.clone(),
                     });
                     sink.record(RuntimeEvent::McpCalled {
                         turn_id: turn_id.clone(),
@@ -740,7 +815,7 @@ where
                         payload: serde_json::json!({
                             "server_name": call_target.server_name.to_string(),
                             "tool_name": call_target.capability_id.clone(),
-                            "arguments": arguments.clone(),
+                            "arguments": sanitized_arguments.clone(),
                         }),
                     });
                     let started = Instant::now();
@@ -748,7 +823,7 @@ where
                         &mut mcp_session.servers,
                         &call_target.server_name,
                         &tool_name,
-                        arguments,
+                        sanitized_arguments,
                         request.limits.mcp_call_timeout,
                     )
                     .await;
@@ -841,6 +916,28 @@ where
                             ));
                         }
                     };
+
+                    let action_signature = format!(
+                        "resource::{}::{}",
+                        call_target.server_name, call_target.capability_id
+                    );
+                    if !seen_mcp_actions.insert(action_signature) {
+                        return Ok((
+                            subagent_policy_result(
+                                subagent_type,
+                                executed_action_count,
+                                format!(
+                                    "duplicate MCP resource read `{}` on server `{}` was blocked; choose a different next action or terminate",
+                                    call_target.capability_id, call_target.server_name
+                                ),
+                                Some(tool_mask_plan),
+                            ),
+                            DelegatedExecutionOutcome {
+                                usage,
+                                trace_messages,
+                            },
+                        ));
+                    }
 
                     let call_message = MessageRecord::McpCall(McpCallMessageRecord {
                         message_id: MessageId::new(),
@@ -1105,6 +1202,12 @@ where
         step_id: &StepId,
         executor: &RuntimeExecutor,
     ) -> Result<FinalAnswerRenderResponse, RuntimeError> {
+        sink.record(RuntimeEvent::ModelCalled {
+            turn_id: turn_id.clone(),
+            step_id: step_id.clone(),
+            executor: executor.clone(),
+            at: SystemTime::now(),
+        });
         sink.record(RuntimeEvent::AnswerRenderStarted {
             turn_id: turn_id.clone(),
             step_id: step_id.clone(),
@@ -1119,12 +1222,7 @@ where
             &request.response_target,
         );
         let started = Instant::now();
-        let mut stream_sink = RuntimeAnswerStreamSink {
-            turn_id: turn_id.clone(),
-            step_id: step_id.clone(),
-            executor: executor.clone(),
-            event_sink: sink,
-        };
+        let mut debug_sink = BoundModelDebugSink::new(sink, turn_id, step_id, executor.clone());
         let result = self
             .model_adapter
             .render_final_answer(
@@ -1134,13 +1232,20 @@ where
                     answer_brief: answer_brief.to_owned(),
                     response_target: request.response_target.clone(),
                 },
-                Some(&mut stream_sink),
                 None,
+                Some(&mut debug_sink),
             )
             .await
             .map_err(RuntimeError::Model);
         match result {
             Ok(response) => {
+                sink.record(RuntimeEvent::AnswerTextDelta {
+                    turn_id: turn_id.clone(),
+                    step_id: step_id.clone(),
+                    executor: executor.clone(),
+                    at: SystemTime::now(),
+                    delta: response.display_text.clone(),
+                });
                 sink.record(RuntimeEvent::AnswerRenderCompleted {
                     turn_id: turn_id.clone(),
                     step_id: step_id.clone(),
@@ -1168,28 +1273,6 @@ where
                 Err(error)
             }
         }
-    }
-}
-
-struct RuntimeAnswerStreamSink<'a> {
-    turn_id: TurnId,
-    step_id: StepId,
-    executor: RuntimeExecutor,
-    event_sink: &'a mut dyn RuntimeDebugSink,
-}
-
-impl FinalAnswerStreamSink for RuntimeAnswerStreamSink<'_> {
-    fn record_text_delta(&mut self, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        self.event_sink.record(RuntimeEvent::AnswerTextDelta {
-            turn_id: self.turn_id.clone(),
-            step_id: self.step_id.clone(),
-            executor: self.executor.clone(),
-            at: SystemTime::now(),
-            delta: delta.to_owned(),
-        });
     }
 }
 
@@ -1331,6 +1414,10 @@ fn build_subagent_prompt(
                 .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
             let template =
                 load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
+            let recent_results_block =
+                render_recent_mcp_results_context_for_mcp(current_turn_messages);
+            let confirmed_tables_block =
+                render_confirmed_table_context(current_turn_messages, &target.server_name);
 
             let capability_block = match target.capability_kind {
                 CapabilityKind::Tool => {
@@ -1358,8 +1445,25 @@ fn build_subagent_prompt(
             };
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n\n{capability_block}",
-                target.capability_id
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n\n{}\n{}\n{capability_block}",
+                target.capability_id, confirmed_tables_block, recent_results_block,
+            ))
+        }
+        DelegationTarget::McpServerScope(target) => {
+            let server = mcp_session
+                .servers
+                .get(&target.server_name)
+                .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+            let template =
+                load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
+            let recent_results_block =
+                render_recent_mcp_results_context_for_mcp(current_turn_messages);
+            let confirmed_tables_block =
+                render_confirmed_table_context(current_turn_messages, &target.server_name);
+
+            Ok(format!(
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n\n{}\n{}\n",
+                target.server_name, confirmed_tables_block, recent_results_block,
             ))
         }
         DelegationTarget::LocalToolsScope(scope) => {
@@ -1429,6 +1533,130 @@ fn render_recent_mcp_results_context(messages: &[MessageRecord]) -> String {
     )
 }
 
+fn render_recent_mcp_results_context_for_mcp(messages: &[MessageRecord]) -> String {
+    const MAX_RECENT_RESULTS: usize = 3;
+    const MAX_RESULT_SUMMARY_CHARS: usize = 1_500;
+
+    let recent_results = messages
+        .iter()
+        .rev()
+        .filter_map(|message| match message {
+            MessageRecord::McpResult(record) => Some(record),
+            _ => None,
+        })
+        .take(MAX_RECENT_RESULTS)
+        .collect::<Vec<_>>();
+
+    if recent_results.is_empty() {
+        return "## Recent Computed Results\nNo recent MCP-derived results are available yet for this server. If the exact target table is not already confirmed, start with discovery.\n".to_owned();
+    }
+
+    let rendered_results = recent_results
+        .into_iter()
+        .rev()
+        .map(|record| {
+            format!(
+                "- server={} kind={:?} target={} error={}\n  result_summary:\n{}",
+                record.target.server_name,
+                record.target.capability_kind,
+                record.target.capability_id,
+                record.error.is_some(),
+                indent_block(&truncate_for_prompt(
+                    &record.result_summary,
+                    MAX_RESULT_SUMMARY_CHARS
+                ))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "## Recent Computed Results\nUse these recent MCP-derived results as server-side analysis context. Prefer direct `run_query` only when they already confirm the exact target table; otherwise continue with discovery.\n{}\n",
+        rendered_results
+    )
+}
+
+fn render_confirmed_table_context(messages: &[MessageRecord], server_name: &ServerName) -> String {
+    let confirmed_tables = collect_confirmed_tables(messages, server_name);
+    if confirmed_tables.is_empty() {
+        return "## Confirmed Tables\nNo exact table has been confirmed yet for this server. Prefer discovery first unless the user explicitly named the table.\n".to_owned();
+    }
+
+    let rendered = confirmed_tables
+        .into_iter()
+        .map(|table| format!("- {table}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "## Confirmed Tables\nThese exact tables were already confirmed by successful MCP query context in this session. Prefer direct `run_query` only when one of these tables clearly matches the delegated goal.\n{}\n",
+        rendered
+    )
+}
+
+fn collect_confirmed_tables(messages: &[MessageRecord], server_name: &ServerName) -> Vec<String> {
+    let mut confirmed = Vec::new();
+    let mut pending_queries = HashMap::<String, Vec<String>>::new();
+
+    for message in messages {
+        match message {
+            MessageRecord::McpCall(record)
+                if record.target.server_name == *server_name
+                    && record.target.capability_kind == CapabilityKind::Tool
+                    && record.target.capability_id == "run_query" =>
+            {
+                if let Some(query) = record
+                    .arguments
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    pending_queries.insert(query.to_owned(), extract_table_references(query));
+                }
+            }
+            MessageRecord::McpResult(record)
+                if record.target.server_name == *server_name
+                    && record.target.capability_kind == CapabilityKind::Tool
+                    && record.target.capability_id == "run_query"
+                    && record.error.is_none() =>
+            {
+                for tables in pending_queries.values() {
+                    for table in tables {
+                        if !confirmed.iter().any(|existing| existing == table) {
+                            confirmed.push(table.clone());
+                        }
+                    }
+                }
+                pending_queries.clear();
+            }
+            _ => {}
+        }
+    }
+
+    confirmed
+}
+
+fn extract_table_references(query: &str) -> Vec<String> {
+    let flattened = query.replace(['\n', '\r', '\t'], " ");
+    let normalized = flattened
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c: char| matches!(c, ',' | ';' | '(' | ')' | '"' | '\'' | '`'))
+        })
+        .collect::<Vec<_>>();
+    let mut tables = Vec::new();
+
+    for window in normalized.windows(2) {
+        let keyword = window[0].to_ascii_lowercase();
+        if matches!(keyword.as_str(), "from" | "join") {
+            let candidate = window[1];
+            if candidate.contains('.') && !tables.iter().any(|existing| existing == candidate) {
+                tables.push(candidate.to_owned());
+            }
+        }
+    }
+
+    tables
+}
+
 fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_owned();
@@ -1478,6 +1706,35 @@ fn build_subagent_tool_catalog(
                 .servers
                 .get(&target.server_name)
                 .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+            let mut tools = Vec::with_capacity(1);
+            match target.capability_kind {
+                CapabilityKind::Tool => {
+                    let tool = lookup_tool(&server.full_catalog, &target.capability_id)?;
+                    tools.push(ToolDescriptor::mcp_tool(
+                        &target.server_name,
+                        &tool.name,
+                        tool.title.as_deref(),
+                        tool.description.as_deref(),
+                        tool.input_schema.clone(),
+                    ));
+                }
+                CapabilityKind::Resource => {
+                    let resource = lookup_resource(&server.full_catalog, &target.capability_id)?;
+                    tools.push(ToolDescriptor::mcp_resource(
+                        &target.server_name,
+                        &resource.uri,
+                        resource.title.as_deref(),
+                        resource.description.as_deref(),
+                    ));
+                }
+            }
+            Ok(tools)
+        }
+        DelegationTarget::McpServerScope(target) => {
+            let server = mcp_session
+                .servers
+                .get(&target.server_name)
+                .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
             let mut tools = Vec::new();
             for tool in &server.full_catalog.tools {
                 tools.push(ToolDescriptor::mcp_tool(
@@ -1500,6 +1757,231 @@ fn build_subagent_tool_catalog(
         }
         DelegationTarget::LocalToolsScope(_) => Ok(builtin_local_tool_catalog()),
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SanitizedMcpArguments {
+    arguments: Option<Value>,
+    dropped_keys: Vec<String>,
+    rejection_reason: Option<String>,
+}
+
+impl SanitizedMcpArguments {
+    fn rejected(reason: String) -> Self {
+        Self {
+            arguments: None,
+            dropped_keys: Vec::new(),
+            rejection_reason: Some(reason),
+        }
+    }
+}
+
+fn sanitize_mcp_tool_arguments(
+    registered_tools: &[ToolDescriptor],
+    target: &McpCapabilityTarget,
+    arguments: &Value,
+) -> Result<SanitizedMcpArguments, String> {
+    let tool = registered_tools
+        .iter()
+        .find(|tool| {
+            tool.family == crate::tools::ToolFamily::McpTool
+                && tool.server_name.as_ref() == Some(&target.server_name)
+                && tool.name == target.capability_id
+        })
+        .ok_or_else(|| {
+            format!(
+                "no registered MCP tool descriptor found for `{}` on server `{}`",
+                target.capability_id, target.server_name
+            )
+        })?;
+
+    sanitize_object_arguments(&tool.input_schema, arguments)
+}
+
+fn sanitize_object_arguments(
+    schema: &Value,
+    arguments: &Value,
+) -> Result<SanitizedMcpArguments, String> {
+    let Value::Object(argument_map) = arguments else {
+        return Err("MCP tool arguments must be a JSON object".to_owned());
+    };
+
+    let Value::Object(schema_map) = schema else {
+        return Ok(SanitizedMcpArguments {
+            arguments: Some(arguments.clone()),
+            dropped_keys: Vec::new(),
+            rejection_reason: None,
+        });
+    };
+
+    let properties = schema_map
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required = schema_map
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+
+    let mut sanitized = serde_json::Map::new();
+    let mut dropped_keys = Vec::new();
+    let mut present_keys = argument_map.keys().cloned().collect::<Vec<_>>();
+    present_keys.sort();
+
+    for key in present_keys {
+        let value = argument_map
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("missing argument value for `{key}`"))?;
+        let Some(property_schema) = properties.get(&key) else {
+            dropped_keys.push(key);
+            continue;
+        };
+
+        if !json_value_matches_schema(&value, property_schema) {
+            return Err(format!(
+                "argument `{}` does not match the selected tool schema",
+                key
+            ));
+        }
+        sanitized.insert(key, value);
+    }
+
+    for key in required {
+        if !sanitized.contains_key(key) {
+            return Err(format!(
+                "required argument `{}` is missing for the selected tool",
+                key
+            ));
+        }
+    }
+
+    Ok(SanitizedMcpArguments {
+        arguments: Some(Value::Object(sanitized)),
+        dropped_keys,
+        rejection_reason: None,
+    })
+}
+
+fn json_value_matches_schema(value: &Value, schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            if let Some(any_of) = map.get("anyOf").and_then(Value::as_array) {
+                let matches_any_variant = any_of
+                    .iter()
+                    .any(|variant| json_value_matches_schema(value, variant));
+                return matches_any_variant;
+            }
+
+            match map.get("type").and_then(Value::as_str) {
+                Some("string") => value.is_string(),
+                Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+                Some("number") => value.as_f64().is_some(),
+                Some("boolean") => value.is_boolean(),
+                Some("object") => value.is_object(),
+                Some("array") => value.is_array(),
+                Some("null") => value.is_null(),
+                Some(_) | None => true,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn emit_mcp_argument_validation_debug(
+    sink: &mut dyn RuntimeDebugSink,
+    turn_id: &TurnId,
+    step_id: &StepId,
+    executor: &RuntimeExecutor,
+    target: &McpCapabilityTarget,
+    sanitized: &SanitizedMcpArguments,
+    raw_arguments: &Value,
+) {
+    if sanitized.dropped_keys.is_empty() && sanitized.rejection_reason.is_none() {
+        return;
+    }
+
+    let summary = if let Some(reason) = &sanitized.rejection_reason {
+        format!(
+            "rejected MCP arguments for {}::{}",
+            target.server_name, target.capability_id
+        )
+        .to_owned()
+            + &format!(" ({reason})")
+    } else {
+        format!(
+            "sanitized MCP arguments for {}::{}",
+            target.server_name, target.capability_id
+        )
+    };
+
+    sink.record_raw_artifact(RuntimeRawArtifact {
+        turn_id: turn_id.clone(),
+        step_id: Some(step_id.clone()),
+        occurred_at: SystemTime::now(),
+        kind: RuntimeRawArtifactKind::PolicyDecision,
+        source: "mcp_argument_validator".to_owned(),
+        executor: executor.clone(),
+        summary: Some(summary),
+        payload: serde_json::json!({
+            "server_name": target.server_name.to_string(),
+            "tool_name": target.capability_id,
+            "raw_arguments": raw_arguments,
+            "sanitized_arguments": sanitized.arguments,
+            "dropped_keys": sanitized.dropped_keys,
+            "rejection_reason": sanitized.rejection_reason,
+        }),
+    });
+}
+
+fn canonicalize_action_arguments(arguments: &serde_json::Value) -> String {
+    let mut value = arguments.clone();
+    canonicalize_json_value(&mut value);
+    value.to_string()
+}
+
+fn canonicalize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| {
+                    let mut normalized = value.clone();
+                    canonicalize_json_value(&mut normalized);
+                    (key.clone(), normalized)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            map.clear();
+            for (key, normalized) in entries {
+                map.insert(key, normalized);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_skip_final_answer_render(answer_brief: &str) -> bool {
+    let trimmed = answer_brief.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 500 {
+        return false;
+    }
+    if trimmed.contains("```") {
+        return false;
+    }
+    !trimmed.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('|') || line.ends_with('|')
+    })
 }
 
 fn validate_masked_mcp_call(
@@ -2114,18 +2596,28 @@ mod tests {
         time::SystemTime,
     };
 
+    use mcp_config::McpServerConfig;
     use mcp_metadata::CapabilityKind;
+    use mcp_metadata::{
+        CURRENT_SCHEMA_VERSION, FullResourceMetadata, FullToolMetadata, McpCapabilityFamilies,
+        McpCapabilityFamilySummary, McpFullCatalog, McpMinimalCatalog, McpServerMetadata,
+        MinimalResourceMetadata, MinimalToolMetadata,
+    };
 
     use crate::{
         ids::MessageId,
         state::{
-            DelegationTarget, LocalToolsScopeTarget, McpCapabilityTarget, McpResultMessageRecord,
-            MessageRecord, ServerName,
+            DelegationTarget, LocalToolsScopeTarget, McpCallMessageRecord, McpCapabilityTarget,
+            McpResultMessageRecord, McpServerScopeTarget, MessageRecord, ServerName,
         },
         subagent::ConfiguredSubagent,
     };
 
-    use super::{McpSession, build_subagent_prompt, render_recent_mcp_results_context};
+    use super::{
+        McpSession, PreparedServer, build_subagent_prompt, build_subagent_tool_catalog,
+        render_confirmed_table_context, render_recent_mcp_results_context,
+        sanitize_mcp_tool_arguments,
+    };
 
     #[test]
     fn recent_mcp_results_context_renders_recent_results_and_guidance() {
@@ -2196,6 +2688,264 @@ mod tests {
         assert!(prompt.contains("\"new_users\""));
         assert!(prompt.contains("write them into a local file"));
         assert!(prompt.contains("## Local Tools"));
+    }
+
+    fn fake_mcp_session(server_name: &ServerName) -> McpSession {
+        McpSession {
+            servers: HashMap::from([(
+                server_name.clone(),
+                PreparedServer {
+                    config: McpServerConfig {
+                        name: server_name.to_string(),
+                        transport: None,
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: HashMap::new(),
+                        description: None,
+                    },
+                    minimal_catalog: McpMinimalCatalog {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        server: McpServerMetadata {
+                            logical_name: server_name.to_string(),
+                            ..Default::default()
+                        },
+                        capability_families: McpCapabilityFamilies {
+                            tools: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 2,
+                            },
+                            resources: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                        },
+                        tools: vec![
+                            MinimalToolMetadata {
+                                name: "list_tables".to_owned(),
+                                ..Default::default()
+                            },
+                            MinimalToolMetadata {
+                                name: "run_query".to_owned(),
+                                ..Default::default()
+                            },
+                        ],
+                        resources: vec![MinimalResourceMetadata {
+                            uri: "schema://users".to_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    full_catalog: McpFullCatalog {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        server: McpServerMetadata {
+                            logical_name: server_name.to_string(),
+                            ..Default::default()
+                        },
+                        capability_families: McpCapabilityFamilies {
+                            tools: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 2,
+                            },
+                            resources: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                        },
+                        tools: vec![
+                            FullToolMetadata {
+                                name: "list_tables".to_owned(),
+                                input_schema: serde_json::json!({
+                                    "type": "object",
+                                    "required": ["database"],
+                                    "properties": {
+                                        "database": { "type": "string" }
+                                    }
+                                }),
+                                ..Default::default()
+                            },
+                            FullToolMetadata {
+                                name: "run_query".to_owned(),
+                                input_schema: serde_json::json!({
+                                    "type": "object",
+                                    "required": ["query"],
+                                    "properties": {
+                                        "query": { "type": "string" }
+                                    }
+                                }),
+                                ..Default::default()
+                            },
+                        ],
+                        resources: vec![FullResourceMetadata {
+                            uri: "schema://users".to_owned(),
+                            ..Default::default()
+                        }],
+                        extensions: serde_json::Value::Null,
+                    },
+                    full_catalog_markdown: "# MCP Full: ex-vol\n\n- tool: list_tables\n- tool: run_query\n- resource: schema://users".to_owned(),
+                    connection: None,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn mcp_server_scope_prompt_includes_server_scope_and_no_local_tools() {
+        let registry_path = workspace_root().join("config").join("subagents.json");
+        let configured = ConfiguredSubagent {
+            subagent_type: "mcp-executor".to_owned(),
+            display_name: "Mcp Executor".to_owned(),
+            purpose: "Complete delegated MCP work".to_owned(),
+            when_to_use: "For one-server MCP tasks".to_owned(),
+            target_requirements: "mcp server scope".to_owned(),
+            result_summary: "Executes delegated MCP work".to_owned(),
+            prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+
+        let prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &fake_mcp_session(&server_name),
+            &DelegationTarget::McpServerScope(McpServerScopeTarget {
+                server_name: server_name.clone(),
+            }),
+            "Inspect users",
+            "How many users are there?",
+            &workspace_root(),
+            &[],
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.contains("# MCP Full: ex-vol"));
+        assert!(prompt.contains("Selected server: ex-vol"));
+        assert!(
+            prompt
+                .contains("Execution scope: any allowed MCP tool or resource on this server only")
+        );
+        assert!(prompt.contains("Local tools: unavailable"));
+    }
+
+    #[test]
+    fn confirmed_table_context_uses_successful_recent_queries() {
+        let server_name = ServerName::new("vol").expect("valid server");
+        let rendered = render_confirmed_table_context(
+            &[
+                MessageRecord::McpCall(McpCallMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    target: McpCapabilityTarget {
+                        server_name: server_name.clone(),
+                        capability_kind: CapabilityKind::Tool,
+                        capability_id: "run_query".to_owned(),
+                    },
+                    arguments: serde_json::json!({
+                        "query": "SELECT count(*) FROM volonte.users"
+                    }),
+                }),
+                MessageRecord::McpResult(McpResultMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    target: McpCapabilityTarget {
+                        server_name: server_name.clone(),
+                        capability_kind: CapabilityKind::Tool,
+                        capability_id: "run_query".to_owned(),
+                    },
+                    result_summary: "{\"columns\":[\"count\"],\"rows\":[[10]]}".to_owned(),
+                    error: None,
+                }),
+            ],
+            &server_name,
+        );
+
+        assert!(rendered.contains("volonte.users"));
+    }
+
+    #[test]
+    fn mcp_capability_subagent_catalog_only_exposes_selected_tool() {
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+        let target = DelegationTarget::McpCapability(McpCapabilityTarget {
+            server_name: server_name.clone(),
+            capability_kind: CapabilityKind::Tool,
+            capability_id: "run_query".to_owned(),
+        });
+        let tools = build_subagent_tool_catalog(&fake_mcp_session(&server_name), &target)
+            .expect("catalog should build");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "run_query");
+    }
+
+    #[test]
+    fn mcp_server_scope_catalog_exposes_full_server_tools_and_resources() {
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+        let tools = build_subagent_tool_catalog(
+            &fake_mcp_session(&server_name),
+            &DelegationTarget::McpServerScope(McpServerScopeTarget { server_name }),
+        )
+        .expect("catalog should build");
+
+        assert_eq!(tools.len(), 3);
+        assert!(tools.iter().any(|tool| tool.name == "list_tables"));
+        assert!(tools.iter().any(|tool| tool.name == "run_query"));
+        assert!(tools.iter().any(|tool| tool.name == "schema://users"));
+    }
+
+    #[test]
+    fn sanitize_mcp_tool_arguments_drops_extraneous_keys() {
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+        let tools = build_subagent_tool_catalog(
+            &fake_mcp_session(&server_name),
+            &DelegationTarget::McpServerScope(McpServerScopeTarget {
+                server_name: server_name.clone(),
+            }),
+        )
+        .expect("catalog should build");
+
+        let sanitized = sanitize_mcp_tool_arguments(
+            &tools,
+            &McpCapabilityTarget {
+                server_name,
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "run_query".to_owned(),
+            },
+            &serde_json::json!({
+                "query": "select 1",
+                "database": "volonte"
+            }),
+        )
+        .expect("arguments should sanitize");
+
+        assert_eq!(
+            sanitized.arguments,
+            Some(serde_json::json!({"query": "select 1"}))
+        );
+        assert_eq!(sanitized.dropped_keys, vec!["database".to_owned()]);
+    }
+
+    #[test]
+    fn sanitize_mcp_tool_arguments_rejects_missing_required_keys() {
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+        let tools = build_subagent_tool_catalog(
+            &fake_mcp_session(&server_name),
+            &DelegationTarget::McpServerScope(McpServerScopeTarget {
+                server_name: server_name.clone(),
+            }),
+        )
+        .expect("catalog should build");
+
+        let error = sanitize_mcp_tool_arguments(
+            &tools,
+            &McpCapabilityTarget {
+                server_name,
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "run_query".to_owned(),
+            },
+            &serde_json::json!({}),
+        )
+        .expect_err("missing required query should fail");
+
+        assert!(error.contains("required argument `query` is missing"));
     }
 
     fn workspace_root() -> PathBuf {
