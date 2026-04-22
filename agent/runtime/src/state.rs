@@ -351,6 +351,9 @@ pub struct RunRequest {
     pub limits: RuntimeLimits,
     /// Provider and model selection for this turn.
     pub model_config: ModelConfig,
+    /// Whether the runtime requires turn-scoped todos for every turn.
+    #[serde(default)]
+    pub require_todos: bool,
 }
 
 /// Final runtime result returned to callers.

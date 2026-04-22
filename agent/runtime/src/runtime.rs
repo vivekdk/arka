@@ -19,7 +19,10 @@ use crate::{
         SubagentDecision, SubagentStepRequest,
     },
     policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
-    prompt::{PromptAssembler, PromptRenderError, load_and_render_system_prompt},
+    prompt::{
+        PromptAssembler, PromptRenderError, TodoPromptContext, TurnPolicyPromptContext,
+        load_and_render_system_prompt, render_todo_context, render_turn_policy_context,
+    },
     state::{
         DelegationTarget, LlmMessageRecord, LocalToolCallMessageRecord,
         LocalToolResultMessageRecord, McpCallMessageRecord, McpCapability, McpCapabilityTarget,
@@ -28,7 +31,10 @@ use crate::{
         UserMessageRecord,
     },
     subagent::{ConfiguredSubagent, SubagentConfigError, SubagentRegistry, load_subagent_prompt},
-    tools::{ToolDescriptor, builtin_local_tool_catalog, execute_local_tool},
+    todo::{
+        GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoList,
+    },
+    tools::{LocalToolContext, ToolDescriptor, builtin_local_tool_catalog, execute_local_tool},
 };
 use mcp_client::{
     ClientInfo, McpClient, McpClientError, McpConnection, McpResourceReadResult, McpToolCallResult,
@@ -43,6 +49,11 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::{info, warn};
+
+const MAX_TOTAL_SUBAGENT_MCP_ERRORS: u32 = 3;
+const MAX_TOTAL_SUBAGENT_LOCAL_TOOL_ERRORS: u32 = 4;
+const POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON: &str =
+    "postgres schema resource reads are disabled for postgres-mcp servers; use the query tool with simple SELECT-based discovery instead";
 
 /// Runtime entrypoint parameterized by a provider-specific model adapter.
 pub struct AgentRuntime<A> {
@@ -194,6 +205,11 @@ where
         mcp_session: &mut McpSession,
         sink: &mut dyn RuntimeDebugSink,
     ) -> Result<TurnOutcome, RuntimeError> {
+        let mut request = request;
+        request.require_todos &= should_require_todos_for_turn(
+            &request.user_message,
+            &request.conversation_history,
+        );
         validate_limits(&request)?;
 
         let subagent_registry = SubagentRegistry::load_from_path(&request.subagent_registry_path)?;
@@ -210,6 +226,23 @@ where
         let main_executor = RuntimeExecutor::main_agent();
 
         let turn_id = TurnId::new();
+        let turn_directory = turn_directory(&request.working_directory, &turn_id);
+        fs::create_dir_all(&turn_directory).map_err(|error| {
+            RuntimeError::Io(format!(
+                "failed to prepare turn workspace `{}`: {error}",
+                turn_directory.display()
+            ))
+        })?;
+        let todo_path = todo_file_path(&request.working_directory, &turn_id);
+        let html_output_path = deterministic_html_output_path(&request.working_directory, &turn_id);
+        if request.require_todos && !todo_path.exists() {
+            let starter_todos = vec![GENERIC_STARTER_TODO.to_owned()];
+            TodoList::initialize(&starter_todos)?.save_to_path(&todo_path)?;
+        }
+        let turn_policy_context = TurnPolicyPromptContext {
+            html_output_path: html_output_path.clone(),
+            require_todos: request.require_todos,
+        };
         let turn_started_at = SystemTime::now();
         sink.record(RuntimeEvent::TurnStarted {
             turn_id: turn_id.clone(),
@@ -240,6 +273,13 @@ where
 
         for step_number in 1..=request.limits.max_steps_per_turn {
             ensure_turn_time_remaining(turn_start, request.limits.turn_timeout)?;
+            reconcile_mandatory_todos_from_turn_trace(
+                &todo_path,
+                &html_output_path,
+                &request.working_directory,
+                &all_messages,
+            )?;
+            reconcile_active_todo_from_turn_trace(&todo_path, &all_messages)?;
 
             let step_id = StepId::new();
             let step_started_at = SystemTime::now();
@@ -256,6 +296,8 @@ where
                 &request.conversation_history,
                 &request.recent_session_messages,
                 &prompt_messages,
+                &turn_policy_context,
+                load_todo_prompt_context(&todo_path)?.as_ref(),
             );
             sink.record(RuntimeEvent::PromptBuilt {
                 turn_id: turn_id.clone(),
@@ -263,6 +305,20 @@ where
                 executor: main_executor.clone(),
                 at: SystemTime::now(),
             });
+            info!(
+                turn_id = %turn_id,
+                step_id = %step_id,
+                step_number,
+                executor = %main_executor.display_name,
+                prompt_chars = prompt.rendered.chars().count(),
+                prompt_sections = prompt.sections.len(),
+                conversation_history_messages = request.conversation_history.len(),
+                recent_session_results = request.recent_session_messages.len(),
+                current_turn_messages = prompt_messages.len(),
+                todo_present = load_todo_prompt_context(&todo_path)?.is_some(),
+                section_summary = %prompt_section_summary(&prompt),
+                "prompt built"
+            );
 
             let (decision, step_usage) = self
                 .generate_validated_step(
@@ -278,10 +334,91 @@ where
                 )
                 .await?;
             usage.add_assign(step_usage);
+            info!(
+                turn_id = %turn_id,
+                step_id = %step_id,
+                step_number,
+                executor = %main_executor.display_name,
+                model_decision = %model_step_decision_summary(&decision),
+                input_tokens = step_usage.input_tokens,
+                cached_tokens = step_usage.cached_tokens,
+                output_tokens = step_usage.output_tokens,
+                total_tokens = step_usage.total_tokens,
+                "model decision received"
+            );
 
             let mut step_messages = Vec::new();
             match decision.clone() {
                 ModelStepDecision::Final { content } => {
+                    if let Some(feedback) = generic_starter_replan_feedback(&todo_path)? {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+                    if let Some(todo_list) = load_todo_list_if_present(&todo_path)? {
+                        if let Some((item_index, item)) = todo_list.next_actionable() {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: incomplete_todo_final_feedback(
+                                    item_index,
+                                    item.status.as_str(),
+                                    &item.text,
+                                    &html_output_path,
+                                ),
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+                    }
                     let rendered = if should_skip_final_answer_render(&content) {
                         FinalAnswerRenderResponse {
                             canonical_text: content.clone(),
@@ -294,6 +431,8 @@ where
                             &prompt_messages,
                             request.model_config.clone(),
                             &content,
+                            &turn_policy_context,
+                            load_todo_prompt_context(&todo_path)?.as_ref(),
                             sink,
                             &turn_id,
                             &step_id,
@@ -339,6 +478,173 @@ where
                     );
                 }
                 ModelStepDecision::DelegateSubagent { delegation } => {
+                    if let Some(feedback) =
+                        generic_starter_replan_feedback_for_delegation(&todo_path, &delegation)?
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+                    if let Some(feedback) =
+                        concrete_plan_replan_feedback_for_delegation(&todo_path, &delegation)?
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+                    if let Some(feedback) = mcp_collection_feedback_for_delegation(
+                        &todo_path,
+                        &delegation,
+                        !mcp_session.servers.is_empty(),
+                    )? {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+                    if let Some(feedback) =
+                        disabled_mcp_capability_feedback_for_delegation(mcp_session, &delegation)?
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+                    if let Some(feedback) =
+                        html_todo_feedback_for_delegation(&todo_path, &delegation, &html_output_path)?
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        prompt_messages
+                            .push(step_messages.last().expect("message just pushed").clone());
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
                     let llm_message = MessageRecord::Llm(LlmMessageRecord {
                         message_id: MessageId::new(),
                         timestamp: SystemTime::now(),
@@ -374,6 +680,7 @@ where
                         goal: delegation.goal.clone(),
                         target: delegation.target.clone(),
                     });
+                    sync_mcp_todo_before_delegation(&todo_path, &delegation)?;
 
                     let (subagent_result_message, maybe_execution) = self
                         .run_subagent(
@@ -392,6 +699,7 @@ where
                         )
                         .await?;
                     if let MessageRecord::SubAgentResult(record) = &subagent_result_message {
+                        sync_mcp_todo_after_delegation(&todo_path, record)?;
                         sink.record(RuntimeEvent::HandoffToMainAgent {
                             turn_id: turn_id.clone(),
                             step_id: step_id.clone(),
@@ -526,6 +834,12 @@ where
             .chain(current_turn_messages.iter().cloned())
             .collect::<Vec<_>>();
         let configured = registry.get_enabled(subagent_type)?;
+        let todo_path = todo_file_path(&request.working_directory, turn_id);
+        let html_output_path = deterministic_html_output_path(&request.working_directory, turn_id);
+        let turn_policy_context = TurnPolicyPromptContext {
+            html_output_path: html_output_path.clone(),
+            require_todos: request.require_todos,
+        };
         let base_prompt = build_subagent_prompt(
             &request.subagent_registry_path,
             configured,
@@ -534,6 +848,8 @@ where
             goal,
             &request.user_message,
             &request.working_directory,
+            &todo_path,
+            &turn_policy_context,
             &subagent_context_messages,
         )?;
         let model_config = configured
@@ -546,6 +862,8 @@ where
         let mut trace_messages = Vec::new();
         let mut subagent_messages = Vec::new();
         let mut executed_action_count = 0u32;
+        let mut total_mcp_error_count = 0u32;
+        let mut total_local_tool_error_count = 0u32;
         let mut seen_mcp_actions = HashSet::new();
         let mut last_tool_mask_plan =
             crate::policy::ToolMaskPlan::terminal_only("no delegated tools evaluated yet");
@@ -590,6 +908,21 @@ where
                 subagent_step_number,
                 &request.limits,
             );
+            info!(
+                turn_id = %turn_id,
+                step_id = %step_id,
+                subagent_type = %subagent_type,
+                subagent_step_number,
+                executor = %executor.display_name,
+                prompt_chars = prompt.chars().count(),
+                base_prompt_chars = base_prompt.chars().count(),
+                execution_history_messages = subagent_messages.len(),
+                registered_tools = registered_tools.len(),
+                allowed_mcp_tools = tool_mask_plan.allowed_mcp_tools.len(),
+                allowed_mcp_resources = tool_mask_plan.allowed_mcp_resources.len(),
+                allowed_local_tools = tool_mask_plan.allowed_local_tools.len(),
+                "subagent prompt built"
+            );
 
             let remaining = remaining_turn_budget(turn_start, request.limits.turn_timeout)?;
             sink.record(RuntimeEvent::ModelCalled {
@@ -614,8 +947,28 @@ where
                 ),
             )
             .await
-            .map_err(|_| RuntimeError::Timeout("sub-agent step timed out".to_owned()))?
-            .map_err(RuntimeError::Model)?;
+            .map_err(|_| RuntimeError::Timeout("sub-agent step timed out".to_owned()))?;
+            let response = match response {
+                Ok(response) => response,
+                Err(ModelAdapterError::InvalidDecision(error)) => {
+                    return Ok((
+                        subagent_result_message(
+                            subagent_type,
+                            "partial",
+                            executed_action_count,
+                            format!(
+                                "sub-agent returned invalid structured output and was stopped early: {error}"
+                            ),
+                            Some(tool_mask_plan),
+                        ),
+                        DelegatedExecutionOutcome {
+                            usage,
+                            trace_messages,
+                        },
+                    ));
+                }
+                Err(error) => return Err(RuntimeError::Model(error)),
+            };
             usage.add_assign(response.usage);
             sink.record(RuntimeEvent::ModelResponded {
                 turn_id: turn_id.clone(),
@@ -625,6 +978,19 @@ where
                 executor: executor.clone(),
                 usage: response.usage,
             });
+            info!(
+                turn_id = %turn_id,
+                step_id = %step_id,
+                subagent_type = %subagent_type,
+                subagent_step_number,
+                executor = %executor.display_name,
+                decision = %subagent_decision_summary(&response.decision),
+                input_tokens = response.usage.input_tokens,
+                cached_tokens = response.usage.cached_tokens,
+                output_tokens = response.usage.output_tokens,
+                total_tokens = response.usage.total_tokens,
+                "subagent model decision received"
+            );
             match response.decision {
                 SubagentDecision::Done { summary } => {
                     return Ok((
@@ -872,6 +1238,29 @@ where
                     trace_messages.push(result_message.clone());
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
+                    if was_error {
+                        total_mcp_error_count += 1;
+                        if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    repeated_mcp_failure_detail(
+                                        &call_target,
+                                        executed_action_count,
+                                        total_mcp_error_count,
+                                        &captured,
+                                    ),
+                                    Some(tool_mask_plan),
+                                ),
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                    }
                 }
                 SubagentDecision::McpResourceRead {
                     server_name,
@@ -1022,11 +1411,51 @@ where
                     trace_messages.push(result_message.clone());
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
+                    if was_error {
+                        total_mcp_error_count += 1;
+                        if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    repeated_mcp_failure_detail(
+                                        &call_target,
+                                        executed_action_count,
+                                        total_mcp_error_count,
+                                        &captured,
+                                    ),
+                                    Some(tool_mask_plan),
+                                ),
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                    }
                 }
                 SubagentDecision::LocalToolCall {
                     tool_name,
                     arguments,
                 } => {
+                    if let Some(detail) =
+                        tool_executor_mcp_todo_partial_feedback(todo_path.as_path(), &tool_name)?
+                    {
+                        return Ok((
+                            subagent_result_message(
+                                subagent_type,
+                                "partial",
+                                executed_action_count,
+                                detail,
+                                Some(tool_mask_plan),
+                            ),
+                            DelegatedExecutionOutcome {
+                                usage,
+                                trace_messages,
+                            },
+                        ));
+                    }
                     if executed_action_count >= request.limits.max_subagent_mcp_calls_per_invocation
                     {
                         return Ok((
@@ -1093,32 +1522,44 @@ where
                     let result = execute_local_tool(
                         &tool_name,
                         &arguments,
-                        &request.working_directory,
+                        &LocalToolContext {
+                            working_directory: request.working_directory.clone(),
+                            turn_directory: turn_directory(&request.working_directory, turn_id),
+                            todo_path: todo_file_path(&request.working_directory, turn_id),
+                            html_output_path: deterministic_html_output_path(
+                                &request.working_directory,
+                                turn_id,
+                            ),
+                        },
                         remaining,
                     )
                     .await;
                     let (result_message, was_error, response_payload, result_summary, error) =
                         match result {
-                            Ok(result) => (
-                                MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
-                                    message_id: MessageId::new(),
-                                    timestamp: SystemTime::now(),
-                                    tool_name: tool_name.clone(),
-                                    status: result.status.clone(),
-                                    result_summary: result.summary.clone(),
-                                    error: None,
-                                }),
-                                false,
-                                serde_json::to_value(&result).unwrap_or_else(
-                                    |serialization_error| {
-                                        serde_json::json!({
-                                            "serialization_error": serialization_error.to_string(),
-                                        })
-                                    },
-                                ),
-                                result.summary,
-                                None,
-                            ),
+                            Ok(result) => {
+                                let was_error =
+                                    result.status != "ok" || result.error.as_ref().is_some();
+                                (
+                                    MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                                        message_id: MessageId::new(),
+                                        timestamp: SystemTime::now(),
+                                        tool_name: tool_name.clone(),
+                                        status: result.status.clone(),
+                                        result_summary: result.summary.clone(),
+                                        error: result.error.clone(),
+                                    }),
+                                    was_error,
+                                    serde_json::to_value(&result).unwrap_or_else(
+                                        |serialization_error| {
+                                            serde_json::json!({
+                                                "serialization_error": serialization_error.to_string(),
+                                            })
+                                        },
+                                    ),
+                                    result.summary,
+                                    result.error,
+                                )
+                            }
                             Err(error) => (
                                 MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
                                     message_id: MessageId::new(),
@@ -1172,6 +1613,46 @@ where
                     trace_messages.push(result_message.clone());
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
+                    if was_error {
+                        if let Some(detail) =
+                            immediate_partial_detail_for_local_tool_error(&tool_name, &result_summary)
+                        {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    detail,
+                                    Some(tool_mask_plan),
+                                ),
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                        total_local_tool_error_count += 1;
+                        if total_local_tool_error_count >= MAX_TOTAL_SUBAGENT_LOCAL_TOOL_ERRORS {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    repeated_local_tool_failure_detail(
+                                        &tool_name,
+                                        executed_action_count,
+                                        total_local_tool_error_count,
+                                        &result_summary,
+                                    ),
+                                    Some(tool_mask_plan),
+                                ),
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1197,6 +1678,8 @@ where
         prompt_messages: &[MessageRecord],
         model_config: crate::state::ModelConfig,
         answer_brief: &str,
+        turn_policy_context: &TurnPolicyPromptContext,
+        todo_context: Option<&TodoPromptContext>,
         sink: &mut dyn RuntimeDebugSink,
         turn_id: &TurnId,
         step_id: &StepId,
@@ -1220,6 +1703,8 @@ where
             prompt_messages,
             answer_brief,
             &request.response_target,
+            turn_policy_context,
+            todo_context,
         );
         let started = Instant::now();
         let mut debug_sink = BoundModelDebugSink::new(sink, turn_id, step_id, executor.clone());
@@ -1392,6 +1877,808 @@ fn build_capabilities(servers: &HashMap<ServerName, PreparedServer>) -> Vec<McpC
     capabilities
 }
 
+fn turn_directory(working_directory: &Path, turn_id: &TurnId) -> PathBuf {
+    working_directory.join(turn_id.to_string())
+}
+
+fn todo_file_path(working_directory: &Path, turn_id: &TurnId) -> PathBuf {
+    turn_directory(working_directory, turn_id).join("todos.txt")
+}
+
+fn deterministic_html_output_path(working_directory: &Path, turn_id: &TurnId) -> PathBuf {
+    working_directory
+        .join("outputs")
+        .join(format!("{}-report.html", turn_id))
+}
+
+fn load_todo_prompt_context(todo_path: &Path) -> Result<Option<TodoPromptContext>, RuntimeError> {
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(None);
+    };
+    Ok(Some(TodoPromptContext {
+        todo_path: todo_path.to_path_buf(),
+        todo_contents: todo_list.render(),
+        next_actionable: todo_list
+            .next_actionable()
+            .map(|(index, item)| format!("{index}. [{}] {}", item.status.as_str(), item.text)),
+    }))
+}
+
+fn load_todo_list_if_present(todo_path: &Path) -> Result<Option<TodoList>, RuntimeError> {
+    if !todo_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(TodoList::load_from_path(todo_path)?))
+}
+
+fn generic_starter_replan_feedback(todo_path: &Path) -> Result<Option<String>, RuntimeError> {
+    if !todo_starts_with_generic_scaffold(todo_path)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        "The current todo plan is still the generic starter scaffold. Before substantive work or a final answer, delegate `tool-executor` with local tools scope and use `write_todos` `replan_pending_suffix` to replace it with concrete ordered todos that match this turn. That delegation is planning-only: once the todo plan is rewritten, return control immediately instead of starting execution.".to_owned(),
+    ))
+}
+
+fn generic_starter_replan_feedback_for_delegation(
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> Result<Option<String>, RuntimeError> {
+    if !todo_starts_with_generic_scaffold(todo_path)? {
+        return Ok(None);
+    }
+    if delegation.subagent_type == "tool-executor"
+        && matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
+        && is_todo_planning_goal(&delegation.goal)
+    {
+        return Ok(None);
+    }
+    generic_starter_replan_feedback(todo_path)
+}
+
+fn concrete_plan_replan_feedback_for_delegation(
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> Result<Option<String>, RuntimeError> {
+    if delegation.subagent_type != "tool-executor"
+        || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
+        || !is_todo_planning_goal(&delegation.goal)
+    {
+        return Ok(None);
+    }
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(None);
+    };
+    if matches!(
+        todo_list.next_actionable(),
+        Some((_, item)) if item.text == GENERIC_STARTER_TODO
+    ) || todo_list
+        .items
+        .iter()
+        .any(|item| item.status == crate::todo::TodoStatus::Failed)
+    {
+        return Ok(None);
+    }
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "A concrete todo plan already exists and execution is underway. Do not replan the todo list again yet. Continue the current todo instead: {item_index}. [{}] {}. Only use planning-only replanning again if the starter scaffold is still present or a todo has failed.",
+        item.status.as_str(),
+        item.text
+    )))
+}
+
+fn is_todo_planning_goal(goal: &str) -> bool {
+    let goal = goal.to_lowercase();
+    let mentions_planning = goal.contains("todo") || goal.contains("replan") || goal.contains("plan");
+    let mentions_execution = [
+        "execute",
+        "complete",
+        "finish",
+        "continue",
+        "run",
+        "perform",
+        "workflow",
+    ]
+    .iter()
+    .any(|term| goal.contains(term));
+    mentions_planning
+        && !goal.contains("html")
+        && !goal.contains("browser")
+        && !mentions_execution
+}
+
+fn mcp_collection_feedback_for_delegation(
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+    mcp_available: bool,
+) -> Result<Option<String>, RuntimeError> {
+    if !mcp_available
+        || delegation.subagent_type != "tool-executor"
+        || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
+    {
+        return Ok(None);
+    }
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(None);
+    };
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(None);
+    };
+    if todo_step_prefers_mcp_executor(&item.text) {
+        return Ok(Some(format!(
+            "The current next actionable todo is MCP-style data discovery or collection work and should not be delegated to `tool-executor`: {item_index}. [{}] {}. Delegate `mcp-executor` with server scope to inspect/query the data first, then use `tool-executor` later for local scripts, HTML generation, and opening the report.",
+            item.status.as_str(),
+            item.text
+        )));
+    }
+    Ok(None)
+}
+
+fn tool_executor_mcp_todo_partial_feedback(
+    todo_path: &Path,
+    tool_name: &crate::state::LocalToolName,
+) -> Result<Option<String>, RuntimeError> {
+    if tool_name.as_str() == "write_todos" {
+        return Ok(None);
+    }
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(None);
+    };
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(None);
+    };
+    if todo_step_prefers_mcp_executor(&item.text) {
+        return Ok(Some(format!(
+            "The next actionable todo belongs to MCP-backed data discovery or collection, not local workspace execution: {item_index}. [{}] {}. Return control so the main agent can delegate `mcp-executor` instead of continuing with local tools.",
+            item.status.as_str(),
+            item.text
+        )));
+    }
+    Ok(None)
+}
+
+fn disabled_mcp_capability_feedback_for_delegation(
+    mcp_session: &McpSession,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> Result<Option<String>, RuntimeError> {
+    if delegation.subagent_type != "mcp-executor" {
+        return Ok(None);
+    }
+    let DelegationTarget::McpCapability(target) = &delegation.target else {
+        return Ok(None);
+    };
+    let server = mcp_session
+        .servers
+        .get(&target.server_name)
+        .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+    let Some(reason) = disabled_mcp_capability_reason(
+        server,
+        &target.capability_kind,
+        &target.capability_id,
+    ) else {
+        return Ok(None);
+    };
+
+    let scope_hint = match target.capability_kind {
+        CapabilityKind::Resource => format!(
+            "Do not delegate `mcp-executor` to this resource again. Delegate `mcp-executor` with `mcp_server_scope` for server `{}` instead so it can use the allowed tools on that server.",
+            target.server_name
+        ),
+        CapabilityKind::Tool => format!(
+            "Do not delegate `mcp-executor` to this capability again. Choose a different allowed MCP target on server `{}`.",
+            target.server_name
+        ),
+    };
+    let server_guidance = render_mcp_server_guidance(server).replace('\n', " ").trim().to_owned();
+
+    Ok(Some(format!(
+        "The selected MCP capability cannot be used: {reason}. {scope_hint} {server_guidance}"
+    )))
+}
+
+fn todo_step_prefers_mcp_executor(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let data_keywords = [
+        "collect",
+        "prepare",
+        "query",
+        "extract",
+        "schema",
+        "table",
+        "database",
+        "dataset",
+        "discover",
+        "inspect",
+        "workspace inputs",
+        "source data",
+        "source rows",
+        "batting source data",
+        "match/stat",
+        "stat data",
+        "season data",
+        "supporting context",
+        "run total",
+        "runs total",
+    ];
+    let has_data_keyword = data_keywords.iter().any(|keyword| text.contains(keyword));
+    let is_local_artifact_work = text.contains("html")
+        || text.contains("browser")
+        || text.contains("chart")
+        || text.contains("table and chart")
+        || text.contains("write the deterministic html report")
+        || text.contains("open the generated");
+    has_data_keyword && !is_local_artifact_work
+}
+
+fn sync_mcp_todo_before_delegation(
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> Result<(), RuntimeError> {
+    if delegation.subagent_type != "mcp-executor" {
+        return Ok(());
+    }
+    let Some(mut todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(());
+    };
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(());
+    };
+    if matches!(
+        item.status,
+        crate::todo::TodoStatus::Pending | crate::todo::TodoStatus::Failed
+    ) && todo_step_prefers_mcp_executor(&item.text)
+    {
+        todo_list.set_status(item_index, crate::todo::TodoStatus::InProgress)?;
+        todo_list.save_to_path(todo_path)?;
+    }
+    Ok(())
+}
+
+fn sync_mcp_todo_after_delegation(
+    todo_path: &Path,
+    record: &crate::state::SubAgentResultMessageRecord,
+) -> Result<(), RuntimeError> {
+    if record.subagent_type != "mcp-executor" {
+        return Ok(());
+    }
+    let Some(mut todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(());
+    };
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(());
+    };
+    if item.status != crate::todo::TodoStatus::InProgress
+        || !todo_step_prefers_mcp_executor(&item.text)
+    {
+        return Ok(());
+    }
+    match record.status.as_str() {
+        "completed" => {
+            todo_list.set_status(item_index, crate::todo::TodoStatus::Completed)?;
+            todo_list.save_to_path(todo_path)?;
+        }
+        "partial" => {
+            if record.executed_action_count > 0
+                && todo_can_complete_from_partial_mcp_collection(&item.text)
+            {
+                todo_list.set_status(item_index, crate::todo::TodoStatus::Completed)?;
+                todo_list.save_to_path(todo_path)?;
+            }
+        }
+        "cannot_execute" => {
+            todo_list.set_status(item_index, crate::todo::TodoStatus::Failed)?;
+            todo_list.save_to_path(todo_path)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn todo_can_complete_from_partial_mcp_collection(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let hybrid_collection_prefixes = [
+        "compute or extract",
+        "compute or query",
+        "compute or inspect",
+    ];
+    let collection_prefixes = [
+        "query ",
+        "query or inspect",
+        "inspect ",
+        "inspect or query",
+        "collect ",
+        "load ",
+        "discover ",
+        "prepare ",
+        "fetch ",
+        "extract or materialize",
+    ];
+    let starts_as_collection_step = hybrid_collection_prefixes
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+        || collection_prefixes
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    let is_follow_on_analysis = (text.starts_with("compute")
+        && !hybrid_collection_prefixes
+            .iter()
+            .any(|prefix| text.starts_with(prefix)))
+        || text.starts_with("identify")
+        || text.starts_with("derive")
+        || text.starts_with("validate")
+        || text.starts_with("analy")
+        || text.starts_with("generate")
+        || text.starts_with("open ")
+        || text.contains("html")
+        || text.contains("browser")
+        || text.contains("chart")
+        || text.contains("table");
+    starts_as_collection_step && !is_follow_on_analysis
+}
+
+fn todo_starts_with_generic_scaffold(todo_path: &Path) -> Result<bool, RuntimeError> {
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        todo_list.next_actionable(),
+        Some((1, item)) if item.text == GENERIC_STARTER_TODO
+    ))
+}
+
+fn reconcile_mandatory_todos_from_turn_trace(
+    todo_path: &Path,
+    html_output_path: &Path,
+    working_directory: &Path,
+    messages: &[MessageRecord],
+) -> Result<(), RuntimeError> {
+    let Some(mut todos) = load_todo_list_if_present(todo_path)? else {
+        return Ok(());
+    };
+
+    let html_written = observed_html_write(messages, html_output_path);
+    let html_opened = observed_html_open(messages, html_output_path, working_directory);
+    let mut changed = false;
+
+    if html_written {
+        changed |= auto_complete_next_todo_if_matches(&mut todos, MANDATORY_TODO_GENERATE_HTML)?;
+    }
+    if html_opened {
+        changed |= auto_complete_next_todo_if_matches(&mut todos, MANDATORY_TODO_OPEN_HTML)?;
+    }
+
+    if changed {
+        todos.save_to_path(todo_path)?;
+    }
+
+    Ok(())
+}
+
+fn reconcile_active_todo_from_turn_trace(
+    todo_path: &Path,
+    messages: &[MessageRecord],
+) -> Result<(), RuntimeError> {
+    let Some(mut todos) = load_todo_list_if_present(todo_path)? else {
+        return Ok(());
+    };
+    let Some((item_index, item)) = todos.next_actionable() else {
+        return Ok(());
+    };
+    if item.status != crate::todo::TodoStatus::InProgress
+        || item.text == GENERIC_STARTER_TODO
+        || item.text == MANDATORY_TODO_GENERATE_HTML
+        || item.text == MANDATORY_TODO_OPEN_HTML
+    {
+        return Ok(());
+    }
+
+    let Some(last_subagent_result) = messages.iter().rev().find_map(|message| match message {
+        MessageRecord::SubAgentResult(record) => Some(record),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    let should_complete = match last_subagent_result.status.as_str() {
+        "completed" => true,
+        "partial" => {
+            last_subagent_result.subagent_type == "tool-executor"
+                && todo_can_complete_from_partial_local_inspection(&item.text)
+        }
+        _ => false,
+    };
+
+    if !should_complete {
+        return Ok(());
+    }
+
+    todos.set_status(item_index, crate::todo::TodoStatus::Completed)?;
+    todos.save_to_path(todo_path)?;
+    Ok(())
+}
+
+fn incomplete_todo_final_feedback(
+    item_index: usize,
+    item_status: &str,
+    item_text: &str,
+    html_output_path: &Path,
+) -> String {
+    if item_text == MANDATORY_TODO_GENERATE_HTML {
+        return format!(
+            "Cannot finish the turn yet because the mandatory deliverable is still incomplete. Next actionable todo: {item_index}. [{item_status}] {item_text}. Delegate `tool-executor` with local workspace scope to generate the deterministic HTML report at `{}` and then continue the turn instead of returning a final answer. Do not ask `tool-executor` to open the report in the same delegation; return control first and open it only when the next actionable todo becomes `{}`.",
+            html_output_path.display(),
+            MANDATORY_TODO_OPEN_HTML
+        );
+    }
+    if item_text == MANDATORY_TODO_OPEN_HTML {
+        return format!(
+            "Cannot finish the turn yet because the report still needs to be opened. Next actionable todo: {item_index}. [{item_status}] {item_text}. Use `tool-executor` to open the generated HTML report at `{}` in the browser, then continue instead of returning a final answer.",
+            html_output_path.display()
+        );
+    }
+    format!(
+        "Cannot finish the turn yet because the todo plan is incomplete. Next actionable todo: {item_index}. [{item_status}] {item_text}. Continue execution instead of returning a final answer."
+    )
+}
+
+fn todo_can_complete_from_partial_local_inspection(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let mentions_local_inspection = text.contains("inspect available local workspace inputs")
+        || text.contains("inspect local workspace inputs")
+        || text.contains("inspect available local inputs")
+        || text.contains("inspect the local workspace")
+        || text.contains("search workspace inputs")
+        || text.contains("inspect workspace inputs");
+    let is_substantive_data_step = text.contains("extract")
+        || text.contains("materialize")
+        || text.contains("compute")
+        || text.contains("validate")
+        || text.contains("generate")
+        || text.contains("html")
+        || text.contains("chart")
+        || text.contains("table");
+    mentions_local_inspection && !is_substantive_data_step
+}
+
+fn html_todo_feedback_for_delegation(
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+    html_output_path: &Path,
+) -> Result<Option<String>, RuntimeError> {
+    if delegation.subagent_type != "tool-executor"
+        || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
+    {
+        return Ok(None);
+    }
+    let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
+        return Ok(None);
+    };
+    let Some((item_index, item)) = todo_list.next_actionable() else {
+        return Ok(None);
+    };
+    let goal = delegation.goal.to_lowercase();
+
+    if item.text == MANDATORY_TODO_GENERATE_HTML && goal_mentions_html_open(&goal) {
+        return Ok(Some(format!(
+            "The current next actionable todo is only the HTML-generation step: {item_index}. [{}] {}. Do not bundle the browser-open step into the same `tool-executor` delegation. Generate the deterministic HTML report at `{}` first, return control immediately, and open it only when the next actionable todo becomes `{}`.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display(),
+            MANDATORY_TODO_OPEN_HTML
+        )));
+    }
+
+    if item.text == MANDATORY_TODO_OPEN_HTML && goal_mentions_html_generation(&goal) {
+        return Ok(Some(format!(
+            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not regenerate the HTML report in this delegation. Only open the existing deterministic HTML report at `{}` in the browser.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display()
+        )));
+    }
+    if item.text == MANDATORY_TODO_OPEN_HTML && !goal_is_open_only(&goal) {
+        return Ok(Some(format!(
+            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not delegate any broader `tool-executor` work here. Only open the existing deterministic HTML report at `{}` in the browser, then return control.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display()
+        )));
+    }
+
+    Ok(None)
+}
+
+fn should_require_todos_for_turn(
+    user_message: &str,
+    conversation_history: &[crate::state::ConversationMessage],
+) -> bool {
+    !(is_simple_factual_turn(user_message)
+        || is_simple_factual_follow_up_turn(user_message, conversation_history))
+}
+
+fn is_simple_factual_turn(user_message: &str) -> bool {
+    let normalized = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty() || normalized.len() > 160 {
+        return false;
+    }
+    if user_message
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        > 2
+    {
+        return false;
+    }
+
+    let disqualifying_terms = [
+        "analysis",
+        "analyze",
+        "compare",
+        "breakdown",
+        "trend",
+        "chart",
+        "graph",
+        "plot",
+        "table",
+        "visual",
+        "dashboard",
+        "report",
+        "html",
+        "browser",
+        "csv",
+        "file",
+        "script",
+    ];
+    if disqualifying_terms
+        .iter()
+        .any(|term| normalized.contains(term))
+    {
+        return false;
+    }
+
+    let factual_prefixes = [
+        "who ",
+        "what ",
+        "when ",
+        "where ",
+        "which ",
+        "is ",
+        "are ",
+        "was ",
+        "were ",
+        "did ",
+        "does ",
+        "do ",
+        "can ",
+        "could ",
+        "how many ",
+        "how much ",
+        "how old ",
+        "tell me ",
+    ];
+    if factual_prefixes
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return true;
+    }
+
+    normalized.ends_with('?') && normalized.split_whitespace().count() <= 12
+}
+
+fn is_simple_factual_follow_up_turn(
+    user_message: &str,
+    conversation_history: &[crate::state::ConversationMessage],
+) -> bool {
+    if !is_short_contextual_follow_up(user_message) {
+        return false;
+    }
+
+    conversation_history
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, crate::state::ConversationRole::User))
+        .map(|message| is_simple_factual_turn(&message.content))
+        .unwrap_or(false)
+}
+
+fn is_short_contextual_follow_up(user_message: &str) -> bool {
+    let normalized = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let trimmed = normalized
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .trim()
+        .to_owned();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.len() > 40 && !is_short_metric_clarification_follow_up(&trimmed) {
+        return false;
+    }
+
+    let first_token = trimmed
+        .split(|ch: char| ch.is_whitespace() || [',', '.', '!', '?', ';', ':'].contains(&ch))
+        .find(|token| !token.is_empty())
+        .unwrap_or("");
+    if matches!(
+        first_token,
+        "yes" | "yeah" | "yep" | "ok" | "okay" | "sure" | "retry"
+    ) {
+        return true;
+    }
+
+    [
+        "try again",
+        "go ahead",
+        "please do",
+        "do it",
+        "continue",
+    ]
+    .iter()
+    .any(|phrase| trimmed.starts_with(phrase))
+        || is_short_metric_clarification_follow_up(&trimmed)
+}
+
+fn is_short_metric_clarification_follow_up(user_message: &str) -> bool {
+    if user_message.len() > 90 || user_message.contains('?') {
+        return false;
+    }
+
+    let subject_prefixes = [
+        "best ",
+        "top ",
+        "most ",
+        "highest ",
+        "lowest ",
+        "fielder ",
+        "bowler ",
+        "batter ",
+        "metric ",
+        "fielding ",
+        "bowling ",
+        "batting ",
+    ];
+    if !subject_prefixes
+        .iter()
+        .any(|prefix| user_message.starts_with(prefix))
+    {
+        return false;
+    }
+
+    let clarification_markers = [
+        " i mean ",
+        " means ",
+        " should mean ",
+        " is somebody who ",
+        " is the player who ",
+        " is whoever ",
+        " based on ",
+    ];
+    clarification_markers
+        .iter()
+        .any(|marker| user_message.contains(marker))
+}
+
+fn goal_mentions_html_open(goal: &str) -> bool {
+    goal.contains("open")
+        && (goal.contains("browser")
+            || goal.contains("html")
+            || goal.contains("report")
+            || goal.contains("page"))
+}
+
+fn goal_mentions_html_generation(goal: &str) -> bool {
+    let mentions_generation = ["generate", "create", "build", "render", "produce", "write"]
+        .iter()
+        .any(|verb| goal.contains(verb));
+    let mentions_html_target =
+        goal.contains("html") || goal.contains("report") || goal.contains("page");
+    mentions_generation && mentions_html_target
+}
+
+fn goal_is_open_only(goal: &str) -> bool {
+    if !goal_mentions_html_open(goal) {
+        return false;
+    }
+    let disallowed_terms = [
+        "generate",
+        "create",
+        "build",
+        "render",
+        "produce",
+        "write",
+        "answer",
+        "deliverable",
+        "report deliverable",
+        "complete",
+        "summarize",
+        "chart",
+        "table",
+        "analy",
+    ];
+    !disallowed_terms.iter().any(|term| goal.contains(term))
+}
+
+fn auto_complete_next_todo_if_matches(
+    todos: &mut TodoList,
+    expected_text: &str,
+) -> Result<bool, RuntimeError> {
+    let Some((item_index, item)) = todos.next_actionable() else {
+        return Ok(false);
+    };
+    if item.text != expected_text {
+        return Ok(false);
+    }
+
+    todos.set_status(item_index, crate::todo::TodoStatus::InProgress)?;
+    todos.set_status(item_index, crate::todo::TodoStatus::Completed)?;
+    Ok(true)
+}
+
+fn observed_html_write(messages: &[MessageRecord], html_output_path: &Path) -> bool {
+    if html_output_path.exists() {
+        return true;
+    }
+
+    let html_path = html_output_path.display().to_string();
+    let html_file_name = html_output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    messages.iter().any(|message| match message {
+        MessageRecord::LocalToolResult(record) if record.tool_name.as_str() == "write_file" => {
+            record.status == "ok" && record.result_summary.contains(&html_path)
+        }
+        MessageRecord::LocalToolResult(record) if record.tool_name.as_str() == "bash" => {
+            record.status == "ok"
+                && record.result_summary.contains("exit_code: 0")
+                && (record.result_summary.contains(&html_path)
+                    || (!html_file_name.is_empty()
+                        && record.result_summary.contains(html_file_name)))
+        }
+        _ => false,
+    })
+}
+
+fn observed_html_open(
+    messages: &[MessageRecord],
+    html_output_path: &Path,
+    working_directory: &Path,
+) -> bool {
+    let absolute = html_output_path.display().to_string();
+    let relative = html_output_path
+        .strip_prefix(working_directory)
+        .ok()
+        .map(|path| path.display().to_string());
+
+    messages.iter().any(|message| match message {
+        MessageRecord::LocalToolResult(record) if record.tool_name.as_str() == "bash" => {
+            if record.status != "ok" || !record.result_summary.contains("exit_code: 0") {
+                return false;
+            }
+            let opened_absolute = record.result_summary.contains(&format!("open {absolute}"));
+            let opened_relative = relative
+                .as_ref()
+                .is_some_and(|path| record.result_summary.contains(&format!("open {path}")));
+            opened_absolute || opened_relative
+        }
+        _ => false,
+    })
+}
+
 fn build_subagent_prompt(
     registry_path: &Path,
     configured: &ConfiguredSubagent,
@@ -1400,12 +2687,26 @@ fn build_subagent_prompt(
     goal: &str,
     user_message: &str,
     working_directory: &Path,
+    todo_path: &Path,
+    turn_policy_context: &TurnPolicyPromptContext,
     current_turn_messages: &[MessageRecord],
 ) -> Result<String, RuntimeError> {
     let registry_dir = registry_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    let turn_policy_block = format!(
+        "\n## Turn Policy\n{}\n",
+        render_turn_policy_context(turn_policy_context)
+    );
+    let todo_block = load_todo_prompt_context(todo_path)?
+        .map(|todo_context| {
+            format!(
+                "\n## Current Turn Todo Plan\n{}\n- Replanning rule: rewrite only the future pending suffix when the current plan is insufficient.\n",
+                render_todo_context(&todo_context)
+            )
+        })
+        .unwrap_or_default();
     match target {
         DelegationTarget::McpCapability(target) => {
             let server = mcp_session
@@ -1418,6 +2719,7 @@ fn build_subagent_prompt(
                 render_recent_mcp_results_context_for_mcp(current_turn_messages);
             let confirmed_tables_block =
                 render_confirmed_table_context(current_turn_messages, &target.server_name);
+            let server_guidance_block = render_mcp_server_guidance(server);
 
             let capability_block = match target.capability_kind {
                 CapabilityKind::Tool => {
@@ -1445,7 +2747,7 @@ fn build_subagent_prompt(
             };
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n\n{}\n{}\n{capability_block}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n{server_guidance_block}{turn_policy_block}{todo_block}\n{}\n{}\n{capability_block}",
                 target.capability_id, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -1460,9 +2762,10 @@ fn build_subagent_prompt(
                 render_recent_mcp_results_context_for_mcp(current_turn_messages);
             let confirmed_tables_block =
                 render_confirmed_table_context(current_turn_messages, &target.server_name);
+            let server_guidance_block = render_mcp_server_guidance(server);
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n\n{}\n{}\n",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n{server_guidance_block}{turn_policy_block}{todo_block}\n{}\n{}\n",
                 target.server_name, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -1479,10 +2782,18 @@ fn build_subagent_prompt(
                 .collect::<Vec<_>>()
                 .join("\n");
             let recent_results_block = render_recent_mcp_results_context(current_turn_messages);
+            let planning_only_block = if configured.subagent_type == "tool-executor"
+                && is_todo_planning_goal(goal)
+            {
+                "- This delegation is todo-planning only. Update the todo plan with `write_todos`, then return `done` immediately.\n- Do not inspect unrelated workspace data, do not begin executing the planned analysis, and do not mark later execution todos in progress or completed in this delegation.\n"
+            } else {
+                ""
+            };
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n\n{}\n## Local Tools\n{}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n- Deterministic HTML output path: {}\n- If todos are optional and no todo file exists, complete the HTML report and browser-open workflow for analysis/reporting work before finishing.\n- When todo context is present, update only the current todo item, and replan only the future pending suffix.\n{planning_only_block}{turn_policy_block}{todo_block}\n{}\n## Local Tools\n{}",
                 scope.scope,
                 working_directory.display(),
+                turn_policy_context.html_output_path.display(),
                 recent_results_block,
                 tools_block
             ))
@@ -1719,6 +3030,13 @@ fn build_subagent_tool_catalog(
                     ));
                 }
                 CapabilityKind::Resource => {
+                    if let Some(reason) = disabled_mcp_capability_reason(
+                        server,
+                        &CapabilityKind::Resource,
+                        &target.capability_id,
+                    ) {
+                        return Err(RuntimeError::Validation(reason));
+                    }
                     let resource = lookup_resource(&server.full_catalog, &target.capability_id)?;
                     tools.push(ToolDescriptor::mcp_resource(
                         &target.server_name,
@@ -1746,6 +3064,11 @@ fn build_subagent_tool_catalog(
                 ));
             }
             for resource in &server.full_catalog.resources {
+                if disabled_mcp_capability_reason(server, &CapabilityKind::Resource, &resource.uri)
+                    .is_some()
+                {
+                    continue;
+                }
                 tools.push(ToolDescriptor::mcp_resource(
                     &target.server_name,
                     &resource.uri,
@@ -1944,6 +3267,68 @@ fn canonicalize_action_arguments(arguments: &serde_json::Value) -> String {
     value.to_string()
 }
 
+fn prompt_section_summary(prompt: &crate::state::PromptSnapshot) -> String {
+    prompt
+        .sections
+        .iter()
+        .map(|section| format!("{}:{}c", section.title, section.content.chars().count()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn model_step_decision_summary(decision: &ModelStepDecision) -> String {
+    match decision {
+        ModelStepDecision::Final { content } => {
+            format!("final_answer: {}", truncate_for_log(content, 160))
+        }
+        ModelStepDecision::DelegateSubagent { delegation } => format!(
+            "delegate_subagent: type={}, target={}, goal={}",
+            delegation.subagent_type,
+            delegation.target.summary(),
+            truncate_for_log(&delegation.goal, 120)
+        ),
+    }
+}
+
+fn subagent_decision_summary(decision: &SubagentDecision) -> String {
+    match decision {
+        SubagentDecision::Done { summary } => {
+            format!("done: {}", truncate_for_log(summary, 160))
+        }
+        SubagentDecision::Partial { summary, reason } => format!(
+            "partial: summary={}, reason={}",
+            truncate_for_log(summary, 120),
+            truncate_for_log(reason, 120)
+        ),
+        SubagentDecision::CannotExecute { reason } => {
+            format!("cannot_execute: {}", truncate_for_log(reason, 160))
+        }
+        SubagentDecision::McpToolCall {
+            server_name,
+            tool_name,
+            ..
+        } => format!("mcp_tool_call: {server_name}/{tool_name}"),
+        SubagentDecision::McpResourceRead {
+            server_name,
+            resource_uri,
+        } => format!(
+            "mcp_resource_read: {server_name}/{}",
+            truncate_for_log(resource_uri, 120)
+        ),
+        SubagentDecision::LocalToolCall { tool_name, .. } => {
+            format!("local_tool_call: {tool_name}")
+        }
+    }
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > max_chars {
+        normalized = normalized.chars().take(max_chars).collect::<String>() + "...";
+    }
+    normalized
+}
+
 fn canonicalize_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -2015,6 +3400,9 @@ fn validate_masked_mcp_call(
     let server = servers
         .get(requested_server_name)
         .ok_or_else(|| format!("unknown MCP server `{requested_server_name}` requested"))?;
+    if let Some(reason) = disabled_mcp_capability_reason(server, &capability_kind, capability_id) {
+        return Err(reason);
+    }
     match capability_kind {
         CapabilityKind::Tool => {
             lookup_tool(&server.full_catalog, capability_id).map_err(|error| error.to_string())?;
@@ -2030,6 +3418,89 @@ fn validate_masked_mcp_call(
         capability_kind,
         capability_id: capability_id.to_owned(),
     })
+}
+
+fn disabled_mcp_capability_reason(
+    server: &PreparedServer,
+    capability_kind: &CapabilityKind,
+    capability_id: &str,
+) -> Option<String> {
+    if capability_kind == &CapabilityKind::Resource
+        && server.full_catalog.server.protocol_name == "postgres-mcp"
+        && capability_id.starts_with("postgres://")
+        && capability_id.ends_with("/schema")
+    {
+        return Some(POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON.to_owned());
+    }
+    None
+}
+
+fn render_mcp_server_guidance(server: &PreparedServer) -> String {
+    if server.full_catalog.server.protocol_name == "postgres-mcp" {
+        return "- Do not use `postgres://.../schema` resource reads on this server; use the `query` tool with simple SELECT-based discovery instead.\n- If MCP calls keep failing, stop and return `partial` instead of retrying similar actions indefinitely.\n".to_owned();
+    }
+    String::new()
+}
+
+fn repeated_mcp_failure_detail(
+    target: &McpCapabilityTarget,
+    executed_action_count: u32,
+    total_mcp_error_count: u32,
+    captured: &CapturedMcpResult,
+) -> String {
+    let last_error = captured
+        .error
+        .as_deref()
+        .unwrap_or(&captured.result_summary);
+    format!(
+        "repeated MCP failures forced an early stop after {total_mcp_error_count} errors and {executed_action_count} delegated MCP actions. Last failure on server `{}` capability `{}`: {last_error}",
+        target.server_name, target.capability_id
+    )
+}
+
+fn repeated_local_tool_failure_detail(
+    tool_name: &crate::state::LocalToolName,
+    executed_action_count: u32,
+    total_local_tool_error_count: u32,
+    last_error: &str,
+) -> String {
+    format!(
+        "repeated local tool failures forced an early stop after {total_local_tool_error_count} errors and {executed_action_count} delegated actions. Last failure on local tool `{}`: {last_error}",
+        tool_name
+    )
+}
+
+fn immediate_partial_detail_for_local_tool_error(
+    tool_name: &crate::state::LocalToolName,
+    error_text: &str,
+) -> Option<String> {
+    if tool_name.as_str() != "bash" {
+        return None;
+    }
+    if error_text.contains(
+        "cannot be opened while the current actionable todo is `Generate an output HTML page with charts and tables.`",
+    ) {
+        return Some(
+            "The delegated run tried to open the deterministic HTML report before completing the HTML-generation todo. Return control, then generate the report first and open it only on the next todo step.".to_owned(),
+        );
+    }
+    if error_text.contains(
+        "cannot be written from bash while the current actionable todo is `Open the generated output HTML page in the browser.`",
+    ) || error_text.contains(
+        "cannot be written while the current actionable todo is `Open the generated output HTML page in the browser.`",
+    ) {
+        return Some(
+            "The delegated run tried to regenerate the deterministic HTML report even though only the browser-open todo remains. Return control and open the existing report instead of writing it again.".to_owned(),
+        );
+    }
+    if error_text.contains("cannot be written from bash while the current actionable todo is")
+        || error_text.contains("cannot be written while the current actionable todo is")
+    {
+        return Some(
+            "The delegated run tried to write the deterministic HTML report out of todo order. Return control and resume from the current actionable todo instead of skipping ahead.".to_owned(),
+        );
+    }
+    None
 }
 
 fn subagent_result_message(
@@ -2458,6 +3929,8 @@ fn build_final_answer_render_prompt(
     prompt_messages: &[MessageRecord],
     answer_brief: &str,
     response_target: &crate::state::ResponseTarget,
+    turn_policy_context: &TurnPolicyPromptContext,
+    todo_context: Option<&TodoPromptContext>,
 ) -> String {
     let client = match response_target.client {
         crate::state::ResponseClient::Api => "api",
@@ -2514,6 +3987,14 @@ display_text must preserve the same meaning while matching the target client for
     for message in prompt_messages {
         prompt.push_str("- ");
         prompt.push_str(&format!("{message:?}"));
+        prompt.push('\n');
+    }
+    prompt.push_str("\nTurn policy:\n");
+    prompt.push_str(&render_turn_policy_context(turn_policy_context));
+    prompt.push('\n');
+    if let Some(todo_context) = todo_context {
+        prompt.push_str("\nCurrent turn todo plan:\n");
+        prompt.push_str(&render_todo_context(todo_context));
         prompt.push('\n');
     }
     prompt.push_str("\nAnswer brief:\n");
@@ -2606,17 +4087,32 @@ mod tests {
 
     use crate::{
         ids::MessageId,
+        prompt::TurnPolicyPromptContext,
         state::{
-            DelegationTarget, LocalToolsScopeTarget, McpCallMessageRecord, McpCapabilityTarget,
-            McpResultMessageRecord, McpServerScopeTarget, MessageRecord, ServerName,
+            ConversationMessage, ConversationRole, DelegationTarget, LocalToolName,
+            LocalToolResultMessageRecord, LocalToolsScopeTarget, McpCallMessageRecord,
+            McpCapabilityTarget, McpResultMessageRecord, McpServerScopeTarget, MessageRecord,
+            ServerName, SubAgentResultMessageRecord,
         },
         subagent::ConfiguredSubagent,
+        todo::{
+            GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML,
+            TodoList, TodoStatus,
+        },
     };
 
     use super::{
-        McpSession, PreparedServer, build_subagent_prompt, build_subagent_tool_catalog,
-        render_confirmed_table_context, render_recent_mcp_results_context,
-        sanitize_mcp_tool_arguments,
+        McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON, PreparedServer,
+        build_subagent_prompt, build_subagent_tool_catalog, disabled_mcp_capability_reason,
+        disabled_mcp_capability_feedback_for_delegation,
+        generic_starter_replan_feedback_for_delegation, html_todo_feedback_for_delegation,
+        immediate_partial_detail_for_local_tool_error, incomplete_todo_final_feedback,
+        mcp_collection_feedback_for_delegation, reconcile_active_todo_from_turn_trace,
+        reconcile_mandatory_todos_from_turn_trace, render_confirmed_table_context,
+        render_recent_mcp_results_context, sanitize_mcp_tool_arguments,
+        should_require_todos_for_turn, sync_mcp_todo_after_delegation,
+        sync_mcp_todo_before_delegation,
+        tool_executor_mcp_todo_partial_feedback,
     };
 
     #[test]
@@ -2680,6 +4176,11 @@ mod tests {
             "Create a weekly new users chart",
             "give me a visualization for this",
             Path::new("/tmp/arka-session"),
+            Path::new("/tmp/arka-session/turn-1/todos.txt"),
+            &TurnPolicyPromptContext {
+                html_output_path: PathBuf::from("/tmp/arka-session/outputs/turn-1-report.html"),
+                require_todos: false,
+            },
             &messages,
         )
         .expect("prompt should build");
@@ -2688,6 +4189,686 @@ mod tests {
         assert!(prompt.contains("\"new_users\""));
         assert!(prompt.contains("write them into a local file"));
         assert!(prompt.contains("## Local Tools"));
+    }
+
+    #[test]
+    fn reconcile_mandatory_todos_marks_html_and_open_steps_completed() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-1");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = working_directory.join("outputs").join("turn-1-report.html");
+        std::fs::create_dir_all(
+            html_output_path
+                .parent()
+                .expect("html output parent should exist"),
+        )
+        .expect("outputs dir should exist");
+
+        let mut todos =
+            TodoList::initialize(&["Determine Virat Kohli's IPL 2025 runs.".to_owned()])
+                .expect("todo init should succeed");
+        todos
+            .set_status(1, crate::todo::TodoStatus::InProgress)
+            .expect("item 1 should enter in_progress");
+        todos
+            .set_status(1, crate::todo::TodoStatus::Completed)
+            .expect("item 1 should complete");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let messages = vec![
+            MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                tool_name: LocalToolName::new("write_file").expect("valid tool"),
+                status: "ok".to_owned(),
+                result_summary: format!("wrote 123 bytes to {}", html_output_path.display()),
+                error: None,
+            }),
+            MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                tool_name: LocalToolName::new("bash").expect("valid tool"),
+                status: "ok".to_owned(),
+                result_summary: "command: open outputs/turn-1-report.html\nexit_code: 0".to_owned(),
+                error: None,
+            }),
+        ];
+
+        reconcile_mandatory_todos_from_turn_trace(
+            &todo_path,
+            &html_output_path,
+            &working_directory,
+            &messages,
+        )
+        .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[1].text, MANDATORY_TODO_GENERATE_HTML);
+        assert_eq!(
+            reconciled.items[1].status,
+            crate::todo::TodoStatus::Completed
+        );
+        assert_eq!(reconciled.items[2].text, MANDATORY_TODO_OPEN_HTML);
+        assert_eq!(
+            reconciled.items[2].status,
+            crate::todo::TodoStatus::Completed
+        );
+    }
+
+    #[test]
+    fn reconcile_mandatory_todos_marks_html_completed_when_report_was_written_via_bash() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-1-bash-html");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = working_directory
+            .join("outputs")
+            .join("turn-1-bash-html-report.html");
+        std::fs::create_dir_all(
+            html_output_path
+                .parent()
+                .expect("html output parent should exist"),
+        )
+        .expect("outputs dir should exist");
+        std::fs::write(&html_output_path, "<html><body>report</body></html>")
+            .expect("html report should exist");
+
+        let mut todos =
+            TodoList::initialize(&["Determine Dhoni's IPL 2025 runs.".to_owned()])
+                .expect("todo init should succeed");
+        todos
+            .set_status(1, crate::todo::TodoStatus::InProgress)
+            .expect("item 1 should enter in_progress");
+        todos
+            .set_status(1, crate::todo::TodoStatus::Completed)
+            .expect("item 1 should complete");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let messages = vec![
+            MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                tool_name: LocalToolName::new("bash").expect("valid tool"),
+                status: "ok".to_owned(),
+                result_summary: format!(
+                    "command: python3 - <<'PY'\n# wrote {}\nexit_code: 0",
+                    html_output_path.display()
+                ),
+                error: None,
+            }),
+            MessageRecord::LocalToolResult(LocalToolResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                tool_name: LocalToolName::new("bash").expect("valid tool"),
+                status: "ok".to_owned(),
+                result_summary:
+                    "command: open outputs/turn-1-bash-html-report.html\nexit_code: 0"
+                        .to_owned(),
+                error: None,
+            }),
+        ];
+
+        reconcile_mandatory_todos_from_turn_trace(
+            &todo_path,
+            &html_output_path,
+            &working_directory,
+            &messages,
+        )
+        .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[1].text, MANDATORY_TODO_GENERATE_HTML);
+        assert_eq!(
+            reconciled.items[1].status,
+            crate::todo::TodoStatus::Completed
+        );
+        assert_eq!(reconciled.items[2].text, MANDATORY_TODO_OPEN_HTML);
+        assert_eq!(
+            reconciled.items[2].status,
+            crate::todo::TodoStatus::Completed
+        );
+    }
+
+    #[test]
+    fn reconcile_active_todo_marks_in_progress_item_completed_after_subagent_success() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-reconcile");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+
+        let todos = TodoList::parse(
+            "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            subagent_type: "tool-executor".to_owned(),
+            status: "completed".to_owned(),
+            executed_action_count: 3,
+            detail: "Validated the answer and wrote the report".to_owned(),
+            tool_mask: None,
+        })];
+
+        reconcile_active_todo_from_turn_trace(&todo_path, &messages)
+            .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::Completed);
+        assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Pending);
+    }
+
+    #[test]
+    fn reconcile_active_todo_marks_local_inspection_todo_completed_after_partial_tool_executor() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-partial-inspection");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+
+        let todos = TodoList::parse(
+            "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            subagent_type: "tool-executor".to_owned(),
+            status: "partial".to_owned(),
+            executed_action_count: 1,
+            detail:
+                "Inspected local workspace inputs and returned control for MCP-backed data collection."
+                    .to_owned(),
+            tool_mask: None,
+        })];
+
+        reconcile_active_todo_from_turn_trace(&todo_path, &messages)
+            .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::Completed);
+        assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Pending);
+    }
+
+    #[test]
+    fn reconcile_active_todo_does_not_complete_generic_starter_scaffold() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-generic-starter");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+
+        let todos = TodoList::parse(
+            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            subagent_type: "tool-executor".to_owned(),
+            status: "completed".to_owned(),
+            executed_action_count: 1,
+            detail: "Finished delegated work".to_owned(),
+            tool_mask: None,
+        })];
+
+        reconcile_active_todo_from_turn_trace(&todo_path, &messages)
+            .expect("reconciliation should succeed without mutating the starter");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn incomplete_todo_final_feedback_is_specific_for_html_tail_steps() {
+        let html_output_path = PathBuf::from("/tmp/arka-session/outputs/turn-1-report.html");
+
+        let html_feedback = incomplete_todo_final_feedback(
+            3,
+            "pending",
+            MANDATORY_TODO_GENERATE_HTML,
+            &html_output_path,
+        );
+        assert!(html_feedback.contains("mandatory deliverable is still incomplete"));
+        assert!(html_feedback.contains("Delegate `tool-executor`"));
+        assert!(html_feedback.contains("/tmp/arka-session/outputs/turn-1-report.html"));
+        assert!(html_feedback.contains("Do not ask `tool-executor` to open the report in the same delegation"));
+
+        let open_feedback =
+            incomplete_todo_final_feedback(4, "pending", MANDATORY_TODO_OPEN_HTML, &html_output_path);
+        assert!(open_feedback.contains("report still needs to be opened"));
+        assert!(open_feedback.contains("open the generated HTML report"));
+    }
+
+    #[test]
+    fn immediate_partial_detail_is_generated_for_out_of_order_html_open() {
+        let detail = immediate_partial_detail_for_local_tool_error(
+            &LocalToolName::new("bash").expect("valid tool"),
+            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be opened while the current actionable todo is `Generate an output HTML page with charts and tables.`; finish todos in order",
+        )
+        .expect("detail should be returned");
+        assert!(detail.contains("generate the report first"));
+        assert!(detail.contains("next todo step"));
+    }
+
+    #[test]
+    fn immediate_partial_detail_is_specific_for_html_rewrite_during_open_step() {
+        let detail = immediate_partial_detail_for_local_tool_error(
+            &LocalToolName::new("bash").expect("valid tool"),
+            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be written from bash while the current actionable todo is `Open the generated output HTML page in the browser.`; finish todos in order",
+        )
+        .expect("detail should be returned");
+        assert!(detail.contains("browser-open todo remains"));
+        assert!(detail.contains("open the existing report instead of writing it again"));
+    }
+
+    #[test]
+    fn html_todo_feedback_blocks_bundled_generate_and_open_goal() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-reconcile");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Fetch the answer\n2. [in_progress] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Generate the deterministic HTML report and open it in the browser."
+                    .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("Do not bundle the browser-open step"));
+        assert!(feedback.contains("Open the generated output HTML page in the browser."));
+    }
+
+    #[test]
+    fn html_todo_feedback_blocks_non_open_only_goal_when_open_todo_is_active() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-open-only");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Fetch the answer\n2. [completed] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Answer the user's IPL stat query and complete the required report deliverables."
+                    .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("Only open the existing deterministic HTML report"));
+        assert!(feedback.contains("Do not delegate any broader `tool-executor` work"));
+    }
+
+    #[test]
+    fn simple_factual_turns_skip_required_todos() {
+        assert!(!should_require_todos_for_turn(
+            "How many runs did Ajinkya Rahane score in 2025?",
+            &[],
+        ));
+        assert!(should_require_todos_for_turn(
+            "Analyze CSK batting trends in 2025 and generate a chart.",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn simple_factual_follow_up_turns_skip_required_todos() {
+        let conversation_history = vec![
+            ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "How many runs did Ajinkya Rahane score in 2025?".to_owned(),
+            },
+            ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::Assistant,
+                content: "If you mean IPL 2025, I can look it up now.".to_owned(),
+            },
+        ];
+
+        assert!(!should_require_todos_for_turn(
+            "yes, in IPL",
+            &conversation_history,
+        ));
+        assert!(!should_require_todos_for_turn("retry", &conversation_history));
+        assert!(!should_require_todos_for_turn(
+            "best fielder is somebody who has taken the most catches",
+            &conversation_history,
+        ));
+        assert!(should_require_todos_for_turn(
+            "yes",
+            &[ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "Analyze RCB batting trends in IPL 2025 and generate a chart.".to_owned(),
+            }],
+        ));
+        assert!(should_require_todos_for_turn(
+            "best fielder is somebody who has taken the most catches",
+            &[ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "Analyze IPL 2025 fielding performance and generate a report.".to_owned(),
+            }],
+        ));
+    }
+
+    #[test]
+    fn generic_starter_replan_blocks_bundled_plan_and_execute_goal() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-generic-starter-bundled-goal");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        TodoList::initialize(&[GENERIC_STARTER_TODO.to_owned()])
+            .expect("todo init should succeed")
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = generic_starter_replan_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Replace the generic todo scaffold and execute a comprehensive Hardik Pandya performance report workflow.".to_owned(),
+            },
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("planning-only"));
+        assert!(feedback.contains("return control immediately"));
+    }
+
+    #[test]
+    fn mcp_collection_feedback_blocks_tool_executor_for_data_collection_todos() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-routing");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Compute insights\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let feedback = mcp_collection_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Collect the season data locally".to_owned(),
+            },
+            true,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("should not be delegated to `tool-executor`"));
+        assert!(feedback.contains("Delegate `mcp-executor` with server scope"));
+    }
+
+    #[test]
+    fn mcp_collection_feedback_blocks_workspace_input_extraction_todos() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-routing-workspace-inputs");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Clarify the user ask\n2. [pending] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let feedback = mcp_collection_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Search local inputs for the Dhoni run total".to_owned(),
+            },
+            true,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("should not be delegated to `tool-executor`"));
+        assert!(feedback.contains("Delegate `mcp-executor` with server scope"));
+    }
+
+    #[test]
+    fn disabled_postgres_schema_resource_feedback_redirects_to_server_scope() {
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let feedback = disabled_mcp_capability_feedback_for_delegation(
+            &fake_postgres_mcp_session(&server_name),
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpCapability(McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Resource,
+                    capability_id: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                }),
+                goal: "Inspect IPL matches schema and analyze RCB's 2025 performance."
+                    .to_owned(),
+            },
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("postgres schema resource reads are disabled"));
+        assert!(feedback.contains("mcp_server_scope"));
+        assert!(feedback.contains("query tool with simple SELECT-based discovery"));
+    }
+
+    #[test]
+    fn tool_executor_mcp_todo_partial_feedback_blocks_non_todo_tools() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-tool-executor-mcp-gate");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Define scope\n2. [pending] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        let feedback = tool_executor_mcp_todo_partial_feedback(
+            &todo_path,
+            &LocalToolName::new("bash").expect("valid tool"),
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("belongs to MCP-backed data discovery or collection"));
+        assert!(feedback.contains("delegate `mcp-executor`"));
+    }
+
+    #[test]
+    fn sync_mcp_todo_before_and_after_delegation_updates_matching_todo() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        sync_mcp_todo_before_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                }),
+                goal: "Collect season data".to_owned(),
+            },
+        )
+        .expect("pre-sync should succeed");
+
+        let in_progress = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(in_progress.items[1].status, TodoStatus::InProgress);
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 2,
+                detail: "Collected season data".to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+    }
+
+    #[test]
+    fn sync_mcp_todo_marks_collection_step_completed_after_partial_result() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-partial");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Understand the requirements\n2. [in_progress] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "partial".to_owned(),
+                executed_action_count: 2,
+                detail: "Fetched the season match results and returning control for computation."
+                    .to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+        assert_eq!(completed.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn sync_mcp_todo_marks_hybrid_compute_or_extract_step_completed_after_partial_result() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-hybrid-partial");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "partial".to_owned(),
+                executed_action_count: 1,
+                detail: "Computed the IPL 2025 bowling ranking and returned control."
+                    .to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+        assert_eq!(completed.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn sync_mcp_todo_revives_failed_step_before_successful_retry() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-retry");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos.save_to_path(&todo_path).expect("todo file should write");
+
+        sync_mcp_todo_before_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("ipl").expect("valid server"),
+                }),
+                goal: "Resolve the failed IPL 2025 bowler-ranking step.".to_owned(),
+            },
+        )
+        .expect("pre-sync should succeed");
+
+        let retried = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(retried.items[1].status, TodoStatus::InProgress);
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 1,
+                detail: "Computed the bowler ranking successfully on retry.".to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+        assert_eq!(completed.items[2].status, TodoStatus::Pending);
     }
 
     fn fake_mcp_session(server_name: &ServerName) -> McpSession {
@@ -2787,6 +4968,87 @@ mod tests {
         }
     }
 
+    fn fake_postgres_mcp_session(server_name: &ServerName) -> McpSession {
+        McpSession {
+            servers: HashMap::from([(
+                server_name.clone(),
+                PreparedServer {
+                    config: McpServerConfig {
+                        name: server_name.to_string(),
+                        transport: None,
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: HashMap::new(),
+                        description: None,
+                    },
+                    minimal_catalog: McpMinimalCatalog {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        server: McpServerMetadata {
+                            logical_name: server_name.to_string(),
+                            protocol_name: "postgres-mcp".to_owned(),
+                            ..Default::default()
+                        },
+                        capability_families: McpCapabilityFamilies {
+                            tools: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                            resources: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                        },
+                        tools: vec![MinimalToolMetadata {
+                            name: "query".to_owned(),
+                            ..Default::default()
+                        }],
+                        resources: vec![MinimalResourceMetadata {
+                            uri: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    full_catalog: McpFullCatalog {
+                        schema_version: CURRENT_SCHEMA_VERSION,
+                        server: McpServerMetadata {
+                            logical_name: server_name.to_string(),
+                            protocol_name: "postgres-mcp".to_owned(),
+                            ..Default::default()
+                        },
+                        capability_families: McpCapabilityFamilies {
+                            tools: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                            resources: McpCapabilityFamilySummary {
+                                supported: true,
+                                count: 1,
+                            },
+                        },
+                        tools: vec![FullToolMetadata {
+                            name: "query".to_owned(),
+                            input_schema: serde_json::json!({
+                                "type": "object",
+                                "required": ["sql"],
+                                "properties": {
+                                    "sql": { "type": "string" }
+                                }
+                            }),
+                            ..Default::default()
+                        }],
+                        resources: vec![FullResourceMetadata {
+                            uri: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                            ..Default::default()
+                        }],
+                        extensions: serde_json::Value::Null,
+                    },
+                    full_catalog_markdown:
+                        "# MCP Full: ipl\n\n- tool: query\n- resource: postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                    connection: None,
+                },
+            )]),
+        }
+    }
+
     #[test]
     fn mcp_server_scope_prompt_includes_server_scope_and_no_local_tools() {
         let registry_path = workspace_root().join("config").join("subagents.json");
@@ -2813,6 +5075,11 @@ mod tests {
             "Inspect users",
             "How many users are there?",
             &workspace_root(),
+            &workspace_root().join("turn-1").join("todos.txt"),
+            &TurnPolicyPromptContext {
+                html_output_path: workspace_root().join("outputs").join("turn-1-report.html"),
+                require_todos: false,
+            },
             &[],
         )
         .expect("prompt should build");
@@ -2892,6 +5159,40 @@ mod tests {
     }
 
     #[test]
+    fn postgres_mcp_server_scope_catalog_filters_schema_resources() {
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let tools = build_subagent_tool_catalog(
+            &fake_postgres_mcp_session(&server_name),
+            &DelegationTarget::McpServerScope(McpServerScopeTarget { server_name }),
+        )
+        .expect("catalog should build");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "query");
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name == "postgres://vivek@localhost:5432/ipl/matches/schema"));
+    }
+
+    #[test]
+    fn postgres_mcp_schema_resources_are_marked_disabled() {
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let session = fake_postgres_mcp_session(&server_name);
+        let server = session.servers.get(&server_name).expect("server should exist");
+
+        let reason = disabled_mcp_capability_reason(
+            server,
+            &CapabilityKind::Resource,
+            "postgres://vivek@localhost:5432/ipl/matches/schema",
+        );
+
+        assert_eq!(
+            reason.as_deref(),
+            Some(POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON)
+        );
+    }
+
+    #[test]
     fn sanitize_mcp_tool_arguments_drops_extraneous_keys() {
         let server_name = ServerName::new("ex-vol").expect("valid server");
         let tools = build_subagent_tool_catalog(
@@ -2963,6 +5264,8 @@ pub enum RuntimeError {
     Validation(String),
     #[error("runtime timed out: {0}")]
     Timeout(String),
+    #[error("runtime I/O failed: {0}")]
+    Io(String),
     #[error("runtime model interaction failed: {0}")]
     Model(#[from] ModelAdapterError),
     #[error("MCP registry failed: {0}")]
@@ -2971,6 +5274,8 @@ pub enum RuntimeError {
     McpClient(#[from] McpClientError),
     #[error("prompt rendering failed: {0}")]
     Prompt(#[from] PromptRenderError),
+    #[error("todo state failed: {0}")]
+    Todo(#[from] crate::todo::TodoError),
     #[error("state validation failed: {0}")]
     State(#[from] crate::state::StateValidationError),
     #[error("sub-agent config failed: {0}")]

@@ -1,0 +1,4 @@
+1. [completed] Clarify the user ask
+2. [pending] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.
+3. [pending] Generate an output HTML page with charts and tables.
+4. [pending] Open the generated output HTML page in the browser.

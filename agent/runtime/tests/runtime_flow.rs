@@ -117,6 +117,7 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -234,6 +235,7 @@ async fn runtime_records_full_mcp_payload_and_subagent_executor_on_events() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -341,6 +343,7 @@ async fn delegated_subagent_follow_up_prompt_keeps_full_mcp_result_text() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -446,6 +449,7 @@ async fn prepared_session_skips_discovery_until_first_execution() {
                 enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
                 limits: RuntimeLimits::default(),
                 model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
             },
             &mut session,
         )
@@ -521,6 +525,7 @@ async fn runtime_reads_resource_via_tool_executor() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -616,6 +621,7 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -716,6 +722,7 @@ async fn runtime_server_scoped_mcp_subagent_can_use_multiple_tools_in_one_handof
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -830,6 +837,7 @@ async fn runtime_restricts_mcp_subagent_to_selected_capability() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -852,6 +860,279 @@ async fn runtime_restricts_mcp_subagent_to_selected_capability() {
         vec![("run-sql".to_owned(), false)],
         "delegated MCP execution should stay pinned to the selected capability"
     );
+}
+
+#[tokio::test]
+async fn runtime_stops_mcp_subagent_after_repeated_mcp_errors() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                            server_name: ServerName::new("fake").expect("valid server"),
+                        }),
+                        goal: "Collect season data".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "stopped after repeated MCP errors".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "run-sql".to_owned(),
+                    arguments: json!({"query": "select 1"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "run-sql".to_owned(),
+                    arguments: json!({"query": "select 2"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::McpToolCall {
+                    server_name: ServerName::new("fake").expect("valid server"),
+                    tool_name: "run-sql".to_owned(),
+                    arguments: json!({"query": "select 3"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-mcp-error-circuit-breaker");
+    let registry_path = write_registry(
+        &temp_dir,
+        FAKE_SERVER_BIN,
+        vec!["--tool-mode".to_owned(), "always-tool-error".to_owned()],
+    );
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Do the full analysis".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "stopped after repeated MCP errors");
+    let mcp_results = outcome
+        .turn
+        .messages
+        .iter()
+        .filter(|message| matches!(message, MessageRecord::McpResult(_)))
+        .count();
+    assert_eq!(mcp_results, 3);
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::SubAgentResult(record)
+            if record.status == "partial"
+                && record.detail.contains("repeated MCP failures forced an early stop")
+                && record.executed_action_count == 3
+    )));
+}
+
+#[tokio::test]
+async fn runtime_stops_tool_executor_after_repeated_local_tool_errors() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Do the local CSK analysis".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "stopped after repeated local tool errors".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("write_todos").expect("valid tool"),
+                    arguments: json!({}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("glob").expect("valid tool"),
+                    arguments: json!({}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("bash").expect("valid tool"),
+                    arguments: json!({}),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("write_todos").expect("valid tool"),
+                    arguments: json!({"status":"completed"}),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-local-tool-error-circuit-breaker");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "Sub-agents:\n<dynamic variable: available sub-agents>\nTools:\n<dynamic variable: available tools>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Do the analysis".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "stopped after repeated local tool errors");
+    let local_tool_results = outcome
+        .turn
+        .messages
+        .iter()
+        .filter(|message| matches!(message, MessageRecord::LocalToolResult(_)))
+        .count();
+    assert_eq!(local_tool_results, 4);
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::SubAgentResult(record)
+            if record.status == "partial"
+                && record.detail.contains("repeated local tool failures forced an early stop")
+                && record.executed_action_count == 4
+    )));
+}
+
+#[tokio::test]
+async fn runtime_treats_invalid_subagent_structured_output_as_partial_instead_of_failing_turn() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Do the local CSK analysis".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "continued after invalid subagent output".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![Err(ModelAdapterError::InvalidDecision(
+            "local tool name cannot be blank".to_owned(),
+        ))],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-invalid-subagent-structured-output");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "Sub-agents:\n<dynamic variable: available sub-agents>\nTools:\n<dynamic variable: available tools>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Do the analysis".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "continued after invalid subagent output");
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::SubAgentResult(record)
+            if record.status == "partial"
+                && record.executed_action_count == 0
+                && record.detail.contains("invalid structured output")
+                && record.detail.contains("local tool name cannot be blank")
+    )));
 }
 
 #[tokio::test]
@@ -919,6 +1200,7 @@ async fn runtime_blocks_duplicate_mcp_calls_with_identical_arguments() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1007,6 +1289,7 @@ async fn runtime_sanitizes_hybrid_mcp_arguments_before_execution() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1107,6 +1390,7 @@ async fn runtime_mcp_prompt_includes_confirmed_tables_from_recent_session_contex
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1174,6 +1458,7 @@ async fn runtime_mcp_executor_cannot_use_local_tools() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1244,6 +1529,7 @@ async fn runtime_tool_executor_cannot_use_mcp_tools() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1326,6 +1612,7 @@ async fn runtime_delegates_tool_executor_and_executes_glob() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1352,6 +1639,542 @@ async fn runtime_delegates_tool_executor_and_executes_glob() {
         } if tool_name == "glob"
             && executor.subagent_type.as_deref() == Some("tool-executor")
             && result_summary.contains("src/lib.rs")
+    )));
+}
+
+#[tokio::test]
+async fn complex_turn_creates_todo_file_and_injects_follow_up_prompt_context() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Create a complex-turn todo plan".to_owned(),
+                    },
+                },
+                usage: token_usage(2, 2),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "todo planning complete".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "todo planning complete".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("write_todos").expect("valid tool"),
+                    arguments: json!({
+                        "operation":"initialize",
+                        "items":["Inspect the source data","Compute summary metrics"]
+                    }),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::Done {
+                    summary: "Initialized complex-turn todos".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-complex-todo");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "Sub-agents:\n<dynamic variable: available sub-agents>\nTools:\n<dynamic variable: available tools>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Perform a complex analysis".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 3,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let todo_path = temp_dir
+        .join(outcome.turn.turn_id.to_string())
+        .join("todos.txt");
+    let todo_text = fs::read_to_string(&todo_path).expect("todo file should exist");
+    assert!(todo_text.contains("[pending] Inspect the source data"));
+    assert!(todo_text.contains("[pending] Generate an output HTML page with charts and tables."));
+    assert!(todo_text.contains("[pending] Open the generated output HTML page in the browser."));
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.iter().any(|prompt| {
+        prompt.contains("## Current Turn Todo Plan")
+            && prompt.contains("Inspect the source data")
+            && prompt.contains("Deterministic HTML output")
+    }));
+    assert!(prompts.iter().any(|prompt| {
+        prompt.contains("This delegation is todo-planning only.")
+            && prompt.contains("return `done` immediately")
+            && prompt.contains("do not begin executing the planned analysis")
+    }));
+}
+
+#[tokio::test]
+async fn non_todo_analysis_turn_still_gets_turn_policy_guidance() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![Ok(ModelAdapterResponse {
+            decision: ModelStepDecision::Final {
+                content: "Analysis complete".to_owned(),
+            },
+            usage: token_usage(1, 1),
+        })],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-analysis-html-guidance");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be precise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Analyze the uploaded dataset".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let todo_path = temp_dir
+        .join(outcome.turn.turn_id.to_string())
+        .join("todos.txt");
+    assert!(
+        !todo_path.exists(),
+        "non-todo analysis turn should not force todos.txt"
+    );
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.iter().any(|prompt| {
+        prompt.contains("## Turn Policy")
+            && prompt.contains("Todos required: false")
+            && prompt.contains("Deterministic HTML output:")
+            && prompt.contains("generate the HTML report and open it in the browser")
+    }));
+}
+
+#[tokio::test]
+async fn simple_turn_does_not_create_todo_file() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![Ok(ModelAdapterResponse {
+            decision: ModelStepDecision::Final {
+                content: "Simple answer".to_owned(),
+            },
+            usage: token_usage(1, 1),
+        })],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-simple-no-todo");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be concise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "What is a mean?".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let todo_path = temp_dir
+        .join(outcome.turn.turn_id.to_string())
+        .join("todos.txt");
+    assert!(
+        !todo_path.exists(),
+        "simple turn should not create todos.txt"
+    );
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.iter().any(|prompt| {
+        prompt.contains("## Turn Policy")
+            && prompt.contains("Todos required: false")
+            && prompt.contains("Skip is allowed only for very simple factual replies")
+    }));
+}
+
+#[tokio::test]
+async fn required_todos_mode_creates_starter_todo_file_for_simple_turns() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "Simple answer".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "Simple answer".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-simple-required-todos");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be concise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "What is a mean?".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 2,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: true,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let todo_path = temp_dir
+        .join(outcome.turn.turn_id.to_string())
+        .join("todos.txt");
+    let todo_text = fs::read_to_string(&todo_path).expect("required mode should create todos.txt");
+    assert!(todo_text.contains("[pending] Understand and complete the user request."));
+    assert!(todo_text.contains("[pending] Generate an output HTML page with charts and tables."));
+    assert!(todo_text.contains("[pending] Open the generated output HTML page in the browser."));
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.iter().any(|prompt| {
+        prompt.contains("## Turn Policy")
+            && prompt.contains("Todos required: true")
+            && prompt.contains("## Current Turn Todo Plan")
+            && prompt.contains("Understand and complete the user request.")
+    }));
+}
+
+#[tokio::test]
+async fn runtime_rejects_premature_final_when_todos_are_incomplete() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "Virat Kohli scored 657 runs.".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "Virat Kohli scored 657 runs.".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-reject-premature-final");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be concise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "How many runs did Virat Kohli score in IPL 2025?".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 2,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: true,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::MaxStepsReached);
+    assert!(outcome.final_text.is_empty());
+    assert!(outcome.turn.steps.len() >= 2);
+    assert_eq!(
+        outcome.turn.steps[0].outcome,
+        agent_runtime::StepOutcomeKind::Continue
+    );
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::Llm(record)
+            if record.content.contains("generic starter scaffold")
+    )));
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.len() >= 2);
+    assert!(prompts[1].contains("generic starter scaffold"));
+    assert!(prompts[1].contains("replan_pending_suffix"));
+    assert!(prompts[1].contains("return control immediately"));
+}
+
+#[tokio::test]
+async fn runtime_blocks_substantive_delegation_until_generic_scaffold_is_replanned() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                            server_name: ServerName::new("fake").expect("valid server"),
+                        }),
+                        goal: "Inspect the database and compute the season analysis".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "unused".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-block-generic-scaffold");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be concise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Do a full season analysis for CSK in IPL 2025".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 2,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: true,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::MaxStepsReached);
+    assert!(
+        !outcome
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::HandoffToSubagent { subagent_type, .. } if subagent_type == "mcp-executor"))
+    );
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::Llm(record)
+            if record.content.contains("generic starter scaffold")
+                && record.content.contains("replan_pending_suffix")
+    )));
+
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(prompts.len() >= 2);
+    assert!(prompts[1].contains("generic starter scaffold"));
+}
+
+#[tokio::test]
+async fn runtime_blocks_replanning_again_after_concrete_plan_exists() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Create a concrete todo plan for the CSK analysis".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "Replan the todo list again before doing any work".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::LocalToolCall {
+                    tool_name: LocalToolName::new("write_todos").expect("valid tool"),
+                    arguments: json!({
+                        "operation": "replan_pending_suffix",
+                        "items": [
+                            "Define the CSK IPL 2025 analysis scope and key questions to answer",
+                            "Collect and prepare CSK IPL 2025 season data and supporting context",
+                            "Compute team and player insights with tables and charts"
+                        ]
+                    }),
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(SubagentAdapterResponse {
+                decision: SubagentDecision::Done {
+                    summary: "Concrete todo plan created".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-block-repeat-replan");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be concise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Do a full season analysis for CSK in IPL 2025".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 2,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: true,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::MaxStepsReached);
+    let handoffs = outcome
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                RuntimeEvent::HandoffToSubagent { subagent_type, .. } if subagent_type == "tool-executor"
+            )
+        })
+        .count();
+    assert_eq!(handoffs, 1);
+    assert!(outcome.turn.messages.iter().any(|message| matches!(
+        message,
+        MessageRecord::Llm(record)
+            if record.content.contains("Do not replan the todo list again yet")
     )));
 }
 
@@ -1422,6 +2245,7 @@ async fn delegated_tool_follow_up_prompt_keeps_bash_output() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1472,6 +2296,7 @@ async fn runtime_fails_when_metadata_is_missing() {
             enabled_servers: Some(vec![ServerName::new("missing-meta").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect_err("missing metadata must fail");
@@ -1513,6 +2338,7 @@ async fn runtime_skips_final_render_for_short_factual_answers() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");
@@ -1558,6 +2384,7 @@ async fn runtime_tracks_model_events_for_rendered_answers() {
             enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
             limits: RuntimeLimits::default(),
             model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
         })
         .await
         .expect("turn should succeed");

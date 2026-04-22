@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -1027,7 +1027,13 @@ where
         &self,
         bindings: Vec<ChannelBinding>,
     ) -> Result<SessionRecord, ControlPlaneError> {
+        let binding_count = bindings.len();
         let session = self.store.create_session(bindings).await?;
+        info!(
+            session_id = %session.session_id,
+            binding_count,
+            "created session"
+        );
         if let Err(error) = self.runner.prepare_session(&session.session_id).await {
             error!(
                 session_id = %session.session_id,
@@ -1216,6 +1222,11 @@ where
         envelope: ChannelEnvelope,
         extra_runtime_harness_listeners: Vec<Arc<dyn RuntimeHarnessListener>>,
     ) -> Result<ChannelDispatchResult, ControlPlaneError> {
+        let intent_name = channel_intent_name(&envelope.intent);
+        let text_preview = match &envelope.intent {
+            ChannelIntent::UserText { text } => Some(summarize_text_for_log(text)),
+            _ => None,
+        };
         let binding = ChannelBinding {
             channel: envelope.channel,
             external_workspace_id: envelope.external_workspace_id.clone(),
@@ -1224,6 +1235,17 @@ where
             external_thread_id: envelope.external_thread_id.clone(),
             external_user_id: envelope.external_user_id.clone(),
         };
+        info!(
+            channel = ?envelope.channel,
+            intent = intent_name,
+            idempotency_key = %envelope.idempotency_key,
+            external_conversation_id = ?envelope.external_conversation_id,
+            external_channel_id = ?envelope.external_channel_id,
+            external_thread_id = ?envelope.external_thread_id,
+            external_user_id = ?envelope.external_user_id,
+            text_preview = ?text_preview,
+            "received channel envelope"
+        );
 
         if !self
             .store
@@ -1264,6 +1286,12 @@ where
                 self.store
                     .attach_binding(&session.session_id, binding)
                     .await?;
+                info!(
+                    session_id = %session.session_id,
+                    channel = ?envelope.channel,
+                    message_chars = text.chars().count(),
+                    "dispatching user text to session"
+                );
                 self.handle_user_text(
                     session.session_id,
                     text,
@@ -1462,6 +1490,16 @@ where
             .store
             .list_recent_computed_results(&session_id, RECENT_COMPUTED_RESULTS_LIMIT)
             .await;
+        info!(
+            session_id = %session_id,
+            channel = ?channel,
+            turn_number,
+            history_messages = conversation_history.len(),
+            recent_computed_results = recent_session_messages.len(),
+            message_chars = text.chars().count(),
+            text_preview = %summarize_text_for_log(&text),
+            "queued runtime turn"
+        );
 
         let turn = self
             .runner
@@ -1504,6 +1542,7 @@ where
                     external_message_id: None,
                 };
                 self.store.append_message(assistant_message.clone()).await?;
+                let model_name_for_log = model_name.clone();
                 let summary = TurnRecordSummary {
                     turn_number,
                     model_name,
@@ -1518,6 +1557,23 @@ where
                 } else {
                     SessionStatus::Failed
                 };
+                let generated_attachment = slack_generated_attachment(channel, &generated_artifacts);
+                let generated_artifact_count = generated_artifacts.len();
+                info!(
+                    session_id = %session_id,
+                    channel = ?channel,
+                    turn_number,
+                    model_name = %model_name_for_log,
+                    elapsed_ms,
+                    termination = ?termination,
+                    input_tokens = usage.input_tokens,
+                    cached_tokens = usage.cached_tokens,
+                    output_tokens = usage.output_tokens,
+                    total_tokens = usage.total_tokens,
+                    generated_artifact_count,
+                    reply_chars = final_text.chars().count(),
+                    "runtime turn completed"
+                );
                 let session = self
                     .store
                     .update_session(&session_id, new_status, Some(summary.clone()))
@@ -1533,7 +1589,7 @@ where
                         session_id,
                         kind: OutboundMessageKind::Reply,
                         text: display_text,
-                        attachment: slack_generated_attachment(channel, &generated_artifacts),
+                        attachment: generated_attachment,
                         delivery_target,
                     }],
                     approval: None,
@@ -1570,6 +1626,27 @@ where
 
     fn emit(&self, event: SessionEvent) {
         let _ = self.events_tx.send(event);
+    }
+}
+
+fn summarize_text_for_log(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+
+    let mut normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > MAX_CHARS {
+        normalized = normalized.chars().take(MAX_CHARS).collect::<String>() + "...";
+    }
+    normalized
+}
+
+fn channel_intent_name(intent: &ChannelIntent) -> &'static str {
+    match intent {
+        ChannelIntent::UserText { .. } => "user_text",
+        ChannelIntent::ResetSession => "reset_session",
+        ChannelIntent::ApprovalResponse { .. } => "approval_response",
+        ChannelIntent::Interrupt => "interrupt",
+        ChannelIntent::Resume => "resume",
+        ChannelIntent::StatusRequest => "status_request",
     }
 }
 

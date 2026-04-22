@@ -22,8 +22,8 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::trace::TraceLayer;
-use tracing::{info_span, warn};
+use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::{Level, info_span, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -641,13 +641,17 @@ where
             post(handle_whatsapp_event::<R, S>),
         )
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri()
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri()
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
         .with_state(state)
 }

@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use agent_runtime::{
@@ -17,7 +17,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
 use tokio_postgres::{Client, NoTls};
-use tracing::warn;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{SessionEvent, SessionId};
@@ -183,6 +183,9 @@ pub struct DebugHistoryStore {
     client: Arc<Client>,
 }
 
+#[derive(Debug, Default)]
+pub struct ConsoleRuntimeHarnessListener;
+
 pub trait RuntimeHarnessListener: Send + Sync {
     fn try_observe(
         &self,
@@ -261,6 +264,24 @@ impl RuntimeHarnessFanoutSink {
                 warn!(error = %error, "runtime harness listener dropped observation");
             }
         }
+    }
+}
+
+impl ConsoleRuntimeHarnessListener {
+    pub fn new() -> Arc<dyn RuntimeHarnessListener> {
+        Arc::new(Self)
+    }
+}
+
+impl RuntimeHarnessListener for ConsoleRuntimeHarnessListener {
+    fn try_observe(
+        &self,
+        observation: RuntimeHarnessObservation,
+    ) -> Result<(), RuntimeHarnessListenerError> {
+        if let RuntimeHarnessObservation::Event(envelope) = observation {
+            log_runtime_event_to_console(&envelope);
+        }
+        Ok(())
     }
 }
 
@@ -914,6 +935,286 @@ fn runtime_event_type(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::StepEnded { .. } => "step_ended",
         RuntimeEvent::TurnEnded { .. } => "turn_ended",
     }
+}
+
+fn log_runtime_event_to_console(envelope: &RuntimeHarnessEventEnvelope) {
+    let event_type = runtime_event_type(&envelope.event);
+    match &envelope.event {
+        RuntimeEvent::TurnStarted { executor, .. } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                "turn started"
+            );
+        }
+        RuntimeEvent::StepStarted {
+            step_id,
+            step_number,
+            executor,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                step_number,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                "step started"
+            );
+        }
+        RuntimeEvent::HandoffToSubagent {
+            step_id,
+            executor,
+            subagent_type,
+            goal,
+            target,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                subagent_type = %subagent_type,
+                target = %target_summary(target),
+                goal = %truncate_for_log(goal, 160),
+                "main agent handed off to subagent"
+            );
+        }
+        RuntimeEvent::ModelCalled {
+            step_id, executor, ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                "calling model"
+            );
+        }
+        RuntimeEvent::ModelResponded {
+            step_id,
+            latency,
+            usage,
+            executor,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                latency_ms = duration_ms(*latency),
+                input_tokens = usage.input_tokens,
+                cached_tokens = usage.cached_tokens,
+                output_tokens = usage.output_tokens,
+                total_tokens = usage.total_tokens,
+                "model responded"
+            );
+        }
+        RuntimeEvent::HandoffToMainAgent {
+            step_id,
+            executor,
+            subagent_type,
+            status,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                subagent_type = %subagent_type,
+                status = %status,
+                "subagent returned control to main agent"
+            );
+        }
+        RuntimeEvent::McpCalled {
+            step_id,
+            server_name,
+            tool_name,
+            executor,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                server_name = %server_name,
+                tool_name = %tool_name,
+                "calling MCP tool"
+            );
+        }
+        RuntimeEvent::McpResponded {
+            step_id,
+            server_name,
+            tool_name,
+            executor,
+            latency,
+            was_error,
+            result_summary,
+            error: mcp_error,
+            ..
+        } => {
+            let log_message = if *was_error {
+                "MCP tool returned error"
+            } else {
+                "MCP tool responded"
+            };
+            if *was_error {
+                warn!(
+                    session_id = %envelope.session_id,
+                    turn_number = envelope.turn_number,
+                    step_id = %step_id,
+                    event = event_type,
+                    executor = %executor_filter_label(executor),
+                    server_name = %server_name,
+                    tool_name = %tool_name,
+                    latency_ms = duration_ms(*latency),
+                    result_summary = %truncate_for_log(result_summary, 160),
+                    error = ?mcp_error,
+                    "{log_message}"
+                );
+            } else {
+                info!(
+                    session_id = %envelope.session_id,
+                    turn_number = envelope.turn_number,
+                    step_id = %step_id,
+                    event = event_type,
+                    executor = %executor_filter_label(executor),
+                    server_name = %server_name,
+                    tool_name = %tool_name,
+                    latency_ms = duration_ms(*latency),
+                    result_summary = %truncate_for_log(result_summary, 160),
+                    "{log_message}"
+                );
+            }
+        }
+        RuntimeEvent::LocalToolCalled {
+            step_id,
+            tool_name,
+            executor,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                tool_name = %tool_name,
+                "calling local tool"
+            );
+        }
+        RuntimeEvent::LocalToolResponded {
+            step_id,
+            tool_name,
+            executor,
+            latency,
+            was_error,
+            result_summary,
+            error: tool_error,
+            ..
+        } => {
+            let log_message = if *was_error {
+                "local tool returned error"
+            } else {
+                "local tool responded"
+            };
+            if *was_error {
+                warn!(
+                    session_id = %envelope.session_id,
+                    turn_number = envelope.turn_number,
+                    step_id = %step_id,
+                    event = event_type,
+                    executor = %executor_filter_label(executor),
+                    tool_name = %tool_name,
+                    latency_ms = duration_ms(*latency),
+                    result_summary = %truncate_for_log(result_summary, 160),
+                    error = ?tool_error,
+                    "{log_message}"
+                );
+            } else {
+                info!(
+                    session_id = %envelope.session_id,
+                    turn_number = envelope.turn_number,
+                    step_id = %step_id,
+                    event = event_type,
+                    executor = %executor_filter_label(executor),
+                    tool_name = %tool_name,
+                    latency_ms = duration_ms(*latency),
+                    result_summary = %truncate_for_log(result_summary, 160),
+                    "{log_message}"
+                );
+            }
+        }
+        RuntimeEvent::AnswerRenderFailed {
+            step_id,
+            executor,
+            error: render_error,
+            ..
+        } => {
+            error!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                step_id = %step_id,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                error = %render_error,
+                "answer render failed"
+            );
+        }
+        RuntimeEvent::TurnEnded {
+            executor,
+            termination,
+            usage,
+            ..
+        } => {
+            info!(
+                session_id = %envelope.session_id,
+                turn_number = envelope.turn_number,
+                event = event_type,
+                executor = %executor_filter_label(executor),
+                termination = ?termination,
+                input_tokens = usage.input_tokens,
+                cached_tokens = usage.cached_tokens,
+                output_tokens = usage.output_tokens,
+                total_tokens = usage.total_tokens,
+                "turn ended"
+            );
+        }
+        RuntimeEvent::PromptBuilt { .. }
+        | RuntimeEvent::AnswerRenderStarted { .. }
+        | RuntimeEvent::AnswerTextDelta { .. }
+        | RuntimeEvent::AnswerRenderCompleted { .. }
+        | RuntimeEvent::ToolMaskEvaluated { .. }
+        | RuntimeEvent::StepEnded { .. } => {}
+    }
+}
+
+fn duration_ms(duration: Duration) -> u128 {
+    duration.as_millis()
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > max_chars {
+        normalized = normalized.chars().take(max_chars).collect::<String>() + "...";
+    }
+    normalized
+}
+
+fn target_summary(target: &agent_runtime::state::DelegationTarget) -> String {
+    truncate_for_log(&target.summary(), 120)
 }
 
 fn debug_turn_status_label(status: DebugTurnStatus) -> &'static str {

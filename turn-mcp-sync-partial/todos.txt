@@ -1,0 +1,5 @@
+1. [completed] Understand the requirements
+2. [completed] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.
+3. [pending] Compute each team's NRR and identify the highest-NRR team for 2025.
+4. [pending] Generate an output HTML page with charts and tables.
+5. [pending] Open the generated output HTML page in the browser.

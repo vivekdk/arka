@@ -42,6 +42,19 @@ pub enum PromptRenderError {
 #[derive(Clone, Debug, Default)]
 pub struct PromptAssembler;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnPolicyPromptContext {
+    pub html_output_path: PathBuf,
+    pub require_todos: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoPromptContext {
+    pub todo_path: PathBuf,
+    pub todo_contents: String,
+    pub next_actionable: Option<String>,
+}
+
 impl PromptAssembler {
     /// Renders the step prompt using the fully rendered system prompt and the
     /// current conversation state for this turn.
@@ -51,6 +64,8 @@ impl PromptAssembler {
         conversation_history: &[ConversationMessage],
         recent_session_messages: &[MessageRecord],
         current_turn_messages: &[MessageRecord],
+        turn_policy_context: &TurnPolicyPromptContext,
+        todo_context: Option<&TodoPromptContext>,
     ) -> PromptSnapshot {
         let mut sections = Vec::new();
 
@@ -69,6 +84,16 @@ impl PromptAssembler {
             });
         }
         sections.push(PromptSection {
+            title: "Turn Policy".to_owned(),
+            content: render_turn_policy_context(turn_policy_context),
+        });
+        if let Some(todo_context) = todo_context {
+            sections.push(PromptSection {
+                title: "Current Turn Todo Plan".to_owned(),
+                content: render_todo_context(todo_context),
+            });
+        }
+        sections.push(PromptSection {
             title: "Current Turn Context".to_owned(),
             content: render_turn_context(current_turn_messages),
         });
@@ -81,6 +106,14 @@ impl PromptAssembler {
 
         PromptSnapshot { rendered, sections }
     }
+}
+
+pub fn render_turn_policy_context(turn_policy_context: &TurnPolicyPromptContext) -> String {
+    format!(
+        "Todos required: {}\nDeterministic HTML output: {}\nIf todos are required, a todo file must exist before substantive execution. If the starter todo plan is too coarse, replan the future pending suffix before continuing.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work, generate the HTML report and open it in the browser before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
+        turn_policy_context.require_todos,
+        turn_policy_context.html_output_path.display()
+    )
 }
 
 /// Reads the prompt template from disk and replaces supported dynamic tags.
@@ -190,6 +223,19 @@ fn render_recent_session_results(messages: &[MessageRecord]) -> String {
     } else {
         rendered.join("\n")
     }
+}
+
+pub fn render_todo_context(todo_context: &TodoPromptContext) -> String {
+    let next_actionable = todo_context
+        .next_actionable
+        .as_deref()
+        .unwrap_or("All todo items are completed.");
+    format!(
+        "Todo file: {}\nNext actionable todo: {}\n\nTodo contents:\n{}",
+        todo_context.todo_path.display(),
+        next_actionable,
+        todo_context.todo_contents
+    )
 }
 
 fn render_available_mcps(capabilities: &[McpCapability]) -> String {
@@ -302,9 +348,11 @@ fn render_response_target(target: &ResponseTarget) -> String {
 mod tests {
     //! Prompt-rendering regressions for dynamic tags and canonical sections.
 
+    use std::path::PathBuf;
+
     use crate::{
         ids::MessageId,
-        prompt::load_and_render_system_prompt,
+        prompt::{TodoPromptContext, TurnPolicyPromptContext, load_and_render_system_prompt},
         state::{
             ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability,
             McpCapabilityTarget, McpResultMessageRecord, MessageRecord, ResponseClient,
@@ -331,10 +379,16 @@ mod tests {
                 timestamp: std::time::SystemTime::now(),
                 content: "thinking".to_owned(),
             })],
+            &TurnPolicyPromptContext {
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                require_todos: false,
+            },
+            None,
         );
 
         assert!(prompt.rendered.contains("## System Prompt"));
         assert!(prompt.rendered.contains("## Conversation History"));
+        assert!(prompt.rendered.contains("## Turn Policy"));
         assert!(prompt.rendered.contains("## Current Turn Context"));
         assert!(!prompt.rendered.contains("## MCP Capabilities"));
         assert!(!prompt.rendered.contains("## Sub-agents"));
@@ -364,6 +418,11 @@ mod tests {
                 error: None,
             })],
             &[],
+            &TurnPolicyPromptContext {
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                require_todos: false,
+            },
+            None,
         );
 
         assert!(
@@ -373,6 +432,55 @@ mod tests {
         );
         assert!(prompt.rendered.contains("run_select_query"));
         assert!(prompt.rendered.contains("2026-04-05"));
+    }
+
+    #[test]
+    fn prompt_includes_todo_section_when_present() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            &[],
+            &[],
+            &[],
+            &TurnPolicyPromptContext {
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                require_todos: false,
+            },
+            Some(&TodoPromptContext {
+                todo_path: PathBuf::from("/tmp/session/turn/todos.txt"),
+                todo_contents: "1. [pending] Inspect data".to_owned(),
+                next_actionable: Some("1. [pending] Inspect data".to_owned()),
+            }),
+        );
+
+        assert!(prompt.rendered.contains("## Current Turn Todo Plan"));
+        assert!(prompt.rendered.contains("Inspect data"));
+        assert!(prompt.rendered.contains("turn-report.html"));
+    }
+
+    #[test]
+    fn prompt_includes_turn_policy_without_todo_context() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            &[],
+            &[],
+            &[],
+            &TurnPolicyPromptContext {
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                require_todos: true,
+            },
+            None,
+        );
+
+        assert!(prompt.rendered.contains("## Turn Policy"));
+        assert!(prompt.rendered.contains("turn-report.html"));
+        assert!(prompt.rendered.contains("Todos required: true"));
+        assert!(
+            prompt
+                .rendered
+                .contains("Default rule: if this turn performs analysis")
+        );
     }
 
     #[test]

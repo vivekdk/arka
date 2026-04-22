@@ -11,13 +11,14 @@ use std::{
 };
 
 use agent_controlplane::{
-    DebugHistoryStore, JsonlConversationStore, LoggingWhatsAppDeliveryClient,
+    ConsoleRuntimeHarnessListener, DebugHistoryStore, JsonlConversationStore, LoggingWhatsAppDeliveryClient,
     PostgresRuntimeDebugListener, ReqwestSlackDeliveryClient, ReqwestWhatsAppWebBridgeClient,
     RuntimeExecutionConfig, RuntimeTurnRunner, SlackConnector, WhatsAppConnector, WhatsAppDmPolicy,
     router_with_channels,
 };
 use agent_openai::OpenAiModelAdapter;
 use agent_runtime::{AgentRuntime, ModelConfig, RuntimeLimits, ServerName};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -108,6 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         mcp_call_timeout: Duration::from_secs(read_env_u64("RUNTIME_MCP_CALL_TIMEOUT_SECS", 10)),
         ..RuntimeLimits::default()
     };
+    let startup_model_name = model_name.clone();
+    let startup_system_prompt_path = system_prompt_path.clone();
+    let startup_workspace_root = workspace_root.clone();
     let adapter = OpenAiModelAdapter::new(api_key)?;
     let runtime = AgentRuntime::new(adapter);
     let runner = RuntimeTurnRunner::new(
@@ -121,10 +125,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             enabled_servers: server_names,
             limits: runtime_limits,
             model_config: ModelConfig::new(model_name),
+            require_todos: read_env_bool("RUNTIME_REQUIRE_TODOS", true),
         },
     );
     let store = JsonlConversationStore::open(&session_store_dir)?;
-    let mut service = agent_controlplane::SessionService::new(runner, store);
+    let mut service = agent_controlplane::SessionService::new(runner, store)
+        .with_runtime_harness_listener(ConsoleRuntimeHarnessListener::new());
     let mut debug_history_store = None;
     if runtime_debug_postgres_enabled {
         let dsn = runtime_debug_postgres_dsn.ok_or(
@@ -175,6 +181,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .join("whatsapp-gateway.json"),
         }
     });
+    info!(
+        bind_addr = %bind_addr,
+        model = %startup_model_name,
+        system_prompt_path = %startup_system_prompt_path.display(),
+        workspace_root = %startup_workspace_root.display(),
+        session_store_dir = %session_store_dir,
+        runtime_debug_postgres_enabled,
+        slack_enabled = slack_connector.is_some(),
+        whatsapp_gateway_enabled = whatsapp_connector.is_some(),
+        "starting controlplane server"
+    );
     let app = router_with_channels(
         service.clone(),
         debug_history_store,
@@ -182,16 +199,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         whatsapp_connector,
     );
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!("server listening on http://{bind_addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    info!("shutdown signal received; stopping controlplane server");
     service.shutdown().await?;
+    info!("controlplane server stopped");
     Ok(())
 }
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,tower_http=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

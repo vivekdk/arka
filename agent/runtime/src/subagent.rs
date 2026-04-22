@@ -217,6 +217,19 @@ mod tests {
             "Use `read_file` before mutating when the current file contents are not already known."
         ));
         assert!(rendered.contains(
+            "If the delegated goal is to create, refine, or replan the todo list, that delegation is planning-only."
+        ));
+        assert!(rendered.contains("return `done` immediately"));
+        assert!(rendered.contains(
+            "If the current todo item is already `in_progress`, do not try to mark it `in_progress` again."
+        ));
+        assert!(rendered.contains(
+            "Use the exact input schema for each local tool."
+        ));
+        assert!(rendered.contains(
+            "Do not keep retrying similar invalid calls indefinitely."
+        ));
+        assert!(rendered.contains(
             "If `edit_file` cannot find the requested text, read the file again and reassess before continuing."
         ));
         assert!(rendered.contains(
@@ -225,6 +238,35 @@ mod tests {
         assert!(rendered.contains(
             "The delegated prompt will include the working directory and the available local tools."
         ));
+        assert!(!rendered.contains("<dynamic variable: MCP server details>"));
+    }
+
+    #[test]
+    fn load_subagent_prompt_renders_actual_mcp_executor_template() {
+        let base_dir = workspace_root().join("config");
+        let configured = ConfiguredSubagent {
+            subagent_type: "mcp-executor".to_owned(),
+            display_name: "Mcp Executor".to_owned(),
+            purpose: "Run delegated MCP work".to_owned(),
+            when_to_use: "When MCP work is needed".to_owned(),
+            target_requirements: "mcp target".to_owned(),
+            result_summary: "Returns MCP tool or resource actions until the delegated goal is complete"
+                .to_owned(),
+            prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+
+        let rendered = load_subagent_prompt(
+            &base_dir,
+            &configured,
+            "---\nserver:\n  logical_name: ipl\n  protocol_name: postgres-mcp\n---\n\n# MCP Full: ipl",
+        )
+        .expect("mcp-executor prompt should load");
+
+        assert!(rendered.contains("You are the `mcp-executor` sub-agent."));
+        assert!(rendered.contains("do not rely on `postgres://.../schema` resource reads"));
+        assert!(rendered.contains("stop and return `partial`"));
         assert!(!rendered.contains("<dynamic variable: MCP server details>"));
     }
 

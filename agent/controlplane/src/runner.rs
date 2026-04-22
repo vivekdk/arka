@@ -27,6 +27,7 @@ use agent_runtime::{
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tracing::{error, info};
 
 /// Input passed from the control plane into one runtime turn.
 #[derive(Clone)]
@@ -75,6 +76,7 @@ pub struct TurnRunnerOutput {
 pub enum GeneratedArtifactKind {
     Image,
     Document,
+    Html,
 }
 
 /// One local artifact generated during a runtime turn.
@@ -105,6 +107,8 @@ pub struct RuntimeExecutionConfig {
     pub limits: RuntimeLimits,
     /// Model selection and provider options used for every turn.
     pub model_config: ModelConfig,
+    /// Whether every turn must start with a todo file.
+    pub require_todos: bool,
 }
 
 /// Trait implemented by any component capable of executing one runtime turn.
@@ -196,12 +200,29 @@ where
     }
 
     async fn run_turn(&self, input: TurnRunnerInput) -> Result<TurnRunnerOutput, TurnRunnerError> {
+        let session_id = input.session_id.clone();
+        let turn_number = input.turn_number;
+        let history_len = input.conversation_history.len();
+        let recent_computed_results_len = input.recent_session_messages.len();
+        let user_message_chars = input.user_message.chars().count();
         let session_mcp = self.get_or_prepare_mcp_session(&input.session_id).await?;
         let mut session_mcp = session_mcp.lock().await;
         let turn_started_at = SystemTime::now();
         let started = Instant::now();
         let working_directory =
             prepare_session_workspace_at(&self.config.workspace_root, &input.session_id)?;
+        info!(
+            session_id = %session_id,
+            turn_number,
+            model = %self.config.model_config.model_name,
+            history_messages = history_len,
+            recent_computed_results = recent_computed_results_len,
+            message_chars = user_message_chars,
+            response_client = ?input.response_target.client,
+            response_format = ?input.response_target.format,
+            working_directory = %working_directory.display(),
+            "starting runtime turn"
+        );
         let request = agent_runtime::RunRequest {
             system_prompt_path: self.config.system_prompt_path.clone(),
             working_directory: working_directory.clone(),
@@ -215,6 +236,7 @@ where
             enabled_servers: self.config.enabled_servers.clone(),
             limits: self.config.limits.clone(),
             model_config: self.config.model_config.clone(),
+            require_todos: self.config.require_todos,
         };
         let turn_debug_metadata = TurnDebugMetadata {
             model_name: self.config.model_config.model_name.clone(),
@@ -254,6 +276,19 @@ where
                 let events = sink.into_events();
                 let generated_artifacts =
                     collect_generated_artifacts(&working_directory, turn_started_at)?;
+                info!(
+                    session_id = %session_id,
+                    turn_number,
+                    elapsed_ms,
+                    termination = ?outcome.termination,
+                    input_tokens = outcome.usage.input_tokens,
+                    cached_tokens = outcome.usage.cached_tokens,
+                    output_tokens = outcome.usage.output_tokens,
+                    total_tokens = outcome.usage.total_tokens,
+                    events = events.len(),
+                    generated_artifacts = generated_artifacts.len(),
+                    "runtime turn finished"
+                );
                 Ok(TurnRunnerOutput {
                     final_text: outcome.final_text,
                     display_text: outcome.display_text,
@@ -267,6 +302,13 @@ where
                 })
             }
             Err(error) => {
+                error!(
+                    session_id = %session_id,
+                    turn_number,
+                    elapsed_ms,
+                    error = %error,
+                    "runtime turn failed"
+                );
                 emit_failed_turn_snapshot(
                     &mut sink,
                     &input.session_id,
@@ -434,6 +476,7 @@ fn generated_artifact_kind(path: &Path) -> Option<(GeneratedArtifactKind, &'stat
         "gif" => Some((GeneratedArtifactKind::Image, "image/gif")),
         "webp" => Some((GeneratedArtifactKind::Image, "image/webp")),
         "pdf" => Some((GeneratedArtifactKind::Document, "application/pdf")),
+        "html" => Some((GeneratedArtifactKind::Html, "text/html")),
         _ => None,
     }
 }
@@ -522,6 +565,33 @@ mod tests {
         assert_eq!(artifacts[0].kind, GeneratedArtifactKind::Image);
         assert_eq!(artifacts[0].file_name, "chart.png");
         assert_eq!(artifacts[0].mime_type.as_deref(), Some("image/png"));
+
+        fs::remove_dir_all(&workspace_root).expect("temp directory should be removable");
+    }
+
+    #[test]
+    fn collect_generated_artifacts_reads_recent_output_html() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "agent-controlplane-generated-html-test-{}-{unique}",
+            std::process::id()
+        ));
+        let session_id = SessionId::new();
+        let workspace = prepare_session_workspace_at(&workspace_root, &session_id)
+            .expect("session workspace should be prepared");
+        let html_path = workspace.join("outputs").join("turn-report.html");
+        fs::write(&html_path, b"<html><body>ok</body></html>").expect("html output should write");
+
+        let artifacts =
+            collect_generated_artifacts(&workspace, SystemTime::UNIX_EPOCH).expect("scan works");
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, GeneratedArtifactKind::Html);
+        assert_eq!(artifacts[0].file_name, "turn-report.html");
+        assert_eq!(artifacts[0].mime_type.as_deref(), Some("text/html"));
 
         fs::remove_dir_all(&workspace_root).expect("temp directory should be removable");
     }

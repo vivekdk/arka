@@ -17,7 +17,12 @@ use tokio::{
     time::timeout,
 };
 
-use crate::state::{LocalToolName, ServerName};
+use crate::{
+    state::{LocalToolName, ServerName},
+    todo::{
+        MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError, TodoList, TodoStatus,
+    },
+};
 
 const MAX_GLOB_MATCHES: usize = 1_000;
 const MAX_SHELL_OUTPUT_BYTES: usize = 32 * 1024;
@@ -173,10 +178,29 @@ struct BashArgs {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WriteTodosArgs {
+    operation: String,
+    #[serde(default)]
+    items: Option<Vec<String>>,
+    #[serde(default)]
+    item_index: Option<usize>,
+    #[serde(default)]
+    status: Option<TodoStatus>,
+}
+
 #[derive(Debug)]
 struct CapturedStream {
     text: String,
     truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalToolContext {
+    pub working_directory: PathBuf,
+    pub turn_directory: PathBuf,
+    pub todo_path: PathBuf,
+    pub html_output_path: PathBuf,
 }
 
 pub fn builtin_local_tool_catalog() -> Vec<ToolDescriptor> {
@@ -259,44 +283,191 @@ pub fn builtin_local_tool_catalog() -> Vec<ToolDescriptor> {
                 "additionalProperties": false
             }),
         ),
+        ToolDescriptor::local(
+            "write_todos",
+            "Write Todos",
+            "Create or update the current turn's todo list at `.arka/tmp/<session_id>/<turn_id>/todos.txt`.",
+            vec!["file_write"],
+            json!({
+                "type": "object",
+                "required": ["operation"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["initialize", "set_status", "replan_pending_suffix"]
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "item_index": { "type": "integer", "minimum": 1 },
+                    "status": {
+                        "type": "string",
+                        "enum": ["in_progress", "completed", "failed"]
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
 pub async fn execute_local_tool(
     tool_name: &LocalToolName,
     arguments: &Value,
-    working_directory: &Path,
+    context: &LocalToolContext,
     remaining_turn_budget: Duration,
 ) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
     match tool_name.as_str() {
         "read_file" => {
             let args: ReadFileArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
-            execute_read_file(&args, working_directory)
+            execute_read_file(&args, &context.working_directory)
         }
         "write_file" => {
             let args: WriteFileArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
-            execute_write_file(&args, working_directory)
+            execute_write_file(&args, context)
         }
         "edit_file" => {
             let args: EditFileArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
-            execute_edit_file(&args, working_directory)
+            execute_edit_file(&args, context)
         }
         "glob" => {
             let args: GlobArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
-            execute_glob(&args, working_directory)
+            execute_glob(&args, &context.working_directory)
         }
         "bash" => {
             let args: BashArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
-            execute_bash(&args, working_directory, remaining_turn_budget).await
+            execute_bash(&args, context, remaining_turn_budget).await
+        }
+        "write_todos" => {
+            let args: WriteTodosArgs = serde_json::from_value(arguments.clone())
+                .map_err(|error| LocalToolExecutionError::InvalidArguments(error.to_string()))?;
+            execute_write_todos(&args, context)
         }
         other => Err(LocalToolExecutionError::UnknownTool(format!(
             "unknown local tool `{other}`"
         ))),
+    }
+}
+
+fn execute_write_todos(
+    args: &WriteTodosArgs,
+    context: &LocalToolContext,
+) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
+    match args.operation.as_str() {
+        "initialize" => {
+            if context.todo_path.exists() {
+                return Err(LocalToolExecutionError::Path(format!(
+                    "todo file `{}` already exists for this turn",
+                    context.todo_path.display()
+                )));
+            }
+            let items = args.items.as_ref().ok_or_else(|| {
+                LocalToolExecutionError::InvalidArguments(
+                    "write_todos initialize requires `items`".to_owned(),
+                )
+            })?;
+            let todos = TodoList::initialize(items).map_err(map_todo_error)?;
+            todos
+                .save_to_path(&context.todo_path)
+                .map_err(map_todo_error)?;
+            Ok(todo_result_envelope(
+                "initialized todo list",
+                &context.todo_path,
+                &todos,
+            ))
+        }
+        "set_status" => {
+            let item_index = args.item_index.ok_or_else(|| {
+                LocalToolExecutionError::InvalidArguments(
+                    "write_todos set_status requires `item_index`".to_owned(),
+                )
+            })?;
+            let status = args.status.ok_or_else(|| {
+                LocalToolExecutionError::InvalidArguments(
+                    "write_todos set_status requires `status`".to_owned(),
+                )
+            })?;
+            let mut todos = TodoList::load_from_path(&context.todo_path).map_err(map_todo_error)?;
+            todos
+                .set_status(item_index, status)
+                .map_err(map_todo_error)?;
+            todos
+                .save_to_path(&context.todo_path)
+                .map_err(map_todo_error)?;
+            Ok(todo_result_envelope(
+                &format!("updated todo item {} to {}", item_index, status),
+                &context.todo_path,
+                &todos,
+            ))
+        }
+        "replan_pending_suffix" => {
+            let items = args.items.as_ref().ok_or_else(|| {
+                LocalToolExecutionError::InvalidArguments(
+                    "write_todos replan_pending_suffix requires `items`".to_owned(),
+                )
+            })?;
+            let mut todos = TodoList::load_from_path(&context.todo_path).map_err(map_todo_error)?;
+            todos.replan_pending_suffix(items).map_err(map_todo_error)?;
+            todos
+                .save_to_path(&context.todo_path)
+                .map_err(map_todo_error)?;
+            Ok(todo_result_envelope(
+                "replanned pending todo suffix",
+                &context.todo_path,
+                &todos,
+            ))
+        }
+        other => Err(LocalToolExecutionError::InvalidArguments(format!(
+            "unknown write_todos operation `{other}`"
+        ))),
+    }
+}
+
+fn todo_result_envelope(
+    action: &str,
+    todo_path: &Path,
+    todos: &TodoList,
+) -> ToolCallResultEnvelope {
+    let next_actionable = todos
+        .next_actionable()
+        .map(|(index, item)| {
+            json!({
+                "item_index": index,
+                "status": item.status.as_str(),
+                "text": item.text,
+            })
+        })
+        .unwrap_or(Value::Null);
+    ToolCallResultEnvelope {
+        status: "ok".to_owned(),
+        summary: format!(
+            "{action}\npath: {}\n{}",
+            todo_path.display(),
+            todos.render()
+        ),
+        payload: json!({
+            "path": todo_path.display().to_string(),
+            "todos": todos.items,
+            "next_actionable": next_actionable,
+        }),
+        error: None,
+    }
+}
+
+fn map_todo_error(error: TodoError) -> LocalToolExecutionError {
+    match error {
+        TodoError::Parse(message) | TodoError::Validation(message) => {
+            LocalToolExecutionError::InvalidArguments(message)
+        }
+        TodoError::Read { .. } | TodoError::Write { .. } => {
+            LocalToolExecutionError::Io(error.to_string())
+        }
     }
 }
 
@@ -327,9 +498,11 @@ fn execute_read_file(
 
 fn execute_write_file(
     args: &WriteFileArgs,
-    working_directory: &Path,
+    context: &LocalToolContext,
 ) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
-    let path = resolve_tool_path(working_directory, &args.path, false)?;
+    let path = resolve_tool_path(&context.working_directory, &args.path, false)?;
+    reject_protected_todo_mutation(&path, context)?;
+    reject_out_of_order_html_write(&path, context)?;
     let parent = path.parent().ok_or_else(|| {
         LocalToolExecutionError::Path(format!(
             "file `{}` does not have a writable parent directory",
@@ -358,9 +531,11 @@ fn execute_write_file(
 
 fn execute_edit_file(
     args: &EditFileArgs,
-    working_directory: &Path,
+    context: &LocalToolContext,
 ) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
-    let path = resolve_tool_path(working_directory, &args.path, true)?;
+    let path = resolve_tool_path(&context.working_directory, &args.path, true)?;
+    reject_protected_todo_mutation(&path, context)?;
+    reject_out_of_order_html_write(&path, context)?;
     let bytes = fs::read(&path).map_err(|error| {
         LocalToolExecutionError::Io(format!("failed to read `{}`: {error}", path.display()))
     })?;
@@ -521,13 +696,20 @@ fn execute_glob(
 
 async fn execute_bash(
     args: &BashArgs,
-    working_directory: &Path,
+    context: &LocalToolContext,
     remaining_turn_budget: Duration,
 ) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
-    let root = working_directory.canonicalize().map_err(|error| {
+    if bash_command_mentions_protected_todo(&args.command, context) {
+        return Err(LocalToolExecutionError::Path(format!(
+            "bash cannot read or modify the current turn todo file `{}`; use write_todos for mutations and read_file for inspection",
+            context.todo_path.display()
+        )));
+    }
+    reject_out_of_order_html_bash(&args.command, context)?;
+    let root = context.working_directory.canonicalize().map_err(|error| {
         LocalToolExecutionError::Path(format!(
             "failed to resolve working directory `{}`: {error}",
-            working_directory.display()
+            context.working_directory.display()
         ))
     })?;
     let effective_timeout = args
@@ -606,8 +788,15 @@ async fn execute_bash(
         ));
     }
 
+    let status_text = if status.success() { "ok" } else { "error" };
+    let error = if status.success() {
+        None
+    } else {
+        Some(format!("bash command exited with status {}", exit_code))
+    };
+
     Ok(ToolCallResultEnvelope {
-        status: "ok".to_owned(),
+        status: status_text.to_owned(),
         summary,
         payload: json!({
             "command": args.command,
@@ -615,8 +804,146 @@ async fn execute_bash(
             "stdout": stdout.text,
             "stderr": stderr.text,
         }),
-        error: None,
+        error,
     })
+}
+
+fn reject_protected_todo_mutation(
+    path: &Path,
+    context: &LocalToolContext,
+) -> Result<(), LocalToolExecutionError> {
+    if path == context.todo_path {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the current turn todo file `{}` may only be modified through write_todos",
+            context.todo_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn bash_command_mentions_protected_todo(command: &str, context: &LocalToolContext) -> bool {
+    let absolute = context.todo_path.display().to_string();
+    let relative_to_working_directory = context
+        .todo_path
+        .strip_prefix(&context.working_directory)
+        .ok()
+        .map(|path| path.display().to_string());
+
+    command.contains(&absolute)
+        || relative_to_working_directory
+            .as_ref()
+            .is_some_and(|path| command.contains(path) || command.contains(&format!("./{path}")))
+}
+
+fn reject_out_of_order_html_write(
+    path: &Path,
+    context: &LocalToolContext,
+) -> Result<(), LocalToolExecutionError> {
+    if !tool_paths_equivalent(path, &context.html_output_path)? {
+        return Ok(());
+    }
+    let Some(todo_text) = load_next_actionable_todo_text(context)? else {
+        return Ok(());
+    };
+    if todo_text != MANDATORY_TODO_GENERATE_HTML {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` cannot be written while the current actionable todo is `{}`; finish todos in order",
+            context.html_output_path.display(),
+            todo_text
+        )));
+    }
+    Ok(())
+}
+
+fn tool_paths_equivalent(left: &Path, right: &Path) -> Result<bool, LocalToolExecutionError> {
+    let left = canonicalize_for_tool_guard(left)?;
+    let right = canonicalize_for_tool_guard(right)?;
+    Ok(left == right)
+}
+
+fn canonicalize_for_tool_guard(path: &Path) -> Result<PathBuf, LocalToolExecutionError> {
+    let normalized = normalize_path(path);
+    if normalized.exists() {
+        return normalized.canonicalize().map_err(|error| {
+            LocalToolExecutionError::Path(format!(
+                "failed to resolve path `{}`: {error}",
+                normalized.display()
+            ))
+        });
+    }
+    let parent = normalized.parent().ok_or_else(|| {
+        LocalToolExecutionError::Path(format!(
+            "path `{}` does not have a parent directory",
+            normalized.display()
+        ))
+    })?;
+    let resolved_parent = parent.canonicalize().map_err(|error| {
+        LocalToolExecutionError::Path(format!(
+            "failed to resolve parent directory `{}`: {error}",
+            parent.display()
+        ))
+    })?;
+    let file_name = normalized.file_name().ok_or_else(|| {
+        LocalToolExecutionError::Path(format!(
+            "path `{}` must point to a file",
+            normalized.display()
+        ))
+    })?;
+    Ok(resolved_parent.join(file_name))
+}
+
+fn reject_out_of_order_html_bash(
+    command: &str,
+    context: &LocalToolContext,
+) -> Result<(), LocalToolExecutionError> {
+    let Some(todo_text) = load_next_actionable_todo_text(context)? else {
+        return Ok(());
+    };
+    let html_absolute = context.html_output_path.display().to_string();
+    let html_relative = context
+        .html_output_path
+        .strip_prefix(&context.working_directory)
+        .ok()
+        .map(|path| path.display().to_string());
+    let mentions_html = command.contains(&html_absolute)
+        || html_relative
+            .as_ref()
+            .is_some_and(|path| command.contains(path) || command.contains(&format!("./{path}")));
+    if !mentions_html {
+        return Ok(());
+    }
+
+    let opens_html = command.contains(&format!("open {html_absolute}"))
+        || html_relative.as_ref().is_some_and(|path| {
+            command.contains(&format!("open {path}")) || command.contains(&format!("open ./{path}"))
+        });
+
+    if opens_html {
+        if todo_text != MANDATORY_TODO_OPEN_HTML {
+            return Err(LocalToolExecutionError::Path(format!(
+                "the deterministic HTML report `{}` cannot be opened while the current actionable todo is `{}`; finish todos in order",
+                context.html_output_path.display(),
+                todo_text
+            )));
+        }
+    } else if todo_text != MANDATORY_TODO_GENERATE_HTML {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` cannot be written from bash while the current actionable todo is `{}`; finish todos in order",
+            context.html_output_path.display(),
+            todo_text
+        )));
+    }
+    Ok(())
+}
+
+fn load_next_actionable_todo_text(
+    context: &LocalToolContext,
+) -> Result<Option<String>, LocalToolExecutionError> {
+    if !context.todo_path.exists() {
+        return Ok(None);
+    }
+    let todos = TodoList::load_from_path(&context.todo_path).map_err(map_todo_error)?;
+    Ok(todos.next_actionable().map(|(_, item)| item.text.clone()))
 }
 
 fn resolve_tool_path(
@@ -764,18 +1091,19 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{builtin_local_tool_catalog, execute_local_tool};
+    use super::{LocalToolContext, builtin_local_tool_catalog, execute_local_tool};
     use crate::state::LocalToolName;
 
     #[test]
-    fn builtin_catalog_contains_five_local_tools() {
+    fn builtin_catalog_contains_six_local_tools() {
         let tools = builtin_local_tool_catalog();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         assert_eq!(tools[0].tool_id, "local.read_file");
         assert_eq!(tools[1].tool_id, "local.write_file");
         assert_eq!(tools[2].tool_id, "local.edit_file");
         assert_eq!(tools[3].tool_id, "local.glob");
         assert_eq!(tools[4].tool_id, "local.bash");
+        assert_eq!(tools[5].tool_id, "local.write_todos");
     }
 
     #[tokio::test]
@@ -784,7 +1112,7 @@ mod tests {
         let result = execute_local_tool(
             &LocalToolName::new("write_file").expect("valid tool"),
             &json!({"path":"notes.txt","content":"hello"}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
@@ -803,7 +1131,7 @@ mod tests {
         let result = execute_local_tool(
             &LocalToolName::new("read_file").expect("valid tool"),
             &json!({"path":"notes.txt"}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
@@ -819,12 +1147,52 @@ mod tests {
         let error = execute_local_tool(
             &LocalToolName::new("edit_file").expect("valid tool"),
             &json!({"path":"notes.txt","old_text":"hello","new_text":"bye"}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
         .expect_err("edit should fail");
         assert!(error.to_string().contains("multiple"));
+    }
+
+    #[tokio::test]
+    async fn write_file_cannot_mutate_current_turn_todo_file() {
+        let temp_dir = temp_dir("tool-write-protected-todo");
+        let context = local_tool_context(&temp_dir);
+        std::fs::write(&context.todo_path, "1. [pending] Task").expect("seed todo file");
+        let error = execute_local_tool(
+            &LocalToolName::new("write_file").expect("valid tool"),
+            &json!({"path":"turn-123/todos.txt","content":"overwritten"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("write_file should not mutate todo file");
+        assert!(
+            error
+                .to_string()
+                .contains("may only be modified through write_todos")
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_cannot_mutate_current_turn_todo_file() {
+        let temp_dir = temp_dir("tool-edit-protected-todo");
+        let context = local_tool_context(&temp_dir);
+        std::fs::write(&context.todo_path, "1. [pending] Task").expect("seed todo file");
+        let error = execute_local_tool(
+            &LocalToolName::new("edit_file").expect("valid tool"),
+            &json!({"path":"turn-123/todos.txt","old_text":"Task","new_text":"Changed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("edit_file should not mutate todo file");
+        assert!(
+            error
+                .to_string()
+                .contains("may only be modified through write_todos")
+        );
     }
 
     #[tokio::test]
@@ -839,7 +1207,7 @@ mod tests {
         let result = execute_local_tool(
             &LocalToolName::new("glob").expect("valid tool"),
             &json!({"pattern":"src/**/*.rs","excludes":["src/ignore/**"]}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
@@ -859,7 +1227,7 @@ mod tests {
         let error = execute_local_tool(
             &LocalToolName::new("glob").expect("valid tool"),
             &json!({"pattern":"../*.rs"}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
@@ -877,15 +1245,20 @@ mod tests {
         let result = execute_local_tool(
             &LocalToolName::new("bash").expect("valid tool"),
             &json!({"command":"printf 'hello'; printf 'oops' >&2; exit 7"}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
         .expect("bash should succeed");
 
+        assert_eq!(result.status, "error");
         assert_eq!(result.payload["exit_code"], json!(7));
         assert_eq!(result.payload["stdout"], json!("hello"));
         assert_eq!(result.payload["stderr"], json!("oops"));
+        assert_eq!(
+            result.error,
+            Some("bash command exited with status 7".to_owned())
+        );
         assert!(result.summary.contains("exit_code: 7"));
     }
 
@@ -895,12 +1268,205 @@ mod tests {
         let error = execute_local_tool(
             &LocalToolName::new("bash").expect("valid tool"),
             &json!({"command":"sleep 1","timeout_ms":10}),
-            &temp_dir,
+            &local_tool_context(&temp_dir),
             Duration::from_secs(5),
         )
         .await
         .expect_err("bash should time out");
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn bash_cannot_touch_current_turn_todo_file() {
+        let temp_dir = temp_dir("tool-bash-protected-todo");
+        let context = local_tool_context(&temp_dir);
+        std::fs::write(&context.todo_path, "1. [pending] Task").expect("seed todo file");
+        let error = execute_local_tool(
+            &LocalToolName::new("bash").expect("valid tool"),
+            &json!({"command":"python3 - <<'PY'\nfrom pathlib import Path\np = Path('turn-123/todos.txt')\np.write_text('mutated')\nPY"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("bash should not touch todo file");
+        assert!(
+            error
+                .to_string()
+                .contains("bash cannot read or modify the current turn todo file")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_cannot_write_deterministic_html_before_html_todo_is_current() {
+        let temp_dir = temp_dir("tool-write-html-out-of-order");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
+        std::fs::write(
+            &context.todo_path,
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("write_file").expect("valid tool"),
+            &json!({"path":"outputs/turn-123-report.html","content":"<html></html>"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("write_file should reject out-of-order html write");
+        assert!(error.to_string().contains("cannot be written while the current actionable todo is"));
+    }
+
+    #[tokio::test]
+    async fn bash_cannot_write_deterministic_html_before_html_todo_is_current() {
+        let temp_dir = temp_dir("tool-bash-html-out-of-order");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
+        std::fs::write(
+            &context.todo_path,
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("bash").expect("valid tool"),
+            &json!({"command":"printf '<html></html>' > outputs/turn-123-report.html"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("bash should reject out-of-order html write");
+        assert!(error.to_string().contains("cannot be written from bash while the current actionable todo is"));
+    }
+
+    #[tokio::test]
+    async fn bash_cannot_open_deterministic_html_before_open_todo_is_current() {
+        let temp_dir = temp_dir("tool-bash-open-html-out-of-order");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
+        std::fs::write(
+            &context.todo_path,
+            "1. [pending] Generate an output HTML page with charts and tables.\n2. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("bash").expect("valid tool"),
+            &json!({"command":"open outputs/turn-123-report.html"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("bash should reject out-of-order html open");
+        assert!(error.to_string().contains("cannot be opened while the current actionable todo is"));
+    }
+
+    #[tokio::test]
+    async fn write_todos_initializes_turn_file_and_appends_mandatory_steps() {
+        let temp_dir = temp_dir("tool-write-todos-init");
+        let context = local_tool_context(&temp_dir);
+        let result = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"initialize","items":["Inspect source data","Compute metrics"]}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("write_todos initialize should succeed");
+
+        let raw = std::fs::read_to_string(&context.todo_path).expect("todo file should exist");
+        assert!(raw.contains("[pending] Inspect source data"));
+        assert!(raw.contains("[pending] Generate an output HTML page with charts and tables."));
+        assert!(result.summary.contains("initialized todo list"));
+    }
+
+    #[tokio::test]
+    async fn write_todos_enforces_ordered_status_updates() {
+        let temp_dir = temp_dir("tool-write-todos-status");
+        let context = local_tool_context(&temp_dir);
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"initialize","items":["Inspect source data"]}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("initialize should succeed");
+
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":1,"status":"in_progress"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("pending -> in_progress should succeed");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":2,"status":"completed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("cannot complete a later todo");
+        assert!(error.to_string().contains("before item 1"));
+
+        let result = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":1,"status":"failed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("in_progress -> failed should succeed");
+        assert!(result.summary.contains("[failed] Inspect source data"));
+    }
+
+    #[tokio::test]
+    async fn write_todos_replans_only_pending_suffix() {
+        let temp_dir = temp_dir("tool-write-todos-replan");
+        let context = local_tool_context(&temp_dir);
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"initialize","items":["Inspect source data","Analyze outliers"]}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("initialize should succeed");
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":1,"status":"in_progress"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("item 1 should enter progress");
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":1,"status":"completed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("item 1 should complete");
+
+        let result = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"replan_pending_suffix","items":["Analyze cohorts instead"]}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("replan should succeed");
+
+        let raw = std::fs::read_to_string(&context.todo_path).expect("todo file should exist");
+        assert!(raw.contains("[completed] Inspect source data"));
+        assert!(raw.contains("[pending] Analyze cohorts instead"));
+        assert!(raw.contains("[pending] Open the generated output HTML page in the browser."));
+        assert!(result.summary.contains("replanned pending todo suffix"));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -911,5 +1477,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ai-data-analyst-{prefix}-{unique}"));
         std::fs::create_dir_all(&path).expect("temp dir should exist");
         path
+    }
+
+    fn local_tool_context(working_directory: &PathBuf) -> LocalToolContext {
+        let turn_directory = working_directory.join("turn-123");
+        std::fs::create_dir_all(&turn_directory).expect("turn directory should exist");
+        LocalToolContext {
+            working_directory: working_directory.clone(),
+            turn_directory: turn_directory.clone(),
+            todo_path: turn_directory.join("todos.txt"),
+            html_output_path: working_directory.join("outputs").join("turn-123-report.html"),
+        }
     }
 }

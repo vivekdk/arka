@@ -1,0 +1,5 @@
+1. [completed] Define scope
+2. [pending] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.
+3. [pending] Perform analysis
+4. [pending] Generate an output HTML page with charts and tables.
+5. [pending] Open the generated output HTML page in the browser.

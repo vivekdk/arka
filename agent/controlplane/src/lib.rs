@@ -27,6 +27,7 @@ pub use api::{
     router_with_debug_history, router_with_slack,
 };
 pub use observability::{
+    ConsoleRuntimeHarnessListener,
     DebugHistoryAvailableFilters, DebugHistoryEventRow, DebugHistoryFilterOption,
     DebugHistoryRawArtifactRow, DebugHistorySessionSummary, DebugHistoryStore,
     DebugHistoryTurnDetail, DebugHistoryTurnFilters, DebugHistoryTurnSummary,
