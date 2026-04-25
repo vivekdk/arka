@@ -22,8 +22,8 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::trace::TraceLayer;
-use tracing::{info_span, warn};
+use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::{Level, info_span, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -641,13 +641,17 @@ where
             post(handle_whatsapp_event::<R, S>),
         )
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri()
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri()
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
         .with_state(state)
 }
@@ -1975,6 +1979,15 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       color: var(--muted);
       font-size: 0.92rem;
     }
+    .event-link {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      font-weight: 600;
+    }
+    .event-link:hover {
+      border-color: currentColor;
+    }
     details {
       border-top: 1px dashed var(--line);
       padding-top: 10px;
@@ -1998,6 +2011,75 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       font-family: var(--mono);
       font-size: 0.84rem;
       line-height: 1.45;
+    }
+    .artifact-derived {
+      margin-top: 8px;
+    }
+    .artifact-derived[open] {
+      display: grid;
+      gap: 10px;
+    }
+    .artifact-derived summary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .markdown-render {
+      display: grid;
+      gap: 12px;
+      color: var(--ink);
+      line-height: 1.6;
+    }
+    .markdown-render > :first-child {
+      margin-top: 0;
+    }
+    .markdown-render > :last-child {
+      margin-bottom: 0;
+    }
+    .markdown-render h1,
+    .markdown-render h2,
+    .markdown-render h3,
+    .markdown-render h4,
+    .markdown-render h5,
+    .markdown-render h6 {
+      margin: 0;
+      line-height: 1.25;
+      color: var(--ink);
+    }
+    .markdown-render p,
+    .markdown-render ul,
+    .markdown-render ol,
+    .markdown-render blockquote {
+      margin: 0;
+    }
+    .markdown-render ul,
+    .markdown-render ol {
+      padding-left: 1.35rem;
+    }
+    .markdown-render li + li {
+      margin-top: 4px;
+    }
+    .markdown-render blockquote {
+      border-left: 3px solid var(--accent-soft);
+      padding-left: 12px;
+      color: var(--muted);
+    }
+    .markdown-render code {
+      font-family: var(--mono);
+      background: rgba(15, 91, 80, 0.08);
+      border-radius: 6px;
+      padding: 1px 5px;
+      font-size: 0.92em;
+    }
+    .markdown-render pre {
+      margin: 0;
+    }
+    .markdown-render pre code {
+      display: block;
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      font-size: inherit;
     }
     .muted { color: var(--muted); }
     .empty, .error {
@@ -2145,6 +2227,7 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
     const crumbs = document.getElementById("crumbs");
     const limitInput = document.getElementById("limitInput");
     const refreshButton = document.getElementById("refreshButton");
+    let activeStepNumberLookup = new Map();
 
     refreshButton.addEventListener("click", () => renderRoute());
     window.addEventListener("hashchange", renderRoute);
@@ -2196,6 +2279,272 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;");
+    }
+
+    function extractArtifactMarkdown(artifact) {
+      if (!artifact || artifact.artifact_kind !== "model_request") return null;
+      const input = artifact.payload?.input;
+      if (typeof input !== "string") return null;
+      const trimmed = input.trim();
+      return trimmed ? trimmed : null;
+    }
+
+    function extractModelTurnPhaseFromArtifact(artifact) {
+      if (!artifact || artifact.artifact_kind !== "model_request") return null;
+      const phase = artifact.payload?.metadata?.phase;
+      if (phase === "planning" || phase === "execution") return phase;
+      return null;
+    }
+
+    function extractModelTurnPhaseFromTimelineItem(item) {
+      if (!item) return null;
+      if (item.type === "group") {
+        for (const child of item.items || []) {
+          const phase = extractModelTurnPhaseFromTimelineItem(child);
+          if (phase) return phase;
+        }
+        return null;
+      }
+      if (item.type === "artifact") {
+        return extractModelTurnPhaseFromArtifact(item.artifact);
+      }
+      return null;
+    }
+
+    function extractArtifactFormattedJson(artifact) {
+      if (!artifact || artifact.artifact_kind !== "model_response") return null;
+      const candidates = [];
+      const seenObjects = new Set();
+
+      function collectJsonTextCandidates(value) {
+        if (value == null) return;
+        if (Array.isArray(value)) {
+          value.forEach(collectJsonTextCandidates);
+          return;
+        }
+        if (typeof value !== "object") return;
+        if (seenObjects.has(value)) return;
+        seenObjects.add(value);
+
+        if (typeof value.output_text === "string") {
+          candidates.push(value.output_text);
+        }
+        if (value.type === "output_text" && typeof value.text === "string") {
+          candidates.push(value.text);
+        }
+
+        Object.values(value).forEach(collectJsonTextCandidates);
+      }
+
+      collectJsonTextCandidates(artifact.payload);
+
+      for (const candidate of candidates) {
+        const trimmed = candidate.trim();
+        if (!trimmed || !["{", "["].includes(trimmed[0])) continue;
+        try {
+          return JSON.stringify(JSON.parse(trimmed), null, 2);
+        } catch (_error) {
+          continue;
+        }
+      }
+      return null;
+    }
+
+    function artifactDerivedDetailsId(prefix, kind, artifact) {
+      return `${prefix}-artifact-${kind}-${artifact.artifact_index}`;
+    }
+
+    function openArtifactDetails(event, detailsId) {
+      event.preventDefault();
+      const details = document.getElementById(detailsId);
+      if (!details) return;
+      details.open = true;
+      details.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+
+    function renderMarkdownInline(text) {
+      const codeTokens = [];
+      const codePlaceholder = "\u0000CODE";
+      const emphasizedPlaceholder = "\u0000HTML";
+      const withCodePlaceholders = String(text ?? "").replace(/`([^`]+)`/g, (_, code) => {
+        const token = `${codePlaceholder}${codeTokens.length}\u0000`;
+        codeTokens.push(`<code>${escapeHtml(code)}</code>`);
+        return token;
+      });
+      const htmlTokens = [];
+      const withHtmlPlaceholders = withCodePlaceholders.replace(
+        /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        (_, label, href) => {
+          const token = `${emphasizedPlaceholder}${htmlTokens.length}\u0000`;
+          htmlTokens.push(
+            `<a class="event-link" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
+          );
+          return token;
+        }
+      );
+
+      let rendered = escapeHtml(withHtmlPlaceholders)
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+        .replace(/(^|[\s(])\*([^*]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>")
+        .replace(/(^|[\s(])_([^_]+)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+
+      htmlTokens.forEach((tokenHtml, index) => {
+        rendered = rendered.replaceAll(`${emphasizedPlaceholder}${index}\u0000`, tokenHtml);
+      });
+      codeTokens.forEach((tokenHtml, index) => {
+        rendered = rendered.replaceAll(`${codePlaceholder}${index}\u0000`, tokenHtml);
+      });
+      return rendered;
+    }
+
+    function renderMarkdownDocument(markdownText) {
+      const lines = String(markdownText ?? "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+      const blocks = [];
+      let paragraphLines = [];
+      let listType = null;
+      let listItems = [];
+      let quoteLines = [];
+      let codeFence = null;
+      let codeLines = [];
+
+      function flushParagraph() {
+        if (!paragraphLines.length) return;
+        blocks.push(`<p>${renderMarkdownInline(paragraphLines.join(" "))}</p>`);
+        paragraphLines = [];
+      }
+
+      function flushList() {
+        if (!listItems.length || !listType) return;
+        blocks.push(
+          `<${listType}>${listItems.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</${listType}>`
+        );
+        listType = null;
+        listItems = [];
+      }
+
+      function flushQuote() {
+        if (!quoteLines.length) return;
+        blocks.push(
+          `<blockquote>${quoteLines.map((line) => `<p>${renderMarkdownInline(line)}</p>`).join("")}</blockquote>`
+        );
+        quoteLines = [];
+      }
+
+      function flushAll() {
+        flushParagraph();
+        flushList();
+        flushQuote();
+      }
+
+      for (const line of lines) {
+        if (codeFence !== null) {
+          if (/^```/.test(line)) {
+            blocks.push(
+              `<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`
+            );
+            codeFence = null;
+            codeLines = [];
+          } else {
+            codeLines.push(line);
+          }
+          continue;
+        }
+
+        if (/^```/.test(line)) {
+          flushAll();
+          codeFence = line.replace(/^```+/, "").trim();
+          codeLines = [];
+          continue;
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+          flushAll();
+          const level = headingMatch[1].length;
+          blocks.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`);
+          continue;
+        }
+
+        const quoteMatch = line.match(/^>\s?(.*)$/);
+        if (quoteMatch) {
+          flushParagraph();
+          flushList();
+          quoteLines.push(quoteMatch[1]);
+          continue;
+        }
+        flushQuote();
+
+        const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+        if (unorderedMatch) {
+          flushParagraph();
+          if (listType && listType !== "ul") flushList();
+          listType = "ul";
+          listItems.push(unorderedMatch[1]);
+          continue;
+        }
+
+        const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
+        if (orderedMatch) {
+          flushParagraph();
+          if (listType && listType !== "ol") flushList();
+          listType = "ol";
+          listItems.push(orderedMatch[1]);
+          continue;
+        }
+
+        if (!line.trim()) {
+          flushAll();
+          continue;
+        }
+
+        flushList();
+        paragraphLines.push(line.trim());
+      }
+
+      flushAll();
+      if (codeFence !== null) {
+        blocks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      }
+      return blocks.join("");
+    }
+
+    function renderArtifactMarkdownLink(artifact, prefix) {
+      const markdown = extractArtifactMarkdown(artifact);
+      if (!markdown) return "";
+      const detailsId = artifactDerivedDetailsId(prefix, "markdown", artifact);
+      return ` <span aria-hidden="true">·</span> <a class="event-link" href="#${detailsId}" onclick="openArtifactDetails(event, '${detailsId}')">View markdown</a>`;
+    }
+
+    function renderArtifactMarkdownDetails(artifact, prefix) {
+      const markdown = extractArtifactMarkdown(artifact);
+      if (!markdown) return "";
+      const detailsId = artifactDerivedDetailsId(prefix, "markdown", artifact);
+      return `
+        <details id="${detailsId}" class="artifact-derived">
+          <summary>Formatted markdown</summary>
+          <div class="markdown-render">${renderMarkdownDocument(markdown)}</div>
+        </details>
+      `;
+    }
+
+    function renderArtifactJsonLink(artifact, prefix) {
+      const formattedJson = extractArtifactFormattedJson(artifact);
+      if (!formattedJson) return "";
+      const detailsId = artifactDerivedDetailsId(prefix, "json", artifact);
+      return ` <span aria-hidden="true">·</span> <a class="event-link" href="#${detailsId}" onclick="openArtifactDetails(event, '${detailsId}')">View JSON</a>`;
+    }
+
+    function renderArtifactJsonDetails(artifact, prefix) {
+      const formattedJson = extractArtifactFormattedJson(artifact);
+      if (!formattedJson) return "";
+      const detailsId = artifactDerivedDetailsId(prefix, "json", artifact);
+      return `
+        <details id="${detailsId}" class="artifact-derived">
+          <summary>Formatted JSON</summary>
+          <pre>${escapeHtml(formattedJson)}</pre>
+        </details>
+      `;
     }
 
     function formatTimestamp(value) {
@@ -2257,6 +2606,45 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       return executor.display_name || "Main Agent";
     }
 
+    function mergeTimelineContexts(contexts) {
+      const merged = {
+        turn_id: "",
+        step_number: "",
+        step_id: "",
+        executor: null,
+      };
+
+      for (const context of contexts) {
+        if (!context) continue;
+        if (!merged.turn_id && context.turn_id) merged.turn_id = context.turn_id;
+        if ((merged.step_number === "" || merged.step_number == null) && context.step_number !== "" && context.step_number != null) {
+          merged.step_number = context.step_number;
+        }
+        if (!merged.step_id && context.step_id) merged.step_id = context.step_id;
+        if (!merged.executor && context.executor) merged.executor = context.executor;
+      }
+
+      return merged;
+    }
+
+    function lookupStepNumber(stepId) {
+      if (!stepId) return null;
+      return activeStepNumberLookup.get(String(stepId)) ?? null;
+    }
+
+    function buildStepNumberLookup(turn) {
+      const lookup = new Map();
+      for (const event of turn?.events || []) {
+        if (event?.event_type !== "step_started") continue;
+        const payload = normalizeEventPayload(event);
+        const stepId = event?.step_id ?? payload?.step_id;
+        const stepNumber = event?.step_number ?? payload?.step_number;
+        if (!stepId || stepNumber == null || stepNumber === "") continue;
+        lookup.set(String(stepId), stepNumber);
+      }
+      return lookup;
+    }
+
     function describeEvent(event) {
       const payload = normalizeEventPayload(event);
       switch (event.event_type) {
@@ -2305,8 +2693,8 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
 
     function timelineItemContext(item) {
       if (item.type === "group") {
-        const first = item.items?.[0];
-        return first ? timelineItemContext(first) : {
+        const childContexts = (item.items || []).map((child) => timelineItemContext(child));
+        return childContexts.length ? mergeTimelineContexts(childContexts) : {
           turn_id: "",
           step_number: "",
           step_id: "",
@@ -2315,17 +2703,21 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       }
       if (item.type === "event") {
         const payload = normalizeEventPayload(item.event);
+        const stepId = item.event.step_id ?? payload?.step_id ?? "";
+        const inferredStepNumber =
+          item.event.step_number ?? payload?.step_number ?? lookupStepNumber(stepId) ?? "";
         return {
           turn_id: item.event.turn_id || "",
-          step_number: item.event.step_number ?? payload?.step_number ?? "",
-          step_id: item.event.step_id ?? payload?.step_id ?? "",
+          step_number: inferredStepNumber,
+          step_id: stepId,
           executor: item.event.executor || payload?.executor || null,
         };
       }
+      const artifactStepId = item.artifact.step_id ?? "";
       return {
         turn_id: item.artifact.turn_id || "",
-        step_number: item.artifact.step_number ?? "",
-        step_id: item.artifact.step_id ?? "",
+        step_number: item.artifact.step_number ?? lookupStepNumber(artifactStepId) ?? "",
+        step_id: artifactStepId,
         executor: item.artifact.executor || null,
       };
     }
@@ -2437,7 +2829,13 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
                 `
                 : `
                   <section>
-                    <div class="event-sub">${escapeHtml(`${item.artifact.artifact_kind} · artifact #${item.artifact.artifact_index}`)}</div>
+                    <div class="event-sub">
+                      ${escapeHtml(`${item.artifact.artifact_kind} · artifact #${item.artifact.artifact_index}`)}
+                      ${renderArtifactMarkdownLink(item.artifact, "grouped")}
+                      ${renderArtifactJsonLink(item.artifact, "grouped")}
+                    </div>
+                    ${renderArtifactMarkdownDetails(item.artifact, "grouped")}
+                    ${renderArtifactJsonDetails(item.artifact, "grouped")}
                     <pre>${escapeHtml(JSON.stringify(item.artifact.payload, null, 2))}</pre>
                   </section>
                 `
@@ -2536,12 +2934,17 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
     }
 
     function renderArtifactItem(item) {
+      const modelTurnPhase = extractModelTurnPhaseFromArtifact(item.artifact);
       return `
         <article class="event">
           <div class="event-head">
             <div>
               <div class="event-title">${escapeHtml(describeArtifact(item.artifact))}</div>
-              <div class="event-sub">${escapeHtml(item.artifact.artifact_kind)} · artifact #${item.artifact.artifact_index}</div>
+              <div class="event-sub">
+                ${escapeHtml(item.artifact.artifact_kind)} · artifact #${item.artifact.artifact_index}
+                ${renderArtifactMarkdownLink(item.artifact, "single")}
+                ${renderArtifactJsonLink(item.artifact, "single")}
+              </div>
             </div>
             <div class="event-sub">${escapeHtml(formatTimestamp(item.artifact.occurred_at))}</div>
           </div>
@@ -2551,8 +2954,11 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
             ${formatExecutor(item.artifact.executor) ? `<span class="tag">${escapeHtml(formatExecutor(item.artifact.executor))}</span>` : ""}
             ${item.artifact.turn_id ? `<span class="tag">turn ${escapeHtml(item.artifact.turn_id)}</span>` : ""}
             ${formatStepTag(item.artifact.step_number, item.artifact.step_id) ? `<span class="tag">${escapeHtml(formatStepTag(item.artifact.step_number, item.artifact.step_id))}</span>` : ""}
+            ${modelTurnPhase ? `<span class="tag">${escapeHtml(modelTurnPhase)}</span>` : ""}
             ${item.artifact.summary ? `<span class="tag">${escapeHtml(item.artifact.summary)}</span>` : ""}
           </div>
+          ${renderArtifactMarkdownDetails(item.artifact, "single")}
+          ${renderArtifactJsonDetails(item.artifact, "single")}
           <details>
             <summary>Raw artifact JSON</summary>
             <pre>${escapeHtml(JSON.stringify(item.artifact.payload, null, 2))}</pre>
@@ -2566,6 +2972,7 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       const context = timelineItemContext(first);
       const executor = formatExecutor(context.executor);
       const stepTag = formatStepTag(context.step_number, context.step_id);
+      const modelTurnPhase = extractModelTurnPhaseFromTimelineItem(group);
       const artifactSources = Array.from(
         new Set(
           group.items
@@ -2589,6 +2996,7 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
             ${executor ? `<span class="tag">${escapeHtml(executor)}</span>` : ""}
             ${context.turn_id ? `<span class="tag">turn ${escapeHtml(context.turn_id)}</span>` : ""}
             ${stepTag ? `<span class="tag">${escapeHtml(stepTag)}</span>` : ""}
+            ${modelTurnPhase ? `<span class="tag">${escapeHtml(modelTurnPhase)}</span>` : ""}
             ${artifactSources.map((source) => `<span class="tag">${escapeHtml(source)}</span>`).join("")}
           </div>
           <div class="merged-items">
@@ -2958,6 +3366,7 @@ const DEBUG_HISTORY_PAGE: &str = r###"<!doctype html>
       const requestParams = buildTimelineFilterParams(filterState);
       const query = requestParams.toString();
       const turn = await fetchJson(`/debug/history/turns/${encodeURIComponent(turnId)}${query ? `?${query}` : ""}`);
+      activeStepNumberLookup = buildStepNumberLookup(turn);
       setCrumbs([
         { label: "Recent Sessions", href: "#/" },
         { label: turn.session_id, href: `#/session/${encodeURIComponent(turn.session_id)}` },

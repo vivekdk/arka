@@ -23,9 +23,10 @@
 use agent_runtime::{
     model::{
         FinalAnswerRenderRequest, FinalAnswerRenderResponse, FinalAnswerStreamSink, ModelAdapter,
-        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
-        ModelAdapterResponse, ModelStepDecision, ModelStepRequest, SubagentAdapterResponse,
-        SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
+        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink,
+        ModelAdapterError, ModelAdapterResponse, ModelStepDecision, ModelStepRequest,
+        SubagentAdapterResponse, SubagentDecision, SubagentDelegationRequest,
+        SubagentStepRequest, TurnPhase,
     },
     policy::ToolMaskPlan,
     state::{DelegationTarget, ResponseClient, ResponseFormat, UsageSummary},
@@ -37,8 +38,10 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::time::{Duration, sleep};
 
 const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const MAX_TRANSIENT_RETRIES: u32 = 2;
 
 #[derive(Debug)]
 /// OpenAI-backed implementation of the runtime model adapter.
@@ -121,12 +124,13 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "model_step_decision",
-                    "schema": decision_schema(),
+                    "schema": decision_schema(request.phase),
                     "strict": true
                 }
             },
             "metadata": {
-                "step_number": request.step_number.to_string()
+                "step_number": request.step_number.to_string(),
+                "phase": request.phase.as_str()
             }
         })
     }
@@ -139,7 +143,10 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "subagent_step_decision",
-                    "schema": subagent_decision_schema(&request.tool_mask_plan, &request.registered_tools),
+                    "schema": subagent_decision_schema(
+                        &request.tool_mask_plan,
+                        &request.registered_tools,
+                    ),
                     "strict": true
                 }
             },
@@ -185,70 +192,110 @@ impl OpenAiModelAdapter {
         let headers = self
             .headers()
             .map_err(|error| ModelAdapterError::Provider(error.to_string()))?;
-        let response = self
-            .http_client
-            .post(&self.base_url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
+        for attempt in 0..=MAX_TRANSIENT_RETRIES {
+            let response = match self
+                .http_client
+                .post(&self.base_url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if should_retry_transport_error(&error) && attempt < MAX_TRANSIENT_RETRIES {
+                        debug.emit(
+                            ModelAdapterArtifactKind::Error,
+                            "transport_retry",
+                            json!({
+                                "attempt": attempt + 1,
+                                "max_retries": MAX_TRANSIENT_RETRIES,
+                                "message": error.to_string(),
+                            }),
+                        );
+                        sleep(retry_delay(attempt)).await;
+                        continue;
+                    }
+                    debug.emit(
+                        ModelAdapterArtifactKind::Error,
+                        "transport_error",
+                        json!({
+                            "attempt": attempt + 1,
+                            "message": error.to_string(),
+                        }),
+                    );
+                    return Err(ModelAdapterError::Transport(error.to_string()));
+                }
+            };
+
+            let status = response.status();
+            let response_text = response.text().await.map_err(|error| {
                 debug.emit(
                     ModelAdapterArtifactKind::Error,
-                    "transport_error",
+                    "response_body_read_error",
                     json!({
+                        "attempt": attempt + 1,
                         "message": error.to_string(),
                     }),
                 );
                 ModelAdapterError::Transport(error.to_string())
             })?;
 
-        let status = response.status();
-        let response_text = response.text().await.map_err(|error| {
-            debug.emit(
-                ModelAdapterArtifactKind::Error,
-                "response_body_read_error",
-                json!({
-                    "message": error.to_string(),
-                }),
-            );
-            ModelAdapterError::Transport(error.to_string())
-        })?;
+            if !status.is_success() {
+                if should_retry_provider_status(status) && attempt < MAX_TRANSIENT_RETRIES {
+                    debug.emit(
+                        ModelAdapterArtifactKind::Error,
+                        &format!("provider retry {status}"),
+                        json!({
+                            "attempt": attempt + 1,
+                            "max_retries": MAX_TRANSIENT_RETRIES,
+                            "status": status.as_u16(),
+                            "body": parse_json_or_text(&response_text),
+                        }),
+                    );
+                    sleep(retry_delay(attempt)).await;
+                    continue;
+                }
+                debug.emit(
+                    ModelAdapterArtifactKind::Error,
+                    &format!("provider error {status}"),
+                    json!({
+                        "attempt": attempt + 1,
+                        "status": status.as_u16(),
+                        "body": parse_json_or_text(&response_text),
+                    }),
+                );
+                return Err(ModelAdapterError::Provider(format_provider_error(
+                    status,
+                    &response_text,
+                )));
+            }
 
-        if !status.is_success() {
+            let raw_payload = serde_json::from_str::<Value>(&response_text).map_err(|error| {
+                debug.emit(
+                    ModelAdapterArtifactKind::Error,
+                    "response_json_parse_error",
+                    json!({
+                        "attempt": attempt + 1,
+                        "message": error.to_string(),
+                        "body": parse_json_or_text(&response_text),
+                    }),
+                );
+                ModelAdapterError::Transport(error.to_string())
+            })?;
             debug.emit(
-                ModelAdapterArtifactKind::Error,
-                &format!("provider error {status}"),
-                json!({
-                    "status": status.as_u16(),
-                    "body": parse_json_or_text(&response_text),
-                }),
+                ModelAdapterArtifactKind::Response,
+                response_summary,
+                redact_json_value(&raw_payload),
             );
-            return Err(ModelAdapterError::Provider(format_provider_error(
-                status,
-                &response_text,
-            )));
+
+            return serde_json::from_value(raw_payload)
+                .map_err(|error| ModelAdapterError::Transport(error.to_string()));
         }
 
-        let raw_payload = serde_json::from_str::<Value>(&response_text).map_err(|error| {
-            debug.emit(
-                ModelAdapterArtifactKind::Error,
-                "response_json_parse_error",
-                json!({
-                    "message": error.to_string(),
-                    "body": parse_json_or_text(&response_text),
-                }),
-            );
-            ModelAdapterError::Transport(error.to_string())
-        })?;
-        debug.emit(
-            ModelAdapterArtifactKind::Response,
-            response_summary,
-            redact_json_value(&raw_payload),
-        );
-
-        serde_json::from_value(raw_payload)
-            .map_err(|error| ModelAdapterError::Transport(error.to_string()))
+        Err(ModelAdapterError::Transport(
+            "responses call exhausted retries without a terminal result".to_owned(),
+        ))
     }
 }
 
@@ -290,7 +337,7 @@ impl ModelAdapter for OpenAiModelAdapter {
         let payload = self
             .execute_responses_call(body, "subagent request", "subagent response", debug_sink)
             .await?;
-        let decision_text = payload.extract_output_text()?;
+        let decision_text = payload.extract_subagent_output_text()?;
         let decision = parse_subagent_decision_text(&decision_text)?;
         Ok(SubagentAdapterResponse {
             decision,
@@ -380,6 +427,23 @@ fn format_provider_error(status: StatusCode, body: &str) -> String {
     message
 }
 
+fn should_retry_provider_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn should_retry_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(250),
+        _ => Duration::from_millis(1000),
+    }
+}
+
 struct OpenAiDebugEmitter<'a> {
     sink: Option<&'a mut dyn ModelAdapterDebugSink>,
 }
@@ -441,6 +505,19 @@ fn parse_decision_text(decision_text: &str) -> Result<ModelStepDecision, ModelAd
         .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?;
 
     match wire.decision_type.as_str() {
+        "planning_complete" => Ok(ModelStepDecision::PlanningComplete {
+            outcome: agent_runtime::model::PlanningOutcome {
+                planning_complete: true,
+                answer_brief: wire.content,
+                todo_required: wire.todo_required,
+                planning_summary: wire.planning_summary,
+                selected_sources: wire.selected_sources,
+                discovered_facts: wire.discovered_facts,
+                execution_strategy: wire.execution_strategy,
+                todo_items: wire.todo_items,
+                risks_and_constraints: wire.risks_and_constraints,
+            },
+        }),
         "final" => Ok(ModelStepDecision::Final {
             content: wire.content,
         }),
@@ -594,6 +671,18 @@ struct ResponsesCreateResponse {
 }
 
 impl ResponsesCreateResponse {
+    fn output_text_candidates(&self) -> Vec<OutputTextCandidate> {
+        let mut candidates = Vec::new();
+        if let Some(text) = self.output_text.as_deref().and_then(non_empty_text) {
+            push_unique_output_text_candidate(&mut candidates, text, None);
+        }
+        for item in &self.output {
+            let phase = output_value_phase(item);
+            collect_output_text_candidates_from_output_value(item, phase, &mut candidates);
+        }
+        candidates
+    }
+
     /// Returns the single distinct non-empty assistant text found in the response.
     ///
     /// The Responses API can repeat the same structured decision in multiple
@@ -609,14 +698,7 @@ impl ResponsesCreateResponse {
     /// response, execute the first one in response order and let the runtime
     /// continue the delegated loop on the next turn.
     fn extract_output_text(&self) -> Result<String, ModelAdapterError> {
-        let mut candidates = Vec::new();
-        if let Some(text) = self.output_text.as_deref().and_then(non_empty_text) {
-            push_unique_output_text_candidate(&mut candidates, text, None);
-        }
-        for item in &self.output {
-            let phase = output_value_phase(item);
-            collect_output_text_candidates_from_output_value(item, phase, &mut candidates);
-        }
+        let candidates = self.output_text_candidates();
 
         if candidates.is_empty() {
             return Err(ModelAdapterError::InvalidDecision(
@@ -632,6 +714,48 @@ impl ResponsesCreateResponse {
             OutputTextSelectionMode::RequireUnique,
         )? {
             return Ok(text);
+        }
+
+        if let Some(text) = select_output_text_candidate(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.kind.is_action()),
+            OutputTextSelectionMode::FirstInResponse,
+        )? {
+            return Ok(text);
+        }
+
+        if let Some(text) = select_output_text_candidate(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.phase.as_deref() == Some("final_answer")),
+            OutputTextSelectionMode::RequireUnique,
+        )? {
+            return Ok(text);
+        }
+
+        select_output_text_candidate(candidates.iter(), OutputTextSelectionMode::RequireUnique)?
+            .ok_or_else(|| {
+                ModelAdapterError::InvalidDecision(
+                    "missing output_text and no assistant text found in output".to_owned(),
+                )
+            })
+    }
+
+    /// Returns the structured text for a delegated subagent step.
+    ///
+    /// Subagent responses occasionally contain a valid actionable commentary
+    /// payload followed by a lower-fidelity `final_answer` duplicate. For
+    /// delegated execution, prefer the first actionable decision in response
+    /// order regardless of phase, and only fall back to terminal text when no
+    /// action was emitted at all.
+    fn extract_subagent_output_text(&self) -> Result<String, ModelAdapterError> {
+        let candidates = self.output_text_candidates();
+
+        if candidates.is_empty() {
+            return Err(ModelAdapterError::InvalidDecision(
+                "missing output_text and no assistant text found in output".to_owned(),
+            ));
         }
 
         if let Some(text) = select_output_text_candidate(
@@ -744,9 +868,13 @@ fn classify_output_text_candidate(text: &str) -> OutputTextCandidateKind {
     };
 
     match value.get("type").and_then(Value::as_str) {
-        Some("delegate_subagent" | "mcp_tool_call" | "mcp_resource_read" | "local_tool_call") => {
-            OutputTextCandidateKind::Action
-        }
+        Some(
+            "planning_complete"
+            | "delegate_subagent"
+            | "mcp_tool_call"
+            | "mcp_resource_read"
+            | "local_tool_call",
+        ) => OutputTextCandidateKind::Action,
         Some("final" | "done" | "partial" | "cannot_execute") => OutputTextCandidateKind::Terminal,
         _ => OutputTextCandidateKind::Unknown,
     }
@@ -807,6 +935,7 @@ struct OpenAiInputTokensDetails {
 struct OpenAiDecisionWire {
     #[serde(rename = "type")]
     decision_type: String,
+    #[serde(default)]
     content: String,
     #[serde(default)]
     subagent_type: String,
@@ -814,6 +943,20 @@ struct OpenAiDecisionWire {
     goal: String,
     #[serde(default)]
     target: Option<DelegationTarget>,
+    #[serde(default)]
+    todo_required: bool,
+    #[serde(default)]
+    planning_summary: String,
+    #[serde(default)]
+    selected_sources: Vec<agent_runtime::model::PlannedSource>,
+    #[serde(default)]
+    discovered_facts: Vec<agent_runtime::model::PlanningFact>,
+    #[serde(default)]
+    execution_strategy: String,
+    #[serde(default)]
+    todo_items: Vec<String>,
+    #[serde(default)]
+    risks_and_constraints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -864,24 +1007,84 @@ struct ResponsesErrorBody {
 /// Returns the strict JSON schema enforced for every model step response.
 ///
 /// The schema is intentionally narrow:
-/// - only two decision types are allowed,
-/// - all fields are required, and
+/// - only supported decision types are allowed,
+/// - all declared fields are required so the provider's strict-schema validator
+///   accepts the shape, and
 /// - additional properties are forbidden.
 ///
 /// This pushes output-shape enforcement onto the provider so the runtime can
 /// reject malformed generations early and deterministically.
-fn decision_schema() -> Value {
+fn decision_schema(phase: TurnPhase) -> Value {
+    let decision_types = match phase {
+        TurnPhase::Planning => vec!["planning_complete", "final", "delegate_subagent"],
+        TurnPhase::Execution => vec!["final", "delegate_subagent"],
+    };
     json!({
         "type": "object",
-        "required": ["type", "content", "subagent_type", "goal", "target"],
+        "required": [
+            "type",
+            "content",
+            "subagent_type",
+            "goal",
+            "target",
+            "todo_required",
+            "planning_summary",
+            "selected_sources",
+            "discovered_facts",
+            "execution_strategy",
+            "todo_items",
+            "risks_and_constraints"
+        ],
         "properties": {
             "type": {
                 "type": "string",
-                "enum": ["final", "delegate_subagent"]
+                "enum": decision_types
             },
             "content": { "type": "string" },
             "subagent_type": { "type": "string" },
             "goal": { "type": "string" },
+            "todo_required": { "type": "boolean" },
+            "planning_summary": { "type": "string" },
+            "selected_sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["source_kind", "source_id", "rationale"],
+                    "properties": {
+                        "source_kind": {
+                            "type": "string",
+                            "enum": ["local_file", "mcp_tool", "mcp_resource", "mcp_server"]
+                        },
+                        "source_id": { "type": "string" },
+                        "rationale": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "discovered_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["fact", "evidence_source_ids"],
+                    "properties": {
+                        "fact": { "type": "string" },
+                        "evidence_source_ids": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "execution_strategy": { "type": "string" },
+            "todo_items": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "risks_and_constraints": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
             "target": {
                 "anyOf": [
                     { "type": "null" },
@@ -897,6 +1100,22 @@ fn decision_schema() -> Value {
                                     "server_name": { "type": "string", "minLength": 1 },
                                     "capability_kind": { "type": "string", "enum": ["tool", "resource"] },
                                     "capability_id": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["kind", "value"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["mcp_server_scope"] },
+                            "value": {
+                                "type": "object",
+                                "required": ["server_name"],
+                                "properties": {
+                                    "server_name": { "type": "string", "minLength": 1 }
                                 },
                                 "additionalProperties": false
                             }
@@ -1238,8 +1457,10 @@ fn non_empty_text(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use agent_runtime::{
-        model::ModelStepRequest,
+        model::{ModelStepRequest, TurnPhase},
         policy::ToolMaskPlan,
         state::{ModelConfig, PromptSection, PromptSnapshot, UsageSummary},
         tools::{ToolDescriptor, builtin_local_tool_catalog},
@@ -1250,7 +1471,7 @@ mod tests {
     use super::{
         OpenAiAdapterError, OpenAiModelAdapter, OpenAiUsage, ResponsesCreateResponse,
         decision_schema, format_provider_error, parse_decision_text, parse_subagent_decision_text,
-        prune_null_json, subagent_decision_schema,
+        prune_null_json, retry_delay, should_retry_provider_status, subagent_decision_schema,
     };
 
     #[test]
@@ -1265,6 +1486,7 @@ mod tests {
             .expect("adapter should construct");
         let request = ModelStepRequest {
             step_number: 2,
+            phase: TurnPhase::Planning,
             prompt: PromptSnapshot {
                 rendered: "hello".to_owned(),
                 sections: vec![PromptSection {
@@ -1282,8 +1504,18 @@ mod tests {
         assert_eq!(body["input"], "hello");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["strict"], true);
-        assert_eq!(body["text"]["format"]["schema"], decision_schema());
+        assert_eq!(body["text"]["format"]["schema"], decision_schema(TurnPhase::Planning));
         assert_eq!(body["metadata"]["step_number"], "2");
+        assert_eq!(body["metadata"]["phase"], "planning");
+    }
+
+    #[test]
+    fn execution_schema_disallows_planning_complete() {
+        let schema = decision_schema(TurnPhase::Execution);
+        assert_eq!(
+            schema["properties"]["type"]["enum"],
+            json!(["final", "delegate_subagent"])
+        );
     }
 
     #[test]
@@ -1305,6 +1537,30 @@ mod tests {
                                 .expect("valid server name"),
                             capability_kind: mcp_metadata::CapabilityKind::Tool,
                             capability_id: "run-sql".to_owned(),
+                        }
+                    ),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_server_scoped_delegate_subagent_decision() {
+        let decision = parse_decision_text(
+            r#"{"type":"delegate_subagent","content":"","subagent_type":"mcp-executor","goal":"inspect one server","target":{"kind":"mcp_server_scope","value":{"server_name":"postgres"}}}"#,
+        )
+        .expect("decision should parse");
+
+        assert_eq!(
+            decision,
+            agent_runtime::model::ModelStepDecision::DelegateSubagent {
+                delegation: agent_runtime::model::SubagentDelegationRequest {
+                    subagent_type: "mcp-executor".to_owned(),
+                    goal: "inspect one server".to_owned(),
+                    target: agent_runtime::state::DelegationTarget::McpServerScope(
+                        agent_runtime::state::McpServerScopeTarget {
+                            server_name: agent_runtime::state::ServerName::new("postgres")
+                                .expect("valid server name"),
                         }
                     ),
                 }
@@ -1423,7 +1679,6 @@ mod tests {
         assert_eq!(schema["type"], json!("object"));
         assert_eq!(schema["additionalProperties"], json!(false));
         assert!(schema.get("anyOf").is_none());
-        assert!(schema.get("oneOf").is_none());
         assert!(schema.get("allOf").is_none());
         assert!(schema.get("enum").is_none());
         assert!(schema.get("not").is_none());
@@ -1439,124 +1694,14 @@ mod tests {
             schema["properties"]["arguments"]["anyOf"][1]["required"],
             json!([])
         );
-    }
-
-    #[test]
-    fn subagent_schema_uses_strict_local_tool_arguments_schema() {
-        let tools = builtin_local_tool_catalog();
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["local.write_file".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: vec!["write_file".to_owned()],
-                allowed_mcp_tools: Vec::new(),
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(arguments["additionalProperties"], json!(false));
-        assert_eq!(arguments["required"], json!(["content", "path"]));
         assert_eq!(
-            arguments["properties"]["content"]["anyOf"],
-            json!([
-                { "type": "string" },
-                { "type": "null" }
-            ])
+            schema["properties"]["arguments"]["anyOf"][1]["additionalProperties"],
+            json!(false)
         );
     }
 
     #[test]
-    fn subagent_schema_strictifies_mcp_tool_arguments_schema() {
-        let server = agent_runtime::state::ServerName::new("postgres").expect("valid server");
-        let tools = vec![ToolDescriptor::mcp_tool(
-            &server,
-            "run-sql",
-            None,
-            None,
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                }
-            }),
-        )];
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["mcp.postgres.tool.run-sql".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: Vec::new(),
-                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
-                    server_name: "postgres".to_owned(),
-                    tool_name: "run-sql".to_owned(),
-                }],
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(arguments["additionalProperties"], json!(false));
-        assert_eq!(arguments["required"], json!(["query"]));
-    }
-
-    #[test]
-    fn subagent_schema_requires_all_mcp_argument_properties_for_strict_mode() {
-        let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
-        let tools = vec![ToolDescriptor::mcp_tool(
-            &server,
-            "list_tables",
-            None,
-            None,
-            json!({
-                "type": "object",
-                "required": ["database"],
-                "properties": {
-                    "database": { "type": "string" },
-                    "like": {
-                        "anyOf": [
-                            { "type": "string" },
-                            { "type": "null" }
-                        ],
-                        "default": null
-                    },
-                    "include_detailed_columns": {
-                        "type": "boolean",
-                        "default": true
-                    }
-                }
-            }),
-        )];
-        let schema = subagent_decision_schema(
-            &ToolMaskPlan {
-                enforcement_mode: agent_runtime::policy::ToolMaskEnforcementMode::DecodeTimeMask,
-                allowed_tool_ids: vec!["mcp.ex-vol.tool.list_tables".to_owned()],
-                denied_tool_ids: Vec::new(),
-                decisions: Vec::new(),
-                allowed_local_tools: Vec::new(),
-                allowed_mcp_tools: vec![agent_runtime::policy::AllowedMcpTool {
-                    server_name: "ex-vol".to_owned(),
-                    tool_name: "list_tables".to_owned(),
-                }],
-                allowed_mcp_resources: Vec::new(),
-            },
-            &tools,
-        );
-        let arguments = &schema["properties"]["arguments"]["anyOf"][1];
-
-        assert_eq!(
-            arguments["required"],
-            json!(["database", "include_detailed_columns", "like"])
-        );
-    }
-
-    #[test]
-    fn subagent_schema_merges_multiple_allowed_tool_variants_without_top_level_branching() {
+    fn subagent_schema_lists_allowed_identifiers_without_conditionals() {
         let server = agent_runtime::state::ServerName::new("ex-vol").expect("valid server");
         let mut tools = builtin_local_tool_catalog();
         tools.push(ToolDescriptor::mcp_tool(
@@ -1601,6 +1746,8 @@ mod tests {
 
         assert_eq!(schema["type"], json!("object"));
         assert!(schema.get("anyOf").is_none());
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("allOf").is_none());
         assert_eq!(
             schema["properties"]["type"]["enum"],
             json!([
@@ -1631,6 +1778,13 @@ mod tests {
                 "database",
                 "include_detailed_columns",
                 "timeout_ms"
+            ])
+        );
+        assert_eq!(
+            schema["properties"]["arguments"]["anyOf"][1]["properties"]["database"]["anyOf"],
+            json!([
+                { "type": "string" },
+                { "type": "null" }
             ])
         );
     }
@@ -1895,6 +2049,60 @@ mod tests {
     }
 
     #[test]
+    fn extract_subagent_output_text_prefers_first_actionable_commentary_over_later_final_answer_duplicate() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ipl\",\"tool_name\":\"query\",\"arguments\":{\"sql\":\"select player_name, count(*) as dismissals from wickets group by player_name order by dismissals desc limit 10\"},\"resource_uri\":null,\"summary\":\"Run a fielding leaderboard query for IPL 2025.\",\"reason\":\"Need the fielding dismissal counts before answering.\"}"
+                    }]
+                },
+                {
+                    "type": "message",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ipl\",\"tool_name\":\"query\",\"arguments\":null,\"resource_uri\":null,\"summary\":\"Awaiting query results for IPL 2025 fielding leaderboard.\",\"reason\":\"Need query output before I can finish.\"}"
+                    }]
+                }
+            ]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_subagent_output_text()
+                .expect("first actionable commentary candidate should win for subagents"),
+            "{\"type\":\"mcp_tool_call\",\"server_name\":\"ipl\",\"tool_name\":\"query\",\"arguments\":{\"sql\":\"select player_name, count(*) as dismissals from wickets group by player_name order by dismissals desc limit 10\"},\"resource_uri\":null,\"summary\":\"Run a fielding leaderboard query for IPL 2025.\",\"reason\":\"Need the fielding dismissal counts before answering.\"}"
+        );
+    }
+
+    #[test]
+    fn extract_subagent_output_text_falls_back_to_terminal_when_no_action_exists() {
+        let payload: ResponsesCreateResponse = serde_json::from_value(json!({
+            "output": [{
+                "type": "message",
+                "phase": "final_answer",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"type\":\"cannot_execute\",\"server_name\":null,\"tool_name\":null,\"arguments\":null,\"resource_uri\":null,\"summary\":null,\"reason\":\"The data source is unavailable.\"}"
+                }]
+            }]
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload
+                .extract_subagent_output_text()
+                .expect("terminal fallback should still work"),
+            "{\"type\":\"cannot_execute\",\"server_name\":null,\"tool_name\":null,\"arguments\":null,\"resource_uri\":null,\"summary\":null,\"reason\":\"The data source is unavailable.\"}"
+        );
+    }
+
+    #[test]
     fn parses_cached_tokens_from_openai_usage_details() {
         let usage: OpenAiUsage = serde_json::from_value(json!({
             "input_tokens": 2006,
@@ -1950,5 +2158,24 @@ mod tests {
             format!("OpenAI Responses API returned status 400 Bad Request: {body}")
         );
         assert!(!error.ends_with("..."));
+    }
+
+    #[test]
+    fn retryable_provider_statuses_are_classified_correctly() {
+        assert!(should_retry_provider_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(should_retry_provider_status(StatusCode::BAD_GATEWAY));
+        assert!(should_retry_provider_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(should_retry_provider_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(should_retry_provider_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry_provider_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(!should_retry_provider_status(StatusCode::BAD_REQUEST));
+        assert!(!should_retry_provider_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn retry_delay_uses_short_backoff_then_longer_backoff() {
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(1), Duration::from_millis(1000));
+        assert_eq!(retry_delay(2), Duration::from_millis(1000));
     }
 }

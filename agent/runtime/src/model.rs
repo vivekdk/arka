@@ -3,6 +3,8 @@
 //! The runtime depends only on these types. Concrete provider crates translate
 //! their native request and response shapes into this strongly typed boundary.
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +24,8 @@ use crate::{
 pub struct ModelStepRequest {
     /// One-based step number within the current turn.
     pub step_number: u32,
+    /// Current runtime phase for this step.
+    pub phase: TurnPhase,
     /// Fully assembled prompt snapshot for this step.
     pub prompt: PromptSnapshot,
     /// Provider and model selection for the call.
@@ -101,6 +105,8 @@ pub trait ModelAdapterDebugSink: Send {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelStepDecision {
+    /// Planning is complete and execution may begin.
+    PlanningComplete { outcome: PlanningOutcome },
     /// End the turn and return the supplied assistant message.
     Final { content: String },
     /// Delegate work to one configured sub-agent.
@@ -120,6 +126,110 @@ pub struct SubagentDelegationRequest {
     /// Short statement of what the delegated action should achieve.
     #[serde(default)]
     pub goal: String,
+}
+
+/// High-level runtime phase for the current turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    Planning,
+    Execution,
+}
+
+impl TurnPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Execution => "execution",
+        }
+    }
+}
+
+/// Planner-produced description of one source selected for execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedSource {
+    pub source_kind: PlannedSourceKind,
+    pub source_id: String,
+    pub rationale: String,
+}
+
+/// Kind of data source referenced by the planner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedSourceKind {
+    LocalFile,
+    McpTool,
+    McpResource,
+    McpServer,
+}
+
+/// Planner-discovered fact that shaped the execution plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningFact {
+    pub fact: String,
+    #[serde(default)]
+    pub evidence_source_ids: Vec<String>,
+}
+
+/// Structured result that closes the planning phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningOutcome {
+    #[serde(default = "default_true")]
+    pub planning_complete: bool,
+    #[serde(default)]
+    pub answer_brief: String,
+    #[serde(default)]
+    pub todo_required: bool,
+    #[serde(default)]
+    pub planning_summary: String,
+    #[serde(default)]
+    pub selected_sources: Vec<PlannedSource>,
+    #[serde(default)]
+    pub discovered_facts: Vec<PlanningFact>,
+    #[serde(default)]
+    pub execution_strategy: String,
+    #[serde(default)]
+    pub todo_items: Vec<String>,
+    #[serde(default)]
+    pub risks_and_constraints: Vec<String>,
+}
+
+impl PlanningOutcome {
+    pub fn into_execution_handoff(self, todo_path: Option<PathBuf>) -> ExecutionHandoff {
+        ExecutionHandoff {
+            todo_required: self.todo_required,
+            answer_brief: self.answer_brief,
+            summary: self.planning_summary,
+            selected_sources: self.selected_sources,
+            key_facts: self.discovered_facts,
+            execution_strategy: self.execution_strategy,
+            risks_and_constraints: self.risks_and_constraints,
+            todo_path,
+        }
+    }
+}
+
+/// Structured planning summary carried into execution prompts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionHandoff {
+    pub todo_required: bool,
+    #[serde(default)]
+    pub answer_brief: String,
+    pub summary: String,
+    #[serde(default)]
+    pub selected_sources: Vec<PlannedSource>,
+    #[serde(default)]
+    pub key_facts: Vec<PlanningFact>,
+    #[serde(default)]
+    pub execution_strategy: String,
+    #[serde(default)]
+    pub risks_and_constraints: Vec<String>,
+    #[serde(default)]
+    pub todo_path: Option<PathBuf>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Request sent to a sub-agent renderer/model for a delegated step.

@@ -27,9 +27,9 @@ pub use api::{
     router_with_debug_history, router_with_slack,
 };
 pub use observability::{
-    DebugHistoryAvailableFilters, DebugHistoryEventRow, DebugHistoryFilterOption,
-    DebugHistoryRawArtifactRow, DebugHistorySessionSummary, DebugHistoryStore,
-    DebugHistoryTurnDetail, DebugHistoryTurnFilters, DebugHistoryTurnSummary,
+    ConsoleRuntimeHarnessListener, DebugHistoryAvailableFilters, DebugHistoryEventRow,
+    DebugHistoryFilterOption, DebugHistoryRawArtifactRow, DebugHistorySessionSummary,
+    DebugHistoryStore, DebugHistoryTurnDetail, DebugHistoryTurnFilters, DebugHistoryTurnSummary,
     PostgresRuntimeDebugListener, RuntimeHarnessEventEnvelope, RuntimeHarnessFanoutSink,
     RuntimeHarnessListener, RuntimeHarnessListenerError, RuntimeHarnessObservation,
     RuntimeHarnessRawArtifactEnvelope, SseRuntimeHarnessListener, TurnDebugSnapshot,

@@ -21,6 +21,7 @@ pub mod prompt;
 pub mod runtime;
 pub mod state;
 pub mod subagent;
+pub mod todo;
 pub mod tools;
 
 pub use events::{
@@ -30,9 +31,14 @@ pub use events::{
 pub use ids::{MessageId, StepId, TurnId};
 pub use runtime::{AgentRuntime, McpSession, RuntimeError};
 pub use state::{
-    CapabilityPlaceholders, ConversationMessage, ConversationRole, LocalToolName, McpCapability,
-    MessageRecord, ModelConfig, PromptSection, PromptSnapshot, ResponseClient, ResponseFormat,
-    ResponseTarget, RunRequest, RuntimeLimits, ServerName, StepOutcomeKind, StepRecord,
-    TerminationReason, TurnOutcome, TurnRecord, UsageSummary,
+    CapabilityPlaceholders, ConversationMessage, ConversationRole, LocalToolName,
+    LocalToolsScopeTarget, McpCapability, McpCapabilityTarget, McpServerScopeTarget, MessageRecord,
+    ModelConfig, PromptSection, PromptSnapshot, ResponseClient, ResponseFormat, ResponseTarget,
+    RunRequest, RuntimeLimits, ServerName, StepOutcomeKind, StepRecord, TerminationReason,
+    TurnOutcome, TurnRecord, UsageSummary,
+};
+pub use todo::{
+    MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError, TodoItem, TodoList,
+    TodoStatus,
 };
 pub use tools::{ToolCallResultEnvelope, ToolDescriptor, ToolFamily, builtin_local_tool_catalog};

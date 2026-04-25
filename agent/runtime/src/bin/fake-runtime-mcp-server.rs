@@ -116,7 +116,24 @@ fn main() {
 
                 match tool_name {
                     "run-sql" => {
-                        if tool_mode == "poison-after-tool-error" && poisoned {
+                        if tool_mode == "always-tool-error" {
+                            respond(
+                                &mut writer,
+                                id,
+                                json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "simulated repeated MCP tool failure"
+                                        }
+                                    ],
+                                    "structuredContent": {
+                                        "reason": "simulated_repeated_failure"
+                                    },
+                                    "isError": true
+                                }),
+                            );
+                        } else if tool_mode == "poison-after-tool-error" && poisoned {
                             respond(
                                 &mut writer,
                                 id,

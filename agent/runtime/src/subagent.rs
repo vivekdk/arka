@@ -8,6 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::model::TurnPhase;
 use crate::state::SubagentCard;
 
 const MCP_SERVER_DETAILS_TAG: &str = "<dynamic variable: MCP server details>";
@@ -129,9 +130,10 @@ fn canonicalize_subagent_identifier(value: &str) -> String {
 pub fn load_subagent_prompt(
     base_dir: &Path,
     configured: &ConfiguredSubagent,
+    phase: TurnPhase,
     mcp_server_details: &str,
 ) -> Result<String, SubagentConfigError> {
-    let prompt_path = resolve_prompt_path(base_dir, configured);
+    let prompt_path = resolve_prompt_path(base_dir, configured, phase);
     fs::read_to_string(&prompt_path)
         .map_err(|source| SubagentConfigError::ReadPrompt {
             path: prompt_path,
@@ -140,12 +142,27 @@ pub fn load_subagent_prompt(
         .map(|template| render_subagent_prompt(&template, mcp_server_details))
 }
 
-fn resolve_prompt_path(base_dir: &Path, configured: &ConfiguredSubagent) -> PathBuf {
-    if configured.prompt_path.is_absolute() {
+fn resolve_prompt_path(
+    base_dir: &Path,
+    configured: &ConfiguredSubagent,
+    phase: TurnPhase,
+) -> PathBuf {
+    let default_path = if configured.prompt_path.is_absolute() {
         configured.prompt_path.clone()
     } else {
         base_dir.join(&configured.prompt_path)
+    };
+    let Some(file_name) = default_path.file_name().and_then(|value| value.to_str()) else {
+        return default_path;
+    };
+    if let Some(prefix) = file_name.strip_suffix(".prompt.md") {
+        let phase_path =
+            default_path.with_file_name(format!("{prefix}.{}.prompt.md", phase.as_str()));
+        if phase_path.exists() {
+            return phase_path;
+        }
     }
+    default_path
 }
 
 fn render_subagent_prompt(template: &str, mcp_server_details: &str) -> String {
@@ -159,6 +176,8 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    use crate::model::TurnPhase;
 
     use super::{
         ConfiguredSubagent, SubagentConfigError, SubagentRegistry, load_subagent_prompt,
@@ -196,35 +215,51 @@ mod tests {
         let rendered = load_subagent_prompt(
             &base_dir,
             &configured,
+            TurnPhase::Execution,
             "---\nserver:\n  logical_name: postgres\n---\n\n# MCP Full: postgres",
         )
         .expect("tool-executor prompt should load");
 
         assert!(rendered.contains("You are the `tool-executor` sub-agent."));
-        assert!(rendered.contains(
-            "`glob` finds workspace-relative file or directory paths matching a glob pattern, with optional exclude globs."
-        ));
-        assert!(rendered.contains("`read_file` reads the full UTF-8 contents of one file."));
-        assert!(rendered.contains("`write_file` writes the full UTF-8 contents of one file."));
-        assert!(rendered.contains(
-            "`edit_file` replaces exactly one matching `old_text` block with `new_text` in a UTF-8 file."
-        ));
-        assert!(rendered.contains(
-            "`bash` runs one non-interactive bash command in the working directory and returns the exit code plus captured stdout and stderr."
-        ));
-        assert!(rendered.contains("Prefer `glob` for path discovery before opening files."));
-        assert!(rendered.contains(
-            "Use `read_file` before mutating when the current file contents are not already known."
-        ));
-        assert!(rendered.contains(
-            "If `edit_file` cannot find the requested text, read the file again and reassess before continuing."
-        ));
-        assert!(rendered.contains(
-            "If `bash` output is noisy or truncated, narrow the command and try again instead of guessing."
-        ));
-        assert!(rendered.contains(
-            "The delegated prompt will include the working directory and the available local tools."
-        ));
+        assert!(
+            rendered
+                .contains("Treat Python script authoring and execution as a first-class workflow")
+        );
+        assert!(rendered.contains("Assume `pandas` and `numpy` are available"));
+        assert!(rendered.contains("When current-turn todo context is present"));
+        assert!(rendered.contains("Return `done` once the delegated goal has been completed"));
+        assert!(!rendered.contains("<dynamic variable: MCP server details>"));
+    }
+
+    #[test]
+    fn load_subagent_prompt_renders_actual_mcp_executor_template() {
+        let base_dir = workspace_root().join("config");
+        let configured = ConfiguredSubagent {
+            subagent_type: "mcp-executor".to_owned(),
+            display_name: "Mcp Executor".to_owned(),
+            purpose: "Run delegated MCP work".to_owned(),
+            when_to_use: "When MCP work is needed".to_owned(),
+            target_requirements: "mcp target".to_owned(),
+            result_summary:
+                "Returns MCP tool or resource actions until the delegated goal is complete"
+                    .to_owned(),
+            prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+
+        let rendered = load_subagent_prompt(
+            &base_dir,
+            &configured,
+            TurnPhase::Execution,
+            "---\nserver:\n  logical_name: ipl\n  protocol_name: postgres-mcp\n---\n\n# MCP Full: ipl",
+        )
+        .expect("mcp-executor prompt should load");
+
+        assert!(rendered.contains("You are the `mcp-executor` sub-agent."));
+        assert!(rendered.contains("You may use any allowed MCP tools or resources"));
+        assert!(rendered.contains("Prefer simpler valid `SELECT` queries"));
+        assert!(rendered.contains("stop and return `partial`"));
         assert!(!rendered.contains("<dynamic variable: MCP server details>"));
     }
 
