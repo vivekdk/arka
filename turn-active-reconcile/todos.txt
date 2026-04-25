@@ -1,3 +1,3 @@
-1. [completed] Fetch the answer
-2. [in_progress] Generate an output HTML page with charts and tables.
+1. [completed] Validate the extracted runs against the available source and prepare a concise summary.
+2. [pending] Generate an output HTML page with charts and tables.
 3. [pending] Open the generated output HTML page in the browser.

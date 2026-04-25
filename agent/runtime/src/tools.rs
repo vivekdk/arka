@@ -812,7 +812,7 @@ fn reject_protected_todo_mutation(
     path: &Path,
     context: &LocalToolContext,
 ) -> Result<(), LocalToolExecutionError> {
-    if path == context.todo_path {
+    if tool_paths_equivalent(path, &context.todo_path)? {
         return Err(LocalToolExecutionError::Path(format!(
             "the current turn todo file `{}` may only be modified through write_todos",
             context.todo_path.display()
@@ -877,12 +877,10 @@ fn canonicalize_for_tool_guard(path: &Path) -> Result<PathBuf, LocalToolExecutio
             normalized.display()
         ))
     })?;
-    let resolved_parent = parent.canonicalize().map_err(|error| {
-        LocalToolExecutionError::Path(format!(
-            "failed to resolve parent directory `{}`: {error}",
-            parent.display()
-        ))
-    })?;
+    let resolved_parent = match parent.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(normalized),
+    };
     let file_name = normalized.file_name().ok_or_else(|| {
         LocalToolExecutionError::Path(format!(
             "path `{}` must point to a file",
@@ -913,9 +911,10 @@ fn reject_out_of_order_html_bash(
         return Ok(());
     }
 
-    let opens_html = command.contains(&format!("open {html_absolute}"))
+    let opens_html = bash_command_opens_path(command, &html_absolute)
         || html_relative.as_ref().is_some_and(|path| {
-            command.contains(&format!("open {path}")) || command.contains(&format!("open ./{path}"))
+            bash_command_opens_path(command, path)
+                || bash_command_opens_path(command, &format!("./{path}"))
         });
 
     if opens_html {
@@ -934,6 +933,16 @@ fn reject_out_of_order_html_bash(
         )));
     }
     Ok(())
+}
+
+fn bash_command_opens_path(command: &str, path: &str) -> bool {
+    [
+        format!("open {path}"),
+        format!("open '{path}'"),
+        format!("open \"{path}\""),
+    ]
+    .iter()
+    .any(|pattern| command.contains(pattern))
 }
 
 fn load_next_actionable_todo_text(
@@ -1315,7 +1324,11 @@ mod tests {
         )
         .await
         .expect_err("write_file should reject out-of-order html write");
-        assert!(error.to_string().contains("cannot be written while the current actionable todo is"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be written while the current actionable todo is")
+        );
     }
 
     #[tokio::test]
@@ -1337,7 +1350,11 @@ mod tests {
         )
         .await
         .expect_err("bash should reject out-of-order html write");
-        assert!(error.to_string().contains("cannot be written from bash while the current actionable todo is"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be written from bash while the current actionable todo is")
+        );
     }
 
     #[tokio::test]
@@ -1359,7 +1376,35 @@ mod tests {
         )
         .await
         .expect_err("bash should reject out-of-order html open");
-        assert!(error.to_string().contains("cannot be opened while the current actionable todo is"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be opened while the current actionable todo is")
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_treats_quoted_open_as_open_not_write() {
+        let temp_dir = temp_dir("tool-bash-quoted-open-html-out-of-order");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
+        std::fs::write(
+            &context.todo_path,
+            "1. [pending] Generate an output HTML page with charts and tables.\n2. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("bash").expect("valid tool"),
+            &json!({"command":"open 'outputs/turn-123-report.html'"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("quoted bash open should still be recognized as open");
+        let message = error.to_string();
+        assert!(message.contains("cannot be opened while the current actionable todo is"));
+        assert!(!message.contains("cannot be written from bash"));
     }
 
     #[tokio::test]
@@ -1452,6 +1497,22 @@ mod tests {
         )
         .await
         .expect("item 1 should complete");
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":2,"status":"in_progress"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("item 2 should enter progress");
+        execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":2,"status":"failed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("item 2 should fail before replanning");
 
         let result = execute_local_tool(
             &LocalToolName::new("write_todos").expect("valid tool"),
@@ -1486,7 +1547,9 @@ mod tests {
             working_directory: working_directory.clone(),
             turn_directory: turn_directory.clone(),
             todo_path: turn_directory.join("todos.txt"),
-            html_output_path: working_directory.join("outputs").join("turn-123-report.html"),
+            html_output_path: working_directory
+                .join("outputs")
+                .join("turn-123-report.html"),
         }
     }
 }

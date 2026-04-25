@@ -11,10 +11,10 @@ use std::{
 };
 
 use agent_controlplane::{
-    ConsoleRuntimeHarnessListener, DebugHistoryStore, JsonlConversationStore, LoggingWhatsAppDeliveryClient,
-    PostgresRuntimeDebugListener, ReqwestSlackDeliveryClient, ReqwestWhatsAppWebBridgeClient,
-    RuntimeExecutionConfig, RuntimeTurnRunner, SlackConnector, WhatsAppConnector, WhatsAppDmPolicy,
-    router_with_channels,
+    ConsoleRuntimeHarnessListener, DebugHistoryStore, JsonlConversationStore,
+    LoggingWhatsAppDeliveryClient, PostgresRuntimeDebugListener, ReqwestSlackDeliveryClient,
+    ReqwestWhatsAppWebBridgeClient, RuntimeExecutionConfig, RuntimeTurnRunner, SlackConnector,
+    WhatsAppConnector, WhatsAppDmPolicy, router_with_channels,
 };
 use agent_openai::OpenAiModelAdapter;
 use agent_runtime::{AgentRuntime, ModelConfig, RuntimeLimits, ServerName};

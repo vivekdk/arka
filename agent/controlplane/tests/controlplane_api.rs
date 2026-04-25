@@ -607,6 +607,12 @@ async fn debug_history_page_renders_static_html() {
     assert!(body.contains("Debug History"));
     assert!(body.contains("Arka"));
     assert!(body.contains("cached"));
+    assert!(body.contains("View markdown"));
+    assert!(body.contains("Formatted markdown"));
+    assert!(body.contains("View JSON"));
+    assert!(body.contains("Formatted JSON"));
+    assert!(body.contains("metadata?.phase"));
+    assert!(body.contains("buildStepNumberLookup"));
 }
 
 #[tokio::test]

@@ -1557,7 +1557,8 @@ where
                 } else {
                     SessionStatus::Failed
                 };
-                let generated_attachment = slack_generated_attachment(channel, &generated_artifacts);
+                let generated_attachment =
+                    slack_generated_attachment(channel, &generated_artifacts);
                 let generated_artifact_count = generated_artifacts.len();
                 info!(
                     session_id = %session_id,

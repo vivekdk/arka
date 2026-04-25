@@ -1,0 +1,4 @@
+1. [completed] Confirm the IPL 2025 season scope.
+2. [failed] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.
+3. [pending] Generate an output HTML page with charts and tables.
+4. [pending] Open the generated output HTML page in the browser.

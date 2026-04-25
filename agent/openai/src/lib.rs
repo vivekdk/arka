@@ -23,9 +23,10 @@
 use agent_runtime::{
     model::{
         FinalAnswerRenderRequest, FinalAnswerRenderResponse, FinalAnswerStreamSink, ModelAdapter,
-        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
-        ModelAdapterResponse, ModelStepDecision, ModelStepRequest, SubagentAdapterResponse,
-        SubagentDecision, SubagentDelegationRequest, SubagentStepRequest,
+        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink,
+        ModelAdapterError, ModelAdapterResponse, ModelStepDecision, ModelStepRequest,
+        SubagentAdapterResponse, SubagentDecision, SubagentDelegationRequest,
+        SubagentStepRequest, TurnPhase,
     },
     policy::ToolMaskPlan,
     state::{DelegationTarget, ResponseClient, ResponseFormat, UsageSummary},
@@ -123,12 +124,13 @@ impl OpenAiModelAdapter {
                 "format": {
                     "type": "json_schema",
                     "name": "model_step_decision",
-                    "schema": decision_schema(),
+                    "schema": decision_schema(request.phase),
                     "strict": true
                 }
             },
             "metadata": {
-                "step_number": request.step_number.to_string()
+                "step_number": request.step_number.to_string(),
+                "phase": request.phase.as_str()
             }
         })
     }
@@ -503,6 +505,19 @@ fn parse_decision_text(decision_text: &str) -> Result<ModelStepDecision, ModelAd
         .map_err(|error| ModelAdapterError::InvalidDecision(error.to_string()))?;
 
     match wire.decision_type.as_str() {
+        "planning_complete" => Ok(ModelStepDecision::PlanningComplete {
+            outcome: agent_runtime::model::PlanningOutcome {
+                planning_complete: true,
+                answer_brief: wire.content,
+                todo_required: wire.todo_required,
+                planning_summary: wire.planning_summary,
+                selected_sources: wire.selected_sources,
+                discovered_facts: wire.discovered_facts,
+                execution_strategy: wire.execution_strategy,
+                todo_items: wire.todo_items,
+                risks_and_constraints: wire.risks_and_constraints,
+            },
+        }),
         "final" => Ok(ModelStepDecision::Final {
             content: wire.content,
         }),
@@ -853,9 +868,13 @@ fn classify_output_text_candidate(text: &str) -> OutputTextCandidateKind {
     };
 
     match value.get("type").and_then(Value::as_str) {
-        Some("delegate_subagent" | "mcp_tool_call" | "mcp_resource_read" | "local_tool_call") => {
-            OutputTextCandidateKind::Action
-        }
+        Some(
+            "planning_complete"
+            | "delegate_subagent"
+            | "mcp_tool_call"
+            | "mcp_resource_read"
+            | "local_tool_call",
+        ) => OutputTextCandidateKind::Action,
         Some("final" | "done" | "partial" | "cannot_execute") => OutputTextCandidateKind::Terminal,
         _ => OutputTextCandidateKind::Unknown,
     }
@@ -916,6 +935,7 @@ struct OpenAiInputTokensDetails {
 struct OpenAiDecisionWire {
     #[serde(rename = "type")]
     decision_type: String,
+    #[serde(default)]
     content: String,
     #[serde(default)]
     subagent_type: String,
@@ -923,6 +943,20 @@ struct OpenAiDecisionWire {
     goal: String,
     #[serde(default)]
     target: Option<DelegationTarget>,
+    #[serde(default)]
+    todo_required: bool,
+    #[serde(default)]
+    planning_summary: String,
+    #[serde(default)]
+    selected_sources: Vec<agent_runtime::model::PlannedSource>,
+    #[serde(default)]
+    discovered_facts: Vec<agent_runtime::model::PlanningFact>,
+    #[serde(default)]
+    execution_strategy: String,
+    #[serde(default)]
+    todo_items: Vec<String>,
+    #[serde(default)]
+    risks_and_constraints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -973,24 +1007,84 @@ struct ResponsesErrorBody {
 /// Returns the strict JSON schema enforced for every model step response.
 ///
 /// The schema is intentionally narrow:
-/// - only two decision types are allowed,
-/// - all fields are required, and
+/// - only supported decision types are allowed,
+/// - all declared fields are required so the provider's strict-schema validator
+///   accepts the shape, and
 /// - additional properties are forbidden.
 ///
 /// This pushes output-shape enforcement onto the provider so the runtime can
 /// reject malformed generations early and deterministically.
-fn decision_schema() -> Value {
+fn decision_schema(phase: TurnPhase) -> Value {
+    let decision_types = match phase {
+        TurnPhase::Planning => vec!["planning_complete", "final", "delegate_subagent"],
+        TurnPhase::Execution => vec!["final", "delegate_subagent"],
+    };
     json!({
         "type": "object",
-        "required": ["type", "content", "subagent_type", "goal", "target"],
+        "required": [
+            "type",
+            "content",
+            "subagent_type",
+            "goal",
+            "target",
+            "todo_required",
+            "planning_summary",
+            "selected_sources",
+            "discovered_facts",
+            "execution_strategy",
+            "todo_items",
+            "risks_and_constraints"
+        ],
         "properties": {
             "type": {
                 "type": "string",
-                "enum": ["final", "delegate_subagent"]
+                "enum": decision_types
             },
             "content": { "type": "string" },
             "subagent_type": { "type": "string" },
             "goal": { "type": "string" },
+            "todo_required": { "type": "boolean" },
+            "planning_summary": { "type": "string" },
+            "selected_sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["source_kind", "source_id", "rationale"],
+                    "properties": {
+                        "source_kind": {
+                            "type": "string",
+                            "enum": ["local_file", "mcp_tool", "mcp_resource", "mcp_server"]
+                        },
+                        "source_id": { "type": "string" },
+                        "rationale": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "discovered_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["fact", "evidence_source_ids"],
+                    "properties": {
+                        "fact": { "type": "string" },
+                        "evidence_source_ids": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "execution_strategy": { "type": "string" },
+            "todo_items": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "risks_and_constraints": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
             "target": {
                 "anyOf": [
                     { "type": "null" },
@@ -1366,7 +1460,7 @@ mod tests {
     use std::time::Duration;
 
     use agent_runtime::{
-        model::ModelStepRequest,
+        model::{ModelStepRequest, TurnPhase},
         policy::ToolMaskPlan,
         state::{ModelConfig, PromptSection, PromptSnapshot, UsageSummary},
         tools::{ToolDescriptor, builtin_local_tool_catalog},
@@ -1392,6 +1486,7 @@ mod tests {
             .expect("adapter should construct");
         let request = ModelStepRequest {
             step_number: 2,
+            phase: TurnPhase::Planning,
             prompt: PromptSnapshot {
                 rendered: "hello".to_owned(),
                 sections: vec![PromptSection {
@@ -1409,8 +1504,18 @@ mod tests {
         assert_eq!(body["input"], "hello");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["strict"], true);
-        assert_eq!(body["text"]["format"]["schema"], decision_schema());
+        assert_eq!(body["text"]["format"]["schema"], decision_schema(TurnPhase::Planning));
         assert_eq!(body["metadata"]["step_number"], "2");
+        assert_eq!(body["metadata"]["phase"], "planning");
+    }
+
+    #[test]
+    fn execution_schema_disallows_planning_complete() {
+        let schema = decision_schema(TurnPhase::Execution);
+        assert_eq!(
+            schema["properties"]["type"]["enum"],
+            json!(["final", "delegate_subagent"])
+        );
     }
 
     #[test]

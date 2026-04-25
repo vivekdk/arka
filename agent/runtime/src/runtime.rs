@@ -14,14 +14,15 @@ use crate::{
     },
     ids::{MessageId, StepId, TurnId},
     model::{
-        FinalAnswerRenderRequest, FinalAnswerRenderResponse, ModelAdapter, ModelAdapterArtifact,
-        ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError, ModelStepDecision,
-        SubagentDecision, SubagentStepRequest,
+        ExecutionHandoff, FinalAnswerRenderRequest, FinalAnswerRenderResponse, ModelAdapter,
+        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
+        ModelStepDecision, PlanningOutcome, SubagentDecision, SubagentStepRequest, TurnPhase,
     },
     policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
     prompt::{
         PromptAssembler, PromptRenderError, TodoPromptContext, TurnPolicyPromptContext,
-        load_and_render_system_prompt, render_todo_context, render_turn_policy_context,
+        load_and_render_system_prompt, render_execution_handoff, render_todo_context,
+        render_turn_policy_context,
     },
     state::{
         DelegationTarget, LlmMessageRecord, LocalToolCallMessageRecord,
@@ -52,8 +53,7 @@ use tracing::{info, warn};
 
 const MAX_TOTAL_SUBAGENT_MCP_ERRORS: u32 = 3;
 const MAX_TOTAL_SUBAGENT_LOCAL_TOOL_ERRORS: u32 = 4;
-const POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON: &str =
-    "postgres schema resource reads are disabled for postgres-mcp servers; use the query tool with simple SELECT-based discovery instead";
+const POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON: &str = "postgres schema resource reads are disabled for postgres-mcp servers; use the query tool with simple SELECT-based discovery instead";
 
 /// Runtime entrypoint parameterized by a provider-specific model adapter.
 pub struct AgentRuntime<A> {
@@ -205,11 +205,7 @@ where
         mcp_session: &mut McpSession,
         sink: &mut dyn RuntimeDebugSink,
     ) -> Result<TurnOutcome, RuntimeError> {
-        let mut request = request;
-        request.require_todos &= should_require_todos_for_turn(
-            &request.user_message,
-            &request.conversation_history,
-        );
+        let request = request;
         validate_limits(&request)?;
 
         let subagent_registry = SubagentRegistry::load_from_path(&request.subagent_registry_path)?;
@@ -235,14 +231,6 @@ where
         })?;
         let todo_path = todo_file_path(&request.working_directory, &turn_id);
         let html_output_path = deterministic_html_output_path(&request.working_directory, &turn_id);
-        if request.require_todos && !todo_path.exists() {
-            let starter_todos = vec![GENERIC_STARTER_TODO.to_owned()];
-            TodoList::initialize(&starter_todos)?.save_to_path(&todo_path)?;
-        }
-        let turn_policy_context = TurnPolicyPromptContext {
-            html_output_path: html_output_path.clone(),
-            require_todos: request.require_todos,
-        };
         let turn_started_at = SystemTime::now();
         sink.record(RuntimeEvent::TurnStarted {
             turn_id: turn_id.clone(),
@@ -257,19 +245,14 @@ where
             content: request.user_message.clone(),
         });
         let mut all_messages = vec![user_message.clone()];
-        let mut prompt_messages = vec![user_message];
+        let mut planning_prompt_messages = vec![user_message.clone()];
+        let mut execution_prompt_messages = vec![user_message];
         let mut steps = Vec::new();
         let turn_start = Instant::now();
+        let mut phase = TurnPhase::Planning;
+        let mut execution_handoff: Option<ExecutionHandoff> = None;
 
         let capabilities = build_capabilities(&mcp_session.servers);
-        let system_prompt = load_and_render_system_prompt(
-            &request.system_prompt_path,
-            &request.working_directory,
-            &capabilities,
-            &subagent_cards,
-            &local_tool_catalog,
-            &request.response_target,
-        )?;
 
         for step_number in 1..=request.limits.max_steps_per_turn {
             ensure_turn_time_remaining(turn_start, request.limits.turn_timeout)?;
@@ -280,6 +263,7 @@ where
                 &all_messages,
             )?;
             reconcile_active_todo_from_turn_trace(&todo_path, &all_messages)?;
+            reconcile_pending_mcp_todos_from_turn_trace(&todo_path, &all_messages)?;
 
             let step_id = StepId::new();
             let step_started_at = SystemTime::now();
@@ -291,12 +275,34 @@ where
                 at: step_started_at,
             });
 
+            let turn_policy_context = TurnPolicyPromptContext {
+                phase,
+                html_output_path: html_output_path.clone(),
+                force_todo_file: request.require_todos,
+                execution_todo_required: execution_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.todo_required),
+            };
+            let system_prompt = load_and_render_system_prompt(
+                &request.system_prompt_path,
+                phase,
+                &request.working_directory,
+                &capabilities,
+                &subagent_cards,
+                &local_tool_catalog,
+                &request.response_target,
+            )?;
+            let current_prompt_messages = match phase {
+                TurnPhase::Planning => &planning_prompt_messages,
+                TurnPhase::Execution => &execution_prompt_messages,
+            };
             let prompt = self.prompt_assembler.build(
                 &system_prompt,
                 &request.conversation_history,
                 &request.recent_session_messages,
-                &prompt_messages,
+                current_prompt_messages,
                 &turn_policy_context,
+                execution_handoff.as_ref(),
                 load_todo_prompt_context(&todo_path)?.as_ref(),
             );
             sink.record(RuntimeEvent::PromptBuilt {
@@ -314,7 +320,7 @@ where
                 prompt_sections = prompt.sections.len(),
                 conversation_history_messages = request.conversation_history.len(),
                 recent_session_results = request.recent_session_messages.len(),
-                current_turn_messages = prompt_messages.len(),
+                current_turn_messages = current_prompt_messages.len(),
                 todo_present = load_todo_prompt_context(&todo_path)?.is_some(),
                 section_summary = %prompt_section_summary(&prompt),
                 "prompt built"
@@ -323,6 +329,7 @@ where
             let (decision, step_usage) = self
                 .generate_validated_step(
                     step_number,
+                    phase,
                     prompt.clone(),
                     request.model_config.clone(),
                     local_tool_catalog.clone(),
@@ -349,7 +356,218 @@ where
 
             let mut step_messages = Vec::new();
             match decision.clone() {
+                ModelStepDecision::PlanningComplete { outcome } => {
+                    if phase != TurnPhase::Planning {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: "Planning is already complete for this turn. Continue execution or return the final answer instead of emitting `planning_complete` again.".to_owned(),
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback.clone());
+                        push_prompt_message_for_phase(
+                            phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            feedback,
+                        );
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
+
+                    let Some(outcome) =
+                        normalize_planning_outcome(outcome, request.require_todos, &todo_path)?
+                    else {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: "Planning is not complete yet. If execution needs a todo file, `planning_complete` must include concrete ordered `todo_items`. Continue discovery or emit a complete planning outcome.".to_owned(),
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback.clone());
+                        push_prompt_message_for_phase(
+                            phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            feedback,
+                        );
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    };
+
+                    let handoff =
+                        materialize_planning_outcome(&outcome, &todo_path, request.require_todos)?;
+                    let transition_message = MessageRecord::Llm(LlmMessageRecord {
+                        message_id: MessageId::new(),
+                        timestamp: SystemTime::now(),
+                        content: format!(
+                            "planning complete; transitioning to execution\n{}",
+                            render_execution_handoff(&handoff)
+                        ),
+                    });
+                    step_messages.push(transition_message.clone());
+                    all_messages.push(transition_message.clone());
+                    planning_prompt_messages.push(transition_message);
+                    execution_handoff = Some(handoff);
+                    phase = TurnPhase::Execution;
+                    execution_prompt_messages = vec![all_messages[0].clone()];
+
+                    let step = StepRecord {
+                        step_id: step_id.clone(),
+                        step_number,
+                        started_at: step_started_at,
+                        ended_at: SystemTime::now(),
+                        prompt,
+                        decision: Some(decision),
+                        messages: step_messages,
+                        outcome: StepOutcomeKind::Continue,
+                        usage: step_usage,
+                    };
+                    steps.push(step);
+                    sink.record(RuntimeEvent::StepEnded {
+                        turn_id: turn_id.clone(),
+                        step_id: step_id.clone(),
+                        executor: main_executor.clone(),
+                        at: SystemTime::now(),
+                    });
+                    continue;
+                }
                 ModelStepDecision::Final { content } => {
+                    if phase == TurnPhase::Planning {
+                        if let Some(handoff) = infer_execution_handoff_from_legacy_planning(
+                            &content,
+                            request.require_todos,
+                            &todo_path,
+                        )? {
+                            let transition_message = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: format!(
+                                    "planning complete; transitioning to execution\n{}",
+                                    render_execution_handoff(&handoff)
+                                ),
+                            });
+                            step_messages.push(transition_message.clone());
+                            all_messages.push(transition_message.clone());
+                            planning_prompt_messages.push(transition_message);
+                            execution_handoff = Some(handoff);
+                            phase = TurnPhase::Execution;
+                            execution_prompt_messages = vec![all_messages[0].clone()];
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+
+                        let rendered = if should_skip_final_answer_render(&content) {
+                            FinalAnswerRenderResponse {
+                                canonical_text: content.clone(),
+                                display_text: content.clone(),
+                                usage: UsageSummary::default(),
+                            }
+                        } else {
+                            self.render_final_answer(
+                                &request,
+                                &planning_prompt_messages,
+                                request.model_config.clone(),
+                                &content,
+                                &turn_policy_context,
+                                load_todo_prompt_context(&todo_path)?.as_ref(),
+                                sink,
+                                &turn_id,
+                                &step_id,
+                                &main_executor,
+                            )
+                            .await?
+                        };
+                        usage.add_assign(rendered.usage);
+                        let message = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: rendered.canonical_text.clone(),
+                        });
+                        step_messages.push(message.clone());
+                        all_messages.push(message.clone());
+                        planning_prompt_messages.push(message);
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Final,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        return finish_turn(
+                            sink,
+                            turn_id,
+                            turn_started_at,
+                            SystemTime::now(),
+                            steps,
+                            all_messages,
+                            usage,
+                            rendered.canonical_text,
+                            rendered.display_text,
+                            TerminationReason::Final,
+                            &main_executor,
+                        );
+                    }
                     if let Some(feedback) = generic_starter_replan_feedback(&todo_path)? {
                         let feedback = MessageRecord::Llm(LlmMessageRecord {
                             message_id: MessageId::new(),
@@ -358,7 +576,7 @@ where
                         });
                         step_messages.push(feedback.clone());
                         all_messages.push(feedback);
-                        prompt_messages
+                        execution_prompt_messages
                             .push(step_messages.last().expect("message just pushed").clone());
 
                         let step = StepRecord {
@@ -383,40 +601,111 @@ where
                     }
                     if let Some(todo_list) = load_todo_list_if_present(&todo_path)? {
                         if let Some((item_index, item)) = todo_list.next_actionable() {
-                            let feedback = MessageRecord::Llm(LlmMessageRecord {
-                                message_id: MessageId::new(),
-                                timestamp: SystemTime::now(),
-                                content: incomplete_todo_final_feedback(
+                            if !allow_blocker_final_for_failed_todo(
+                                &todo_list,
+                                &content,
+                                &all_messages,
+                            ) {
+                                match auto_advance_summary_todo_from_final_content(
+                                    &todo_path,
                                     item_index,
-                                    item.status.as_str(),
                                     &item.text,
+                                    &content,
                                     &html_output_path,
-                                ),
-                            });
-                            step_messages.push(feedback.clone());
-                            all_messages.push(feedback);
-                            prompt_messages
-                                .push(step_messages.last().expect("message just pushed").clone());
+                                )? {
+                                    FinalTodoAdvance::AdvancedWithFeedback(feedback_content) => {
+                                        let content_message =
+                                            MessageRecord::Llm(LlmMessageRecord {
+                                                message_id: MessageId::new(),
+                                                timestamp: SystemTime::now(),
+                                                content: content.clone(),
+                                            });
+                                        step_messages.push(content_message.clone());
+                                        all_messages.push(content_message);
+                                        execution_prompt_messages.push(
+                                            step_messages
+                                                .last()
+                                                .expect("message just pushed")
+                                                .clone(),
+                                        );
 
-                            let step = StepRecord {
-                                step_id: step_id.clone(),
-                                step_number,
-                                started_at: step_started_at,
-                                ended_at: SystemTime::now(),
-                                prompt,
-                                decision: Some(decision),
-                                messages: step_messages,
-                                outcome: StepOutcomeKind::Continue,
-                                usage: step_usage,
-                            };
-                            steps.push(step);
-                            sink.record(RuntimeEvent::StepEnded {
-                                turn_id: turn_id.clone(),
-                                step_id: step_id.clone(),
-                                executor: main_executor.clone(),
-                                at: SystemTime::now(),
-                            });
-                            continue;
+                                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                            message_id: MessageId::new(),
+                                            timestamp: SystemTime::now(),
+                                            content: feedback_content,
+                                        });
+                                        step_messages.push(feedback.clone());
+                                        all_messages.push(feedback);
+                                        execution_prompt_messages.push(
+                                            step_messages
+                                                .last()
+                                                .expect("message just pushed")
+                                                .clone(),
+                                        );
+
+                                        let step = StepRecord {
+                                            step_id: step_id.clone(),
+                                            step_number,
+                                            started_at: step_started_at,
+                                            ended_at: SystemTime::now(),
+                                            prompt,
+                                            decision: Some(decision),
+                                            messages: step_messages,
+                                            outcome: StepOutcomeKind::Continue,
+                                            usage: step_usage,
+                                        };
+                                        steps.push(step);
+                                        sink.record(RuntimeEvent::StepEnded {
+                                            turn_id: turn_id.clone(),
+                                            step_id: step_id.clone(),
+                                            executor: main_executor.clone(),
+                                            at: SystemTime::now(),
+                                        });
+                                        continue;
+                                    }
+                                    FinalTodoAdvance::AdvancedAllDone => {}
+                                    FinalTodoAdvance::Noop => {
+                                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                            message_id: MessageId::new(),
+                                            timestamp: SystemTime::now(),
+                                            content: incomplete_todo_final_feedback(
+                                                item_index,
+                                                item.status.as_str(),
+                                                &item.text,
+                                                &html_output_path,
+                                            ),
+                                        });
+                                        step_messages.push(feedback.clone());
+                                        all_messages.push(feedback);
+                                        execution_prompt_messages.push(
+                                            step_messages
+                                                .last()
+                                                .expect("message just pushed")
+                                                .clone(),
+                                        );
+
+                                        let step = StepRecord {
+                                            step_id: step_id.clone(),
+                                            step_number,
+                                            started_at: step_started_at,
+                                            ended_at: SystemTime::now(),
+                                            prompt,
+                                            decision: Some(decision),
+                                            messages: step_messages,
+                                            outcome: StepOutcomeKind::Continue,
+                                            usage: step_usage,
+                                        };
+                                        steps.push(step);
+                                        sink.record(RuntimeEvent::StepEnded {
+                                            turn_id: turn_id.clone(),
+                                            step_id: step_id.clone(),
+                                            executor: main_executor.clone(),
+                                            at: SystemTime::now(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
                     let rendered = if should_skip_final_answer_render(&content) {
@@ -428,7 +717,7 @@ where
                     } else {
                         self.render_final_answer(
                             &request,
-                            &prompt_messages,
+                            &execution_prompt_messages,
                             request.model_config.clone(),
                             &content,
                             &turn_policy_context,
@@ -448,7 +737,7 @@ where
                     });
                     step_messages.push(message.clone());
                     all_messages.push(message);
-                    prompt_messages
+                    execution_prompt_messages
                         .push(step_messages.last().expect("message just pushed").clone());
 
                     let step = StepRecord {
@@ -478,76 +767,225 @@ where
                     );
                 }
                 ModelStepDecision::DelegateSubagent { delegation } => {
-                    if let Some(feedback) =
-                        generic_starter_replan_feedback_for_delegation(&todo_path, &delegation)?
-                    {
-                        let feedback = MessageRecord::Llm(LlmMessageRecord {
-                            message_id: MessageId::new(),
-                            timestamp: SystemTime::now(),
-                            content: feedback,
-                        });
-                        step_messages.push(feedback.clone());
-                        all_messages.push(feedback);
-                        prompt_messages
-                            .push(step_messages.last().expect("message just pushed").clone());
-
-                        let step = StepRecord {
-                            step_id: step_id.clone(),
-                            step_number,
-                            started_at: step_started_at,
-                            ended_at: SystemTime::now(),
-                            prompt,
-                            decision: Some(decision),
-                            messages: step_messages,
-                            outcome: StepOutcomeKind::Continue,
-                            usage: step_usage,
-                        };
-                        steps.push(step);
-                        sink.record(RuntimeEvent::StepEnded {
-                            turn_id: turn_id.clone(),
-                            step_id: step_id.clone(),
-                            executor: main_executor.clone(),
-                            at: SystemTime::now(),
-                        });
-                        continue;
-                    }
-                    if let Some(feedback) =
-                        concrete_plan_replan_feedback_for_delegation(&todo_path, &delegation)?
-                    {
-                        let feedback = MessageRecord::Llm(LlmMessageRecord {
-                            message_id: MessageId::new(),
-                            timestamp: SystemTime::now(),
-                            content: feedback,
-                        });
-                        step_messages.push(feedback.clone());
-                        all_messages.push(feedback);
-                        prompt_messages
-                            .push(step_messages.last().expect("message just pushed").clone());
-
-                        let step = StepRecord {
-                            step_id: step_id.clone(),
-                            step_number,
-                            started_at: step_started_at,
-                            ended_at: SystemTime::now(),
-                            prompt,
-                            decision: Some(decision),
-                            messages: step_messages,
-                            outcome: StepOutcomeKind::Continue,
-                            usage: step_usage,
-                        };
-                        steps.push(step);
-                        sink.record(RuntimeEvent::StepEnded {
-                            turn_id: turn_id.clone(),
-                            step_id: step_id.clone(),
-                            executor: main_executor.clone(),
-                            at: SystemTime::now(),
-                        });
-                        continue;
-                    }
-                    if let Some(feedback) = mcp_collection_feedback_for_delegation(
+                    let mut delegation_phase = phase;
+                    if should_auto_transition_to_execution(
+                        phase,
+                        request.require_todos,
                         &todo_path,
                         &delegation,
-                        !mcp_session.servers.is_empty(),
+                    ) {
+                        let handoff = ExecutionHandoff {
+                            todo_required: false,
+                            answer_brief: String::new(),
+                            summary: "Planning inferred a direct execution path from the requested delegated action.".to_owned(),
+                            selected_sources: Vec::new(),
+                            key_facts: Vec::new(),
+                            execution_strategy: delegation.goal.clone(),
+                            risks_and_constraints: Vec::new(),
+                            todo_path: None,
+                        };
+                        let transition_message = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: format!(
+                                "planning complete; transitioning to execution\n{}",
+                                render_execution_handoff(&handoff)
+                            ),
+                        });
+                        step_messages.push(transition_message.clone());
+                        all_messages.push(transition_message.clone());
+                        planning_prompt_messages.push(transition_message);
+                        execution_handoff = Some(handoff);
+                        phase = TurnPhase::Execution;
+                        delegation_phase = TurnPhase::Execution;
+                        execution_prompt_messages = vec![all_messages[0].clone()];
+                    }
+                    let Some(configured_subagent) =
+                        validate_delegation_subagent(&subagent_registry, &delegation)
+                    else {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: invalid_subagent_feedback(&subagent_registry, &delegation),
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        push_prompt_message_for_phase(
+                            delegation_phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            step_messages.last().expect("message just pushed").clone(),
+                        );
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    };
+                    let resolved_subagent_type = configured_subagent.subagent_type.clone();
+
+                    if delegation_phase == TurnPhase::Execution {
+                        if let Some(feedback) = generic_starter_replan_feedback_for_delegation(
+                            &todo_path,
+                            &delegation,
+                            &resolved_subagent_type,
+                        )? {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: feedback,
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            execution_prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+                        if let Some(feedback) = concrete_plan_replan_feedback_for_delegation(
+                            &todo_path,
+                            &delegation,
+                            &resolved_subagent_type,
+                        )? {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: feedback,
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            execution_prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+                        if let Some(feedback) = repeated_blocked_mcp_delegation_feedback(
+                            &all_messages,
+                            &delegation,
+                            &resolved_subagent_type,
+                        ) {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: feedback,
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            execution_prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+                        if let Some(feedback) = mcp_collection_feedback_for_delegation(
+                            &todo_path,
+                            &delegation,
+                            &resolved_subagent_type,
+                            !mcp_session.servers.is_empty(),
+                        )? {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: feedback,
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            execution_prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
+
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
+                    }
+                    if let Some(feedback) = disabled_mcp_capability_feedback_for_delegation(
+                        mcp_session,
+                        &delegation,
+                        &resolved_subagent_type,
                     )? {
                         let feedback = MessageRecord::Llm(LlmMessageRecord {
                             message_id: MessageId::new(),
@@ -556,8 +994,12 @@ where
                         });
                         step_messages.push(feedback.clone());
                         all_messages.push(feedback);
-                        prompt_messages
-                            .push(step_messages.last().expect("message just pushed").clone());
+                        push_prompt_message_for_phase(
+                            delegation_phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            step_messages.last().expect("message just pushed").clone(),
+                        );
 
                         let step = StepRecord {
                             step_id: step_id.clone(),
@@ -579,108 +1021,93 @@ where
                         });
                         continue;
                     }
-                    if let Some(feedback) =
-                        disabled_mcp_capability_feedback_for_delegation(mcp_session, &delegation)?
-                    {
-                        let feedback = MessageRecord::Llm(LlmMessageRecord {
-                            message_id: MessageId::new(),
-                            timestamp: SystemTime::now(),
-                            content: feedback,
-                        });
-                        step_messages.push(feedback.clone());
-                        all_messages.push(feedback);
-                        prompt_messages
-                            .push(step_messages.last().expect("message just pushed").clone());
+                    if delegation_phase == TurnPhase::Execution {
+                        if let Some(feedback) = html_todo_feedback_for_delegation(
+                            &todo_path,
+                            &delegation,
+                            &html_output_path,
+                        )? {
+                            let feedback = MessageRecord::Llm(LlmMessageRecord {
+                                message_id: MessageId::new(),
+                                timestamp: SystemTime::now(),
+                                content: feedback,
+                            });
+                            step_messages.push(feedback.clone());
+                            all_messages.push(feedback);
+                            execution_prompt_messages
+                                .push(step_messages.last().expect("message just pushed").clone());
 
-                        let step = StepRecord {
-                            step_id: step_id.clone(),
-                            step_number,
-                            started_at: step_started_at,
-                            ended_at: SystemTime::now(),
-                            prompt,
-                            decision: Some(decision),
-                            messages: step_messages,
-                            outcome: StepOutcomeKind::Continue,
-                            usage: step_usage,
-                        };
-                        steps.push(step);
-                        sink.record(RuntimeEvent::StepEnded {
-                            turn_id: turn_id.clone(),
-                            step_id: step_id.clone(),
-                            executor: main_executor.clone(),
-                            at: SystemTime::now(),
-                        });
-                        continue;
-                    }
-                    if let Some(feedback) =
-                        html_todo_feedback_for_delegation(&todo_path, &delegation, &html_output_path)?
-                    {
-                        let feedback = MessageRecord::Llm(LlmMessageRecord {
-                            message_id: MessageId::new(),
-                            timestamp: SystemTime::now(),
-                            content: feedback,
-                        });
-                        step_messages.push(feedback.clone());
-                        all_messages.push(feedback);
-                        prompt_messages
-                            .push(step_messages.last().expect("message just pushed").clone());
-
-                        let step = StepRecord {
-                            step_id: step_id.clone(),
-                            step_number,
-                            started_at: step_started_at,
-                            ended_at: SystemTime::now(),
-                            prompt,
-                            decision: Some(decision),
-                            messages: step_messages,
-                            outcome: StepOutcomeKind::Continue,
-                            usage: step_usage,
-                        };
-                        steps.push(step);
-                        sink.record(RuntimeEvent::StepEnded {
-                            turn_id: turn_id.clone(),
-                            step_id: step_id.clone(),
-                            executor: main_executor.clone(),
-                            at: SystemTime::now(),
-                        });
-                        continue;
+                            let step = StepRecord {
+                                step_id: step_id.clone(),
+                                step_number,
+                                started_at: step_started_at,
+                                ended_at: SystemTime::now(),
+                                prompt,
+                                decision: Some(decision),
+                                messages: step_messages,
+                                outcome: StepOutcomeKind::Continue,
+                                usage: step_usage,
+                            };
+                            steps.push(step);
+                            sink.record(RuntimeEvent::StepEnded {
+                                turn_id: turn_id.clone(),
+                                step_id: step_id.clone(),
+                                executor: main_executor.clone(),
+                                at: SystemTime::now(),
+                            });
+                            continue;
+                        }
                     }
                     let llm_message = MessageRecord::Llm(LlmMessageRecord {
                         message_id: MessageId::new(),
                         timestamp: SystemTime::now(),
                         content: format!(
                             "delegating to sub-agent `{}` for target `{}`",
-                            delegation.subagent_type,
+                            resolved_subagent_type,
                             delegation.target.summary()
                         ),
                     });
                     step_messages.push(llm_message.clone());
                     all_messages.push(llm_message);
-                    prompt_messages
-                        .push(step_messages.last().expect("message just pushed").clone());
+                    push_prompt_message_for_phase(
+                        delegation_phase,
+                        &mut planning_prompt_messages,
+                        &mut execution_prompt_messages,
+                        step_messages.last().expect("message just pushed").clone(),
+                    );
 
                     let subagent_call =
                         MessageRecord::SubAgentCall(crate::state::SubAgentCallMessageRecord {
                             message_id: MessageId::new(),
                             timestamp: SystemTime::now(),
-                            subagent_type: delegation.subagent_type.clone(),
+                            subagent_type: resolved_subagent_type.clone(),
                             goal: delegation.goal.clone(),
                             target: delegation.target.clone(),
                         });
                     step_messages.push(subagent_call.clone());
                     all_messages.push(subagent_call);
-                    prompt_messages
-                        .push(step_messages.last().expect("message just pushed").clone());
+                    push_prompt_message_for_phase(
+                        delegation_phase,
+                        &mut planning_prompt_messages,
+                        &mut execution_prompt_messages,
+                        step_messages.last().expect("message just pushed").clone(),
+                    );
                     sink.record(RuntimeEvent::HandoffToSubagent {
                         turn_id: turn_id.clone(),
                         step_id: step_id.clone(),
                         executor: main_executor.clone(),
                         at: SystemTime::now(),
-                        subagent_type: delegation.subagent_type.clone(),
+                        subagent_type: resolved_subagent_type.clone(),
                         goal: delegation.goal.clone(),
                         target: delegation.target.clone(),
                     });
-                    sync_mcp_todo_before_delegation(&todo_path, &delegation)?;
+                    if delegation_phase == TurnPhase::Execution {
+                        sync_mcp_todo_before_delegation(
+                            &todo_path,
+                            &delegation,
+                            &resolved_subagent_type,
+                        )?;
+                    }
 
                     let (subagent_result_message, maybe_execution) = self
                         .run_subagent(
@@ -688,7 +1115,8 @@ where
                             &tool_policy_engine,
                             &subagent_registry,
                             mcp_session,
-                            &delegation.subagent_type,
+                            delegation_phase,
+                            &resolved_subagent_type,
                             &delegation.target,
                             &delegation.goal,
                             &all_messages,
@@ -699,7 +1127,9 @@ where
                         )
                         .await?;
                     if let MessageRecord::SubAgentResult(record) = &subagent_result_message {
-                        sync_mcp_todo_after_delegation(&todo_path, record)?;
+                        if delegation_phase == TurnPhase::Execution {
+                            sync_mcp_todo_after_delegation(&todo_path, record)?;
+                        }
                         sink.record(RuntimeEvent::HandoffToMainAgent {
                             turn_id: turn_id.clone(),
                             step_id: step_id.clone(),
@@ -715,11 +1145,16 @@ where
                     usage.add_assign(maybe_execution.usage);
                     for trace_message in maybe_execution.trace_messages {
                         step_messages.push(trace_message.clone());
-                        all_messages.push(trace_message);
+                        all_messages.push(trace_message.clone());
                     }
                     step_messages.push(subagent_result_message.clone());
                     all_messages.push(subagent_result_message.clone());
-                    prompt_messages.push(subagent_result_message);
+                    push_prompt_message_for_phase(
+                        delegation_phase,
+                        &mut planning_prompt_messages,
+                        &mut execution_prompt_messages,
+                        subagent_result_message,
+                    );
 
                     let step = StepRecord {
                         step_id: step_id.clone(),
@@ -762,6 +1197,7 @@ where
     async fn generate_validated_step(
         &self,
         step_number: u32,
+        phase: TurnPhase,
         prompt: crate::state::PromptSnapshot,
         model_config: crate::state::ModelConfig,
         registered_tools: Vec<ToolDescriptor>,
@@ -787,6 +1223,7 @@ where
             self.model_adapter.generate_step(
                 crate::model::ModelStepRequest {
                     step_number,
+                    phase,
                     prompt,
                     model_config,
                     registered_tools,
@@ -818,6 +1255,7 @@ where
         tool_policy_engine: &ToolPolicyEngine,
         registry: &SubagentRegistry,
         mcp_session: &mut McpSession,
+        phase: TurnPhase,
         subagent_type: &str,
         target: &DelegationTarget,
         goal: &str,
@@ -837,13 +1275,20 @@ where
         let todo_path = todo_file_path(&request.working_directory, turn_id);
         let html_output_path = deterministic_html_output_path(&request.working_directory, turn_id);
         let turn_policy_context = TurnPolicyPromptContext {
+            phase,
             html_output_path: html_output_path.clone(),
-            require_todos: request.require_todos,
+            force_todo_file: request.require_todos,
+            execution_todo_required: if phase == TurnPhase::Planning {
+                None
+            } else {
+                Some(todo_path.exists())
+            },
         };
         let base_prompt = build_subagent_prompt(
             &request.subagent_registry_path,
             configured,
             mcp_session,
+            phase,
             target,
             goal,
             &request.user_message,
@@ -873,25 +1318,27 @@ where
             let registered_tools = build_subagent_tool_catalog(mcp_session, target);
             let tool_mask_plan = match registered_tools {
                 Ok(registered_tools) => {
+                    let filtered_tools = filter_subagent_tools_for_phase(
+                        phase,
+                        configured.subagent_type.as_str(),
+                        registered_tools,
+                    );
                     let plan = tool_policy_engine.evaluate(
                         &ToolPolicyContext {
                             executor: configured.subagent_type.clone(),
                             response_client: request.response_target.client,
-                            phase: ToolPolicyPhase::DelegatedExecution,
+                            phase: if phase == TurnPhase::Planning {
+                                ToolPolicyPhase::DelegatedPlanning
+                            } else {
+                                ToolPolicyPhase::DelegatedExecution
+                            },
                             environment: None,
                             working_directory: request.working_directory.clone(),
                         },
-                        &registered_tools,
+                        &filtered_tools,
                     );
-                    emit_tool_mask_debug(
-                        sink,
-                        turn_id,
-                        step_id,
-                        &executor,
-                        &plan,
-                        &registered_tools,
-                    );
-                    (registered_tools, plan)
+                    emit_tool_mask_debug(sink, turn_id, step_id, &executor, &plan, &filtered_tools);
+                    (filtered_tools, plan)
                 }
                 Err(error) => {
                     let plan = crate::policy::ToolMaskPlan::terminal_only(error.to_string());
@@ -1614,9 +2061,10 @@ where
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
                     if was_error {
-                        if let Some(detail) =
-                            immediate_partial_detail_for_local_tool_error(&tool_name, &result_summary)
-                        {
+                        if let Some(detail) = immediate_partial_detail_for_local_tool_error(
+                            &tool_name,
+                            &result_summary,
+                        ) {
                             return Ok((
                                 subagent_result_message(
                                     subagent_type,
@@ -1759,6 +2207,113 @@ where
             }
         }
     }
+}
+
+fn push_prompt_message_for_phase(
+    phase: TurnPhase,
+    planning_prompt_messages: &mut Vec<MessageRecord>,
+    execution_prompt_messages: &mut Vec<MessageRecord>,
+    message: MessageRecord,
+) {
+    match phase {
+        TurnPhase::Planning => planning_prompt_messages.push(message),
+        TurnPhase::Execution => execution_prompt_messages.push(message),
+    }
+}
+
+fn normalize_planning_outcome(
+    mut outcome: PlanningOutcome,
+    force_todo_file: bool,
+    todo_path: &Path,
+) -> Result<Option<PlanningOutcome>, RuntimeError> {
+    outcome.planning_complete = true;
+    outcome.todo_required |= force_todo_file || todo_path.exists();
+    if outcome.planning_summary.trim().is_empty() {
+        outcome.planning_summary = if outcome.todo_required {
+            "Planning identified a concrete execution workflow and requires a todo file.".to_owned()
+        } else {
+            "Planning determined this turn can execute without a todo file.".to_owned()
+        };
+    }
+    if outcome.execution_strategy.trim().is_empty() {
+        outcome.execution_strategy = outcome.planning_summary.clone();
+    }
+    if outcome.todo_required && !todo_path.exists() && outcome.todo_items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(outcome))
+}
+
+fn materialize_planning_outcome(
+    outcome: &PlanningOutcome,
+    todo_path: &Path,
+    force_todo_file: bool,
+) -> Result<ExecutionHandoff, RuntimeError> {
+    let todo_required = outcome.todo_required || force_todo_file || todo_path.exists();
+    if todo_required && !todo_path.exists() {
+        TodoList::initialize(&outcome.todo_items)?.save_to_path(todo_path)?;
+    }
+    let mut normalized = outcome.clone();
+    normalized.todo_required = todo_required;
+    Ok(normalized.into_execution_handoff(todo_required.then(|| todo_path.to_path_buf())))
+}
+
+fn infer_execution_handoff_from_legacy_planning(
+    summary: &str,
+    force_todo_file: bool,
+    todo_path: &Path,
+) -> Result<Option<ExecutionHandoff>, RuntimeError> {
+    let todo_required = force_todo_file || todo_path.exists();
+    if force_todo_file && !todo_path.exists() {
+        return Ok(None);
+    }
+    if todo_required {
+        let todo_list = TodoList::load_from_path(todo_path)?;
+        let todo_items = todo_list.items.into_iter().map(|item| item.text).collect();
+        let outcome = PlanningOutcome {
+            planning_complete: true,
+            answer_brief: String::new(),
+            todo_required: true,
+            planning_summary: summary.to_owned(),
+            selected_sources: Vec::new(),
+            discovered_facts: Vec::new(),
+            execution_strategy: summary.to_owned(),
+            todo_items,
+            risks_and_constraints: Vec::new(),
+        };
+        return Ok(Some(materialize_planning_outcome(
+            &outcome,
+            todo_path,
+            force_todo_file,
+        )?));
+    }
+    Ok(None)
+}
+
+fn should_auto_transition_to_execution(
+    phase: TurnPhase,
+    force_todo_file: bool,
+    todo_path: &Path,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> bool {
+    phase == TurnPhase::Planning
+        && !force_todo_file
+        && !todo_path.exists()
+        && !is_todo_planning_goal(&delegation.goal)
+}
+
+fn filter_subagent_tools_for_phase(
+    phase: TurnPhase,
+    subagent_type: &str,
+    tools: Vec<ToolDescriptor>,
+) -> Vec<ToolDescriptor> {
+    if phase != TurnPhase::Planning || subagent_type != "tool-executor" {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|tool| matches!(tool.name.as_str(), "glob" | "read_file" | "write_todos"))
+        .collect()
 }
 
 #[derive(Default)]
@@ -1923,11 +2478,12 @@ fn generic_starter_replan_feedback(todo_path: &Path) -> Result<Option<String>, R
 fn generic_starter_replan_feedback_for_delegation(
     todo_path: &Path,
     delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
 ) -> Result<Option<String>, RuntimeError> {
     if !todo_starts_with_generic_scaffold(todo_path)? {
         return Ok(None);
     }
-    if delegation.subagent_type == "tool-executor"
+    if resolved_subagent_type == "tool-executor"
         && matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
         && is_todo_planning_goal(&delegation.goal)
     {
@@ -1939,8 +2495,9 @@ fn generic_starter_replan_feedback_for_delegation(
 fn concrete_plan_replan_feedback_for_delegation(
     todo_path: &Path,
     delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
 ) -> Result<Option<String>, RuntimeError> {
-    if delegation.subagent_type != "tool-executor"
+    if resolved_subagent_type != "tool-executor"
         || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
         || !is_todo_planning_goal(&delegation.goal)
     {
@@ -1971,31 +2528,24 @@ fn concrete_plan_replan_feedback_for_delegation(
 
 fn is_todo_planning_goal(goal: &str) -> bool {
     let goal = goal.to_lowercase();
-    let mentions_planning = goal.contains("todo") || goal.contains("replan") || goal.contains("plan");
+    let mentions_planning =
+        goal.contains("todo") || goal.contains("replan") || goal.contains("plan");
     let mentions_execution = [
-        "execute",
-        "complete",
-        "finish",
-        "continue",
-        "run",
-        "perform",
-        "workflow",
+        "execute", "complete", "finish", "continue", "run", "perform", "workflow",
     ]
     .iter()
     .any(|term| goal.contains(term));
-    mentions_planning
-        && !goal.contains("html")
-        && !goal.contains("browser")
-        && !mentions_execution
+    mentions_planning && !goal.contains("html") && !goal.contains("browser") && !mentions_execution
 }
 
 fn mcp_collection_feedback_for_delegation(
     todo_path: &Path,
     delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
     mcp_available: bool,
 ) -> Result<Option<String>, RuntimeError> {
     if !mcp_available
-        || delegation.subagent_type != "tool-executor"
+        || resolved_subagent_type != "tool-executor"
         || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
     {
         return Ok(None);
@@ -2042,8 +2592,9 @@ fn tool_executor_mcp_todo_partial_feedback(
 fn disabled_mcp_capability_feedback_for_delegation(
     mcp_session: &McpSession,
     delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
 ) -> Result<Option<String>, RuntimeError> {
-    if delegation.subagent_type != "mcp-executor" {
+    if resolved_subagent_type != "mcp-executor" {
         return Ok(None);
     }
     let DelegationTarget::McpCapability(target) = &delegation.target else {
@@ -2053,11 +2604,9 @@ fn disabled_mcp_capability_feedback_for_delegation(
         .servers
         .get(&target.server_name)
         .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
-    let Some(reason) = disabled_mcp_capability_reason(
-        server,
-        &target.capability_kind,
-        &target.capability_id,
-    ) else {
+    let Some(reason) =
+        disabled_mcp_capability_reason(server, &target.capability_kind, &target.capability_id)
+    else {
         return Ok(None);
     };
 
@@ -2071,7 +2620,10 @@ fn disabled_mcp_capability_feedback_for_delegation(
             target.server_name
         ),
     };
-    let server_guidance = render_mcp_server_guidance(server).replace('\n', " ").trim().to_owned();
+    let server_guidance = render_mcp_server_guidance(server)
+        .replace('\n', " ")
+        .trim()
+        .to_owned();
 
     Ok(Some(format!(
         "The selected MCP capability cannot be used: {reason}. {scope_hint} {server_guidance}"
@@ -2089,6 +2641,9 @@ fn todo_step_prefers_mcp_executor(text: &str) -> bool {
         "table",
         "database",
         "dataset",
+        "sql",
+        "aggregation",
+        "aggregations",
         "discover",
         "inspect",
         "workspace inputs",
@@ -2114,9 +2669,10 @@ fn todo_step_prefers_mcp_executor(text: &str) -> bool {
 
 fn sync_mcp_todo_before_delegation(
     todo_path: &Path,
-    delegation: &crate::model::SubagentDelegationRequest,
+    _delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
 ) -> Result<(), RuntimeError> {
-    if delegation.subagent_type != "mcp-executor" {
+    if resolved_subagent_type != "mcp-executor" {
         return Ok(());
     }
     let Some(mut todo_list) = load_todo_list_if_present(todo_path)? else {
@@ -2160,7 +2716,10 @@ fn sync_mcp_todo_after_delegation(
             todo_list.save_to_path(todo_path)?;
         }
         "partial" => {
-            if record.executed_action_count > 0
+            if mcp_partial_indicates_blocking_failure(&record.detail) {
+                todo_list.set_status(item_index, crate::todo::TodoStatus::Failed)?;
+                todo_list.save_to_path(todo_path)?;
+            } else if record.executed_action_count > 0
                 && todo_can_complete_from_partial_mcp_collection(&item.text)
             {
                 todo_list.set_status(item_index, crate::todo::TodoStatus::Completed)?;
@@ -2174,6 +2733,151 @@ fn sync_mcp_todo_after_delegation(
         _ => {}
     }
     Ok(())
+}
+
+fn repeated_blocked_mcp_delegation_feedback(
+    messages: &[MessageRecord],
+    delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
+) -> Option<String> {
+    if resolved_subagent_type != "mcp-executor" {
+        return None;
+    }
+    let mut last_result: Option<&crate::state::SubAgentResultMessageRecord> = None;
+    let mut last_call: Option<&crate::state::SubAgentCallMessageRecord> = None;
+    for message in messages.iter().rev() {
+        match message {
+            MessageRecord::SubAgentResult(record)
+                if last_result.is_none() && record.subagent_type == "mcp-executor" =>
+            {
+                last_result = Some(record);
+            }
+            MessageRecord::SubAgentCall(record)
+                if last_result.is_some()
+                    && last_call.is_none()
+                    && record.subagent_type == "mcp-executor" =>
+            {
+                last_call = Some(record);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (last_result, last_call) = match (last_result, last_call) {
+        (Some(result), Some(call)) => (result, call),
+        _ => return None,
+    };
+    if !matches!(last_result.status.as_str(), "partial" | "cannot_execute")
+        || !mcp_partial_indicates_blocking_failure(&last_result.detail)
+        || last_call.target.summary() != delegation.target.summary()
+        || !goals_are_materially_similar(&last_call.goal, &delegation.goal)
+    {
+        return None;
+    }
+    Some(format!(
+        "The previous `mcp-executor` attempt for target `{}` already stopped because this MCP path is blocked: {} Do not delegate the same blocked MCP path again in this turn. Either replan around the failed todo if a todo file is present, switch to a materially different next step, or return a blocker summary with the confirmed findings gathered so far.",
+        delegation.target.summary(),
+        truncate_for_log(&last_result.detail, 220)
+    ))
+}
+
+fn validate_delegation_subagent<'a>(
+    registry: &'a SubagentRegistry,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> Option<&'a ConfiguredSubagent> {
+    registry.get_enabled(delegation.subagent_type.trim()).ok()
+}
+
+fn invalid_subagent_feedback(
+    registry: &SubagentRegistry,
+    delegation: &crate::model::SubagentDelegationRequest,
+) -> String {
+    let requested = delegation.subagent_type.trim();
+    let valid_subagents = registry
+        .enabled_cards()
+        .into_iter()
+        .map(|card| format!("`{}`", card.subagent_type))
+        .collect::<Vec<_>>();
+    let valid_subagents = if valid_subagents.is_empty() {
+        "No enabled sub-agents are configured.".to_owned()
+    } else {
+        format!(
+            "Valid sub-agents for this turn are: {}.",
+            valid_subagents.join(", ")
+        )
+    };
+    let target_hint = match delegation.target {
+        DelegationTarget::LocalToolsScope(_) => {
+            "For local workspace inspection, Python scripts, report generation, and browser-open work, use `tool-executor`."
+        }
+        DelegationTarget::McpCapability(_) | DelegationTarget::McpServerScope(_) => {
+            "For MCP discovery, schema inspection, counts, ranges, and data collection, use `mcp-executor`."
+        }
+    };
+    if requested.is_empty() {
+        format!(
+            "The `delegate_subagent` decision is invalid because `type` is blank. Re-emit `delegate_subagent` with a configured sub-agent type. {valid_subagents} {target_hint}"
+        )
+    } else {
+        format!(
+            "The requested sub-agent `{requested}` is not configured or is disabled. Re-emit `delegate_subagent` with one of the configured sub-agent types. {valid_subagents} {target_hint}"
+        )
+    }
+}
+
+fn mcp_partial_indicates_blocking_failure(detail: &str) -> bool {
+    let detail = detail.to_lowercase();
+    detail.contains("repeated mcp failures forced an early stop")
+        || detail.contains("duplicate mcp tool call")
+        || detail.contains("duplicate mcp resource read")
+        || contains_postgres_transaction_session_error(&detail)
+        || detail.contains("duplicate-call")
+}
+
+fn should_cycle_mcp_connection_after_success(server: &PreparedServer, tool_name: &str) -> bool {
+    server.full_catalog.server.protocol_name == "postgres-mcp" && tool_name == "query"
+}
+
+fn should_retry_postgres_query_session_error(
+    server: &PreparedServer,
+    tool_name: &str,
+    result_summary: &str,
+) -> bool {
+    should_cycle_mcp_connection_after_success(server, tool_name)
+        && contains_postgres_transaction_session_error(&result_summary.to_lowercase())
+}
+
+fn contains_postgres_transaction_session_error(text: &str) -> bool {
+    text.contains("set_session cannot be used inside a transaction")
+        || text.contains("transaction/session")
+}
+
+fn goals_are_materially_similar(left: &str, right: &str) -> bool {
+    let left_tokens = normalized_goal_tokens(left);
+    let right_tokens = normalized_goal_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+    let overlap = left_tokens.intersection(&right_tokens).count();
+    overlap >= 3
+}
+
+fn normalized_goal_tokens(goal: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "that", "this", "then", "into", "using", "use", "via",
+        "after", "before", "your", "their", "them", "into", "through", "need", "build", "complete",
+        "report", "analysis",
+    ];
+    goal.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() < 4 || STOPWORDS.contains(&token.as_str()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
 }
 
 fn todo_can_complete_from_partial_mcp_collection(text: &str) -> bool {
@@ -2199,8 +2903,8 @@ fn todo_can_complete_from_partial_mcp_collection(text: &str) -> bool {
         .iter()
         .any(|prefix| text.starts_with(prefix))
         || collection_prefixes
-        .iter()
-        .any(|prefix| text.starts_with(prefix));
+            .iter()
+            .any(|prefix| text.starts_with(prefix));
     let is_follow_on_analysis = (text.starts_with("compute")
         && !hybrid_collection_prefixes
             .iter()
@@ -2299,6 +3003,187 @@ fn reconcile_active_todo_from_turn_trace(
     Ok(())
 }
 
+fn reconcile_pending_mcp_todos_from_turn_trace(
+    todo_path: &Path,
+    messages: &[MessageRecord],
+) -> Result<(), RuntimeError> {
+    let Some(mut todos) = load_todo_list_if_present(todo_path)? else {
+        return Ok(());
+    };
+    let Some(segment) = latest_mcp_execution_segment(messages) else {
+        return Ok(());
+    };
+    if segment.result.executed_action_count == 0 {
+        return Ok(());
+    }
+
+    let status = segment.result.status.as_str();
+    if status == "cannot_execute"
+        || (status == "partial" && mcp_partial_indicates_blocking_failure(&segment.result.detail))
+    {
+        return Ok(());
+    }
+
+    let evidence = render_mcp_execution_evidence(&segment);
+    let mut changed = false;
+
+    loop {
+        let Some((item_index, item)) = todos.next_actionable() else {
+            break;
+        };
+        if item.status != crate::todo::TodoStatus::Pending
+            || !todo_step_prefers_mcp_executor(&item.text)
+        {
+            break;
+        }
+
+        let should_complete = match status {
+            "completed" => mcp_execution_evidence_satisfies_todo(&evidence, &item.text),
+            "partial" => {
+                todo_can_complete_from_partial_mcp_collection(&item.text)
+                    && mcp_execution_evidence_satisfies_todo(&evidence, &item.text)
+            }
+            _ => false,
+        };
+        if !should_complete {
+            break;
+        }
+
+        todos.set_status(item_index, crate::todo::TodoStatus::InProgress)?;
+        todos.set_status(item_index, crate::todo::TodoStatus::Completed)?;
+        changed = true;
+    }
+
+    if changed {
+        todos.save_to_path(todo_path)?;
+    }
+
+    Ok(())
+}
+
+struct LatestMcpExecutionSegment<'a> {
+    messages: &'a [MessageRecord],
+    result: &'a crate::state::SubAgentResultMessageRecord,
+}
+
+fn latest_mcp_execution_segment(
+    messages: &[MessageRecord],
+) -> Option<LatestMcpExecutionSegment<'_>> {
+    let result_index = messages.iter().rposition(|message| {
+        matches!(
+            message,
+            MessageRecord::SubAgentResult(record) if record.subagent_type == "mcp-executor"
+        )
+    })?;
+    let MessageRecord::SubAgentResult(result) = &messages[result_index] else {
+        return None;
+    };
+    let call_index = messages[..result_index].iter().rposition(|message| {
+        matches!(
+            message,
+            MessageRecord::SubAgentCall(record) if record.subagent_type == "mcp-executor"
+        )
+    })?;
+    Some(LatestMcpExecutionSegment {
+        messages: &messages[call_index..=result_index],
+        result,
+    })
+}
+
+fn render_mcp_execution_evidence(segment: &LatestMcpExecutionSegment<'_>) -> String {
+    segment
+        .messages
+        .iter()
+        .map(|message| match message {
+            MessageRecord::SubAgentCall(record) => {
+                format!(
+                    "subagent goal {} target {}",
+                    record.goal,
+                    record.target.summary()
+                )
+            }
+            MessageRecord::McpCall(record) => format!(
+                "mcp call target {} args {}",
+                record.target.capability_id, record.arguments
+            ),
+            MessageRecord::McpResult(record) => {
+                format!("mcp result {}", record.result_summary)
+            }
+            MessageRecord::SubAgentResult(record) => {
+                format!("subagent detail {}", record.detail)
+            }
+            _ => String::new(),
+        })
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mcp_execution_evidence_satisfies_todo(evidence: &str, todo_text: &str) -> bool {
+    let evidence_tokens = normalized_runtime_tokens(evidence);
+    let todo_tokens = normalized_runtime_tokens(todo_text);
+    if evidence_tokens.is_empty() || todo_tokens.is_empty() {
+        return false;
+    }
+
+    let overlap = todo_tokens.intersection(&evidence_tokens).count();
+    let required_overlap = if todo_tokens.len() >= 10 {
+        4
+    } else if todo_tokens.len() >= 6 {
+        3
+    } else {
+        2
+    };
+
+    overlap >= required_overlap
+}
+
+fn normalized_runtime_tokens(text: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "then",
+        "into",
+        "using",
+        "use",
+        "via",
+        "after",
+        "before",
+        "your",
+        "their",
+        "them",
+        "need",
+        "build",
+        "perform",
+        "brief",
+        "compact",
+        "exact",
+        "useful",
+        "couple",
+        "without",
+        "overextending",
+        "scope",
+        "across",
+        "table",
+        "tables",
+    ];
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() < 4 || STOPWORDS.contains(&token.as_str()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
+}
+
 fn incomplete_todo_final_feedback(
     item_index: usize,
     item_status: &str,
@@ -2321,6 +3206,173 @@ fn incomplete_todo_final_feedback(
     format!(
         "Cannot finish the turn yet because the todo plan is incomplete. Next actionable todo: {item_index}. [{item_status}] {item_text}. Continue execution instead of returning a final answer."
     )
+}
+
+enum FinalTodoAdvance {
+    Noop,
+    AdvancedWithFeedback(String),
+    AdvancedAllDone,
+}
+
+fn auto_advance_summary_todo_from_final_content(
+    todo_path: &Path,
+    item_index: usize,
+    item_text: &str,
+    content: &str,
+    html_output_path: &Path,
+) -> Result<FinalTodoAdvance, RuntimeError> {
+    if !todo_text_looks_like_summary_step(item_text)
+        || content_looks_like_blocker_summary(content)
+        || content.trim().len() < 60
+    {
+        return Ok(FinalTodoAdvance::Noop);
+    }
+
+    let mut todo_list = match load_todo_list_if_present(todo_path)? {
+        Some(todo_list) => todo_list,
+        None => return Ok(FinalTodoAdvance::Noop),
+    };
+    let Some((current_index, current_item)) = todo_list.next_actionable() else {
+        return Ok(FinalTodoAdvance::Noop);
+    };
+    if current_index != item_index || current_item.text != item_text {
+        return Ok(FinalTodoAdvance::Noop);
+    }
+
+    todo_list
+        .set_status(item_index, crate::todo::TodoStatus::InProgress)
+        .map_err(RuntimeError::Todo)?;
+    todo_list
+        .set_status(item_index, crate::todo::TodoStatus::Completed)
+        .map_err(RuntimeError::Todo)?;
+    todo_list
+        .save_to_path(todo_path)
+        .map_err(RuntimeError::Todo)?;
+
+    let feedback = todo_list.next_actionable().map(|(next_index, next_item)| {
+        format!(
+            "The previous answer draft already satisfied todo {item_index} and has been recorded for this turn. Do not repeat it. {}",
+            incomplete_todo_final_feedback(
+                next_index,
+                next_item.status.as_str(),
+                &next_item.text,
+                html_output_path,
+            )
+        )
+    });
+
+    Ok(match feedback {
+        Some(content) => FinalTodoAdvance::AdvancedWithFeedback(content),
+        None => FinalTodoAdvance::AdvancedAllDone,
+    })
+}
+
+fn todo_text_looks_like_summary_step(item_text: &str) -> bool {
+    if item_text == MANDATORY_TODO_GENERATE_HTML || item_text == MANDATORY_TODO_OPEN_HTML {
+        return false;
+    }
+
+    let normalized = item_text.to_ascii_lowercase();
+    let padded = format!(" {normalized} ");
+    let summary_markers = [
+        "return ",
+        "summary",
+        "summarize",
+        "summarise",
+        "report",
+        "business-readable",
+        "business readable",
+        "business-style",
+        "business style",
+        "concise",
+        "tell the user",
+        "provide",
+        "answer",
+    ];
+    let execution_markers = [
+        " inspect ",
+        " query ",
+        " compute ",
+        " calculate ",
+        " find ",
+        " check ",
+        " collect ",
+        " extract ",
+        " load ",
+        " run ",
+        "generate an output html",
+        "open the generated output html",
+    ];
+
+    summary_markers
+        .iter()
+        .any(|marker| padded.contains(marker))
+        && !execution_markers
+            .iter()
+            .any(|marker| padded.contains(marker))
+}
+
+fn allow_blocker_final_for_failed_todo(
+    todo_list: &TodoList,
+    content: &str,
+    messages: &[MessageRecord],
+) -> bool {
+    let Some((_, item)) = todo_list.next_actionable() else {
+        return false;
+    };
+    if item.status != crate::todo::TodoStatus::Failed {
+        return false;
+    }
+    if !content_looks_like_blocker_summary(content) {
+        return false;
+    }
+
+    messages
+        .iter()
+        .rev()
+        .any(message_indicates_execution_blocker)
+}
+
+fn content_looks_like_blocker_summary(content: &str) -> bool {
+    let normalized = content.to_lowercase();
+    let blocker_terms = [
+        "i'm blocked",
+        "i am blocked",
+        "cannot continue",
+        "can't continue",
+        "unable to continue",
+        "need a different",
+        "different execution route",
+        "fresh execution path",
+        "alternate allowed",
+        "blocked mcp path",
+        "duplicate query",
+    ];
+    blocker_terms.iter().any(|term| normalized.contains(term))
+}
+
+fn message_indicates_execution_blocker(message: &MessageRecord) -> bool {
+    match message {
+        MessageRecord::SubAgentResult(record) => {
+            if !matches!(record.status.as_str(), "partial" | "cannot_execute") {
+                return false;
+            }
+            let detail = record.detail.to_lowercase();
+            detail.contains("blocked")
+                || detail.contains("duplicate")
+                || detail.contains("cannot execute")
+                || detail.contains("repeated mcp failures")
+                || detail.contains("forced an early stop")
+        }
+        MessageRecord::Llm(record) => {
+            let content = record.content.to_lowercase();
+            content.contains("do not delegate the same blocked mcp path again")
+                || content.contains("selected mcp capability cannot be used")
+                || content.contains("the previous `mcp-executor` attempt")
+                || content.contains("blocked mcp path")
+        }
+        _ => false,
+    }
 }
 
 fn todo_can_complete_from_partial_local_inspection(text: &str) -> bool {
@@ -2360,7 +3412,7 @@ fn html_todo_feedback_for_delegation(
     };
     let goal = delegation.goal.to_lowercase();
 
-    if item.text == MANDATORY_TODO_GENERATE_HTML && goal_mentions_html_open(&goal) {
+    if todo_matches_generate_html(item.text.as_str()) && goal_mentions_html_open(&goal) {
         return Ok(Some(format!(
             "The current next actionable todo is only the HTML-generation step: {item_index}. [{}] {}. Do not bundle the browser-open step into the same `tool-executor` delegation. Generate the deterministic HTML report at `{}` first, return control immediately, and open it only when the next actionable todo becomes `{}`.",
             item.status.as_str(),
@@ -2370,19 +3422,21 @@ fn html_todo_feedback_for_delegation(
         )));
     }
 
-    if item.text == MANDATORY_TODO_OPEN_HTML && goal_mentions_html_generation(&goal) {
+    if todo_matches_open_html(item.text.as_str()) && goal_mentions_html_generation(&goal) {
         return Ok(Some(format!(
-            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not regenerate the HTML report in this delegation. Only open the existing deterministic HTML report at `{}` in the browser.",
+            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not regenerate the HTML report in this delegation. Only open the existing deterministic HTML report at `{}` in the browser by delegating `tool-executor` and using local `bash` with `open {}`.",
             item.status.as_str(),
             item.text,
+            html_output_path.display(),
             html_output_path.display()
         )));
     }
-    if item.text == MANDATORY_TODO_OPEN_HTML && !goal_is_open_only(&goal) {
+    if todo_matches_open_html(item.text.as_str()) && !goal_is_open_only(&goal) {
         return Ok(Some(format!(
-            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not delegate any broader `tool-executor` work here. Only open the existing deterministic HTML report at `{}` in the browser, then return control.",
+            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not delegate any broader `tool-executor` work here. Only open the existing deterministic HTML report at `{}` in the browser by delegating `tool-executor` and using local `bash` with `open {}`, then return control.",
             item.status.as_str(),
             item.text,
+            html_output_path.display(),
             html_output_path.display()
         )));
     }
@@ -2390,6 +3444,7 @@ fn html_todo_feedback_for_delegation(
     Ok(None)
 }
 
+#[cfg(test)]
 fn should_require_todos_for_turn(
     user_message: &str,
     conversation_history: &[crate::state::ConversationMessage],
@@ -2398,6 +3453,7 @@ fn should_require_todos_for_turn(
         || is_simple_factual_follow_up_turn(user_message, conversation_history))
 }
 
+#[cfg(test)]
 fn is_simple_factual_turn(user_message: &str) -> bool {
     let normalized = user_message
         .split_whitespace()
@@ -2472,6 +3528,7 @@ fn is_simple_factual_turn(user_message: &str) -> bool {
     normalized.ends_with('?') && normalized.split_whitespace().count() <= 12
 }
 
+#[cfg(test)]
 fn is_simple_factual_follow_up_turn(
     user_message: &str,
     conversation_history: &[crate::state::ConversationMessage],
@@ -2488,6 +3545,7 @@ fn is_simple_factual_follow_up_turn(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn is_short_contextual_follow_up(user_message: &str) -> bool {
     let normalized = user_message
         .split_whitespace()
@@ -2520,18 +3578,13 @@ fn is_short_contextual_follow_up(user_message: &str) -> bool {
         return true;
     }
 
-    [
-        "try again",
-        "go ahead",
-        "please do",
-        "do it",
-        "continue",
-    ]
-    .iter()
-    .any(|phrase| trimmed.starts_with(phrase))
+    ["try again", "go ahead", "please do", "do it", "continue"]
+        .iter()
+        .any(|phrase| trimmed.starts_with(phrase))
         || is_short_metric_clarification_follow_up(&trimmed)
 }
 
+#[cfg(test)]
 fn is_short_metric_clarification_follow_up(user_message: &str) -> bool {
     if user_message.len() > 90 || user_message.contains('?') {
         return false;
@@ -2578,6 +3631,20 @@ fn goal_mentions_html_open(goal: &str) -> bool {
             || goal.contains("html")
             || goal.contains("report")
             || goal.contains("page"))
+}
+
+fn todo_matches_generate_html(text: &str) -> bool {
+    text == MANDATORY_TODO_GENERATE_HTML
+        || (text.to_lowercase().contains("html")
+            && text.to_lowercase().contains("chart")
+            && text.to_lowercase().contains("table"))
+}
+
+fn todo_matches_open_html(text: &str) -> bool {
+    text == MANDATORY_TODO_OPEN_HTML
+        || (text.to_lowercase().contains("open")
+            && text.to_lowercase().contains("html")
+            && text.to_lowercase().contains("browser"))
 }
 
 fn goal_mentions_html_generation(goal: &str) -> bool {
@@ -2669,20 +3736,33 @@ fn observed_html_open(
             if record.status != "ok" || !record.result_summary.contains("exit_code: 0") {
                 return false;
             }
-            let opened_absolute = record.result_summary.contains(&format!("open {absolute}"));
-            let opened_relative = relative
-                .as_ref()
-                .is_some_and(|path| record.result_summary.contains(&format!("open {path}")));
+            let opened_absolute =
+                bash_result_opened_path(record.result_summary.as_str(), &absolute);
+            let opened_relative = relative.as_ref().is_some_and(|path| {
+                bash_result_opened_path(record.result_summary.as_str(), path)
+                    || bash_result_opened_path(record.result_summary.as_str(), &format!("./{path}"))
+            });
             opened_absolute || opened_relative
         }
         _ => false,
     })
 }
 
+fn bash_result_opened_path(summary: &str, path: &str) -> bool {
+    [
+        format!("open {path}"),
+        format!("open '{path}'"),
+        format!("open \"{path}\""),
+    ]
+    .iter()
+    .any(|pattern| summary.contains(pattern))
+}
+
 fn build_subagent_prompt(
     registry_path: &Path,
     configured: &ConfiguredSubagent,
     mcp_session: &McpSession,
+    phase: TurnPhase,
     target: &DelegationTarget,
     goal: &str,
     user_message: &str,
@@ -2713,8 +3793,12 @@ fn build_subagent_prompt(
                 .servers
                 .get(&target.server_name)
                 .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
-            let template =
-                load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
+            let template = load_subagent_prompt(
+                &registry_dir,
+                configured,
+                phase,
+                &server.full_catalog_markdown,
+            )?;
             let recent_results_block =
                 render_recent_mcp_results_context_for_mcp(current_turn_messages);
             let confirmed_tables_block =
@@ -2756,8 +3840,12 @@ fn build_subagent_prompt(
                 .servers
                 .get(&target.server_name)
                 .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
-            let template =
-                load_subagent_prompt(&registry_dir, configured, &server.full_catalog_markdown)?;
+            let template = load_subagent_prompt(
+                &registry_dir,
+                configured,
+                phase,
+                &server.full_catalog_markdown,
+            )?;
             let recent_results_block =
                 render_recent_mcp_results_context_for_mcp(current_turn_messages);
             let confirmed_tables_block =
@@ -2770,7 +3858,8 @@ fn build_subagent_prompt(
             ))
         }
         DelegationTarget::LocalToolsScope(scope) => {
-            let template = load_subagent_prompt(&registry_dir, configured, "Local tool catalog")?;
+            let template =
+                load_subagent_prompt(&registry_dir, configured, phase, "Local tool catalog")?;
             let tools_block = builtin_local_tool_catalog()
                 .into_iter()
                 .map(|tool| {
@@ -2789,8 +3878,22 @@ fn build_subagent_prompt(
             } else {
                 ""
             };
+            let explicit_open_guidance = if configured.subagent_type == "tool-executor" {
+                load_todo_prompt_context(todo_path)?
+                    .and_then(|todo_context| todo_context.next_actionable)
+                    .filter(|next| next.contains(MANDATORY_TODO_OPEN_HTML))
+                    .map(|_| {
+                        format!(
+                            "- The current actionable todo is the browser-open step. Execute it with local `bash` using `open {}`. Do not say that no local tool action is available for this step.\n",
+                            turn_policy_context.html_output_path.display()
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n- Deterministic HTML output path: {}\n- If todos are optional and no todo file exists, complete the HTML report and browser-open workflow for analysis/reporting work before finishing.\n- When todo context is present, update only the current todo item, and replan only the future pending suffix.\n{planning_only_block}{turn_policy_block}{todo_block}\n{}\n## Local Tools\n{}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n- Deterministic HTML output path: {}\n- If todos are optional and no todo file exists, complete the HTML report and browser-open workflow for analysis/reporting work before finishing.\n- When todo context is present, update only the current todo item, and replan only the future pending suffix.\n{explicit_open_guidance}{planning_only_block}{turn_policy_block}{todo_block}\n{}\n## Local Tools\n{}",
                 scope.scope,
                 working_directory.display(),
                 turn_policy_context.html_output_path.display(),
@@ -3278,6 +4381,11 @@ fn prompt_section_summary(prompt: &crate::state::PromptSnapshot) -> String {
 
 fn model_step_decision_summary(decision: &ModelStepDecision) -> String {
     match decision {
+        ModelStepDecision::PlanningComplete { outcome } => format!(
+            "planning_complete: todo_required={}, summary={}",
+            outcome.todo_required,
+            truncate_for_log(&outcome.planning_summary, 120)
+        ),
         ModelStepDecision::Final { content } => {
             format!("final_answer: {}", truncate_for_log(content, 160))
         }
@@ -3619,62 +4727,90 @@ async fn execute_tool_call(
         .get_mut(server_name)
         .ok_or_else(|| RuntimeError::UnknownServer(server_name.to_string()))?;
     lookup_tool(&server.full_catalog, tool_name)?;
-    ensure_connection(server).await?;
-    info!(
-        server = %server_name,
-        tool = tool_name,
-        timeout_ms = timeout_duration.as_millis() as u64,
-        "starting MCP tool call"
-    );
-    let result = timeout(
-        timeout_duration,
-        server
-            .connection
-            .as_ref()
-            .expect("connection should exist")
-            .call_tool(
-                &McpToolName::new(tool_name.to_owned()).map_err(RuntimeError::McpClient)?,
-                arguments,
-            ),
-    )
-    .await;
-    match result {
-        Ok(Ok(value)) => {
-            if value.is_error {
+    let should_cycle_success = should_cycle_mcp_connection_after_success(server, tool_name);
+    let mut retried_postgres_session_error = false;
+    loop {
+        ensure_connection(server).await?;
+        info!(
+            server = %server_name,
+            tool = tool_name,
+            timeout_ms = timeout_duration.as_millis() as u64,
+            "starting MCP tool call"
+        );
+        let result = timeout(
+            timeout_duration,
+            server
+                .connection
+                .as_ref()
+                .expect("connection should exist")
+                .call_tool(
+                    &McpToolName::new(tool_name.to_owned()).map_err(RuntimeError::McpClient)?,
+                    arguments.clone(),
+                ),
+        )
+        .await;
+        match result {
+            Ok(Ok(value)) => {
+                if value.is_error {
+                    let result_summary = summarize_tool_result(&value);
+                    if !retried_postgres_session_error
+                        && should_retry_postgres_query_session_error(
+                            server,
+                            tool_name,
+                            &result_summary,
+                        )
+                    {
+                        warn!(
+                            server = %server_name,
+                            tool = tool_name,
+                            "postgres MCP query hit a transaction/session error; resetting connection and retrying once"
+                        );
+                        server.connection.take();
+                        retried_postgres_session_error = true;
+                        continue;
+                    }
+                    warn!(
+                        server = %server_name,
+                        tool = tool_name,
+                        "MCP tool returned isError=true; resetting connection"
+                    );
+                    server.connection.take();
+                } else if should_cycle_success {
+                    info!(
+                        server = %server_name,
+                        tool = tool_name,
+                        "completed MCP tool call; cycling connection for postgres session hygiene"
+                    );
+                    server.connection.take();
+                } else {
+                    info!(
+                        server = %server_name,
+                        tool = tool_name,
+                        "completed MCP tool call"
+                    );
+                }
+                return Ok(value);
+            }
+            Ok(Err(error)) => {
                 warn!(
                     server = %server_name,
                     tool = tool_name,
-                    "MCP tool returned isError=true; resetting connection"
+                    error = %error,
+                    "MCP tool call failed; resetting connection"
                 );
                 server.connection.take();
-            } else {
-                info!(
+                return Err(RuntimeError::McpClient(error));
+            }
+            Err(_) => {
+                warn!(
                     server = %server_name,
                     tool = tool_name,
-                    "completed MCP tool call"
+                    timeout_ms = timeout_duration.as_millis() as u64,
+                    "MCP tool call timed out; resetting connection"
                 );
+                server.connection.take();
+                return Err(RuntimeError::Timeout("MCP call timed out".to_owned()));
             }
-            Ok(value)
-        }
-        Ok(Err(error)) => {
-            warn!(
-                server = %server_name,
-                tool = tool_name,
-                error = %error,
-                "MCP tool call failed; resetting connection"
-            );
-            server.connection.take();
-            Err(RuntimeError::McpClient(error))
-        }
-        Err(_) => {
-            warn!(
-                server = %server_name,
-                tool = tool_name,
-                timeout_ms = timeout_duration.as_millis() as u64,
-                "MCP tool call timed out; resetting connection"
-            );
-            server.connection.take();
-            Err(RuntimeError::Timeout("MCP call timed out".to_owned()))
         }
     }
 }
@@ -4087,32 +5223,36 @@ mod tests {
 
     use crate::{
         ids::MessageId,
+        model::TurnPhase,
         prompt::TurnPolicyPromptContext,
         state::{
             ConversationMessage, ConversationRole, DelegationTarget, LocalToolName,
             LocalToolResultMessageRecord, LocalToolsScopeTarget, McpCallMessageRecord,
             McpCapabilityTarget, McpResultMessageRecord, McpServerScopeTarget, MessageRecord,
-            ServerName, SubAgentResultMessageRecord,
+            ServerName, SubAgentCallMessageRecord, SubAgentResultMessageRecord,
         },
-        subagent::ConfiguredSubagent,
+        subagent::{ConfiguredSubagent, SubagentRegistry},
         todo::{
-            GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML,
-            TodoList, TodoStatus,
+            GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoList,
+            TodoStatus,
         },
     };
 
     use super::{
-        McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON, PreparedServer,
-        build_subagent_prompt, build_subagent_tool_catalog, disabled_mcp_capability_reason,
-        disabled_mcp_capability_feedback_for_delegation,
+        FinalTodoAdvance, McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON, PreparedServer,
+        auto_advance_summary_todo_from_final_content,
+        build_subagent_prompt, build_subagent_tool_catalog,
+        disabled_mcp_capability_feedback_for_delegation, disabled_mcp_capability_reason,
         generic_starter_replan_feedback_for_delegation, html_todo_feedback_for_delegation,
         immediate_partial_detail_for_local_tool_error, incomplete_todo_final_feedback,
-        mcp_collection_feedback_for_delegation, reconcile_active_todo_from_turn_trace,
-        reconcile_mandatory_todos_from_turn_trace, render_confirmed_table_context,
+        invalid_subagent_feedback, mcp_collection_feedback_for_delegation,
+        reconcile_active_todo_from_turn_trace, reconcile_mandatory_todos_from_turn_trace,
+        reconcile_pending_mcp_todos_from_turn_trace, render_confirmed_table_context,
         render_recent_mcp_results_context, sanitize_mcp_tool_arguments,
-        should_require_todos_for_turn, sync_mcp_todo_after_delegation,
-        sync_mcp_todo_before_delegation,
-        tool_executor_mcp_todo_partial_feedback,
+        should_cycle_mcp_connection_after_success, should_require_todos_for_turn,
+        should_retry_postgres_query_session_error, sync_mcp_todo_after_delegation,
+        sync_mcp_todo_before_delegation, tool_executor_mcp_todo_partial_feedback,
+        validate_delegation_subagent,
     };
 
     #[test]
@@ -4170,6 +5310,7 @@ mod tests {
             &McpSession {
                 servers: HashMap::new(),
             },
+            TurnPhase::Execution,
             &DelegationTarget::LocalToolsScope(LocalToolsScopeTarget {
                 scope: "workspace".to_owned(),
             }),
@@ -4178,8 +5319,10 @@ mod tests {
             Path::new("/tmp/arka-session"),
             Path::new("/tmp/arka-session/turn-1/todos.txt"),
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
                 html_output_path: PathBuf::from("/tmp/arka-session/outputs/turn-1-report.html"),
-                require_todos: false,
+                force_todo_file: false,
+                execution_todo_required: Some(false),
             },
             &messages,
         )
@@ -4187,7 +5330,7 @@ mod tests {
 
         assert!(prompt.contains("## Recent Computed Results"));
         assert!(prompt.contains("\"new_users\""));
-        assert!(prompt.contains("write them into a local file"));
+        assert!(prompt.contains("Assume `pandas` and `numpy` are available"));
         assert!(prompt.contains("## Local Tools"));
     }
 
@@ -4259,6 +5402,70 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_mandatory_todos_marks_open_completed_for_quoted_bash_open() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-quoted-open-reconcile");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = working_directory
+            .join("outputs")
+            .join("turn-quoted-open-reconcile-report.html");
+        std::fs::create_dir_all(
+            html_output_path
+                .parent()
+                .expect("html output parent should exist"),
+        )
+        .expect("outputs dir should exist");
+
+        let mut todos = TodoList::initialize(&["Prepare the report.".to_owned()])
+            .expect("todo init should succeed");
+        todos
+            .set_status(1, crate::todo::TodoStatus::InProgress)
+            .expect("item 1 should enter in_progress");
+        todos
+            .set_status(1, crate::todo::TodoStatus::Completed)
+            .expect("item 1 should complete");
+        todos
+            .set_status(2, crate::todo::TodoStatus::InProgress)
+            .expect("html generation should enter in_progress");
+        todos
+            .set_status(2, crate::todo::TodoStatus::Completed)
+            .expect("html generation should complete");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let messages = vec![MessageRecord::LocalToolResult(
+            LocalToolResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                tool_name: LocalToolName::new("bash").expect("valid tool"),
+                status: "ok".to_owned(),
+                result_summary: format!(
+                    "command: open '{}'\nexit_code: 0",
+                    html_output_path.display()
+                ),
+                error: None,
+            },
+        )];
+
+        reconcile_mandatory_todos_from_turn_trace(
+            &todo_path,
+            &html_output_path,
+            &working_directory,
+            &messages,
+        )
+        .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[2].text, MANDATORY_TODO_OPEN_HTML);
+        assert_eq!(
+            reconciled.items[2].status,
+            crate::todo::TodoStatus::Completed
+        );
+    }
+
+    #[test]
     fn reconcile_mandatory_todos_marks_html_completed_when_report_was_written_via_bash() {
         let working_directory = workspace_root();
         let turn_dir = working_directory.join("turn-1-bash-html");
@@ -4276,9 +5483,8 @@ mod tests {
         std::fs::write(&html_output_path, "<html><body>report</body></html>")
             .expect("html report should exist");
 
-        let mut todos =
-            TodoList::initialize(&["Determine Dhoni's IPL 2025 runs.".to_owned()])
-                .expect("todo init should succeed");
+        let mut todos = TodoList::initialize(&["Determine Dhoni's IPL 2025 runs.".to_owned()])
+            .expect("todo init should succeed");
         todos
             .set_status(1, crate::todo::TodoStatus::InProgress)
             .expect("item 1 should enter in_progress");
@@ -4306,9 +5512,8 @@ mod tests {
                 timestamp: SystemTime::now(),
                 tool_name: LocalToolName::new("bash").expect("valid tool"),
                 status: "ok".to_owned(),
-                result_summary:
-                    "command: open outputs/turn-1-bash-html-report.html\nexit_code: 0"
-                        .to_owned(),
+                result_summary: "command: open outputs/turn-1-bash-html-report.html\nexit_code: 0"
+                    .to_owned(),
                 error: None,
             }),
         ];
@@ -4345,7 +5550,9 @@ mod tests {
             "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
             message_id: MessageId::new(),
@@ -4361,7 +5568,10 @@ mod tests {
             .expect("reconciliation should succeed");
 
         let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
-        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::Completed);
+        assert_eq!(
+            reconciled.items[0].status,
+            crate::todo::TodoStatus::Completed
+        );
         assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Pending);
     }
 
@@ -4376,7 +5586,9 @@ mod tests {
             "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
             message_id: MessageId::new(),
@@ -4394,7 +5606,10 @@ mod tests {
             .expect("reconciliation should succeed");
 
         let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
-        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::Completed);
+        assert_eq!(
+            reconciled.items[0].status,
+            crate::todo::TodoStatus::Completed
+        );
         assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Pending);
     }
 
@@ -4409,7 +5624,9 @@ mod tests {
             "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
             message_id: MessageId::new(),
@@ -4425,7 +5642,113 @@ mod tests {
             .expect("reconciliation should succeed without mutating the starter");
 
         let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
-        assert_eq!(reconciled.items[0].status, crate::todo::TodoStatus::InProgress);
+        assert_eq!(
+            reconciled.items[0].status,
+            crate::todo::TodoStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn reconcile_pending_mcp_todos_advances_multiple_grounded_collection_steps() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-trace-reconcile");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+
+        let todos = TodoList::parse(
+            "1. [completed] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.\n2. [pending] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.\n3. [pending] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.\n4. [pending] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.\n5. [pending] Generate an output HTML page with charts and tables.\n6. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let messages = vec![
+            MessageRecord::SubAgentCall(SubAgentCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                goal: "Analyze Virat Kohli's IPL batting performance using the IPL database."
+                    .to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: server_name.clone(),
+                }),
+            }),
+            MessageRecord::McpCall(McpCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                arguments: serde_json::json!({
+                    "sql": "select player_id, player_name from players where player_name ilike '%Kohli%';"
+                }),
+            }),
+            MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                result_summary:
+                    "Confirmed Virat Kohli as player_id 135 and verified batting events are available in deliveries plus innings summaries."
+                        .to_owned(),
+                error: None,
+            }),
+            MessageRecord::McpCall(McpCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                arguments: serde_json::json!({
+                    "sql": "select season, runs, dismissals, strike_rate from virat_kohli_ipl_summary;"
+                }),
+            }),
+            MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                result_summary:
+                    "Computed Virat Kohli's overall IPL batting summary, season-wise run totals, dismissals, and strike rate."
+                        .to_owned(),
+                error: None,
+            }),
+            MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 2,
+                detail: "Virat Kohli identified as player_id 135. Overall IPL batting summary and season-wise totals were computed.".to_owned(),
+                tool_mask: None,
+            }),
+        ];
+
+        reconcile_pending_mcp_todos_from_turn_trace(&todo_path, &messages)
+            .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(
+            reconciled.items[1].status,
+            crate::todo::TodoStatus::Completed
+        );
+        assert_eq!(
+            reconciled.items[2].status,
+            crate::todo::TodoStatus::Completed
+        );
+        assert_eq!(reconciled.items[3].status, crate::todo::TodoStatus::Pending);
     }
 
     #[test]
@@ -4441,12 +5764,91 @@ mod tests {
         assert!(html_feedback.contains("mandatory deliverable is still incomplete"));
         assert!(html_feedback.contains("Delegate `tool-executor`"));
         assert!(html_feedback.contains("/tmp/arka-session/outputs/turn-1-report.html"));
-        assert!(html_feedback.contains("Do not ask `tool-executor` to open the report in the same delegation"));
+        assert!(
+            html_feedback
+                .contains("Do not ask `tool-executor` to open the report in the same delegation")
+        );
 
-        let open_feedback =
-            incomplete_todo_final_feedback(4, "pending", MANDATORY_TODO_OPEN_HTML, &html_output_path);
+        let open_feedback = incomplete_todo_final_feedback(
+            4,
+            "pending",
+            MANDATORY_TODO_OPEN_HTML,
+            &html_output_path,
+        );
         assert!(open_feedback.contains("report still needs to be opened"));
         assert!(open_feedback.contains("open the generated HTML report"));
+    }
+
+    #[test]
+    fn auto_advance_summary_todo_from_final_content_marks_summary_step_completed() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-auto-advance-summary");
+        std::fs::create_dir_all(turn_dir.join("outputs")).expect("outputs dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Inspect schema\n2. [completed] Compute captaincy record\n3. [pending] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let content = "Rohit Sharma's IPL captaincy record is 228 matches as captain, with 125 wins, 99 losses, 4 ties, and 0 no-results, for a 54.82% win rate. Caveat: captaincy is inferred from the available captain-designation field in the match data.";
+        let outcome = auto_advance_summary_todo_from_final_content(
+            &todo_path,
+            3,
+            "Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.",
+            content,
+            &html_output_path,
+        )
+        .expect("auto-advance should succeed");
+
+        let feedback = match outcome {
+            FinalTodoAdvance::AdvancedWithFeedback(feedback) => feedback,
+            _ => panic!("summary todo should advance to the HTML step"),
+        };
+        assert!(feedback.contains("satisfied todo 3"));
+        assert!(feedback.contains(MANDATORY_TODO_GENERATE_HTML));
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(
+            reconciled.items[2].status,
+            crate::todo::TodoStatus::Completed
+        );
+        assert_eq!(reconciled.items[3].status, crate::todo::TodoStatus::Pending);
+    }
+
+    #[test]
+    fn auto_advance_summary_todo_from_final_content_does_not_advance_compute_step() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-auto-advance-compute");
+        std::fs::create_dir_all(turn_dir.join("outputs")).expect("outputs dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Inspect schema\n2. [pending] Compute Rohit Sharma's IPL captaincy record from the confirmed fields.\n3. [pending] Return the computed record in a concise cricket summary.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let content = "Rohit Sharma's IPL captaincy record is 228 matches as captain, with 125 wins and 99 losses.";
+        let outcome = auto_advance_summary_todo_from_final_content(
+            &todo_path,
+            2,
+            "Compute Rohit Sharma's IPL captaincy record from the confirmed fields.",
+            content,
+            &html_output_path,
+        )
+        .expect("auto-advance should succeed");
+
+        assert!(matches!(outcome, FinalTodoAdvance::Noop));
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Pending);
     }
 
     #[test]
@@ -4483,13 +5885,17 @@ mod tests {
             "1. [completed] Fetch the answer\n2. [in_progress] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let feedback = html_todo_feedback_for_delegation(
             &todo_path,
             &crate::model::SubagentDelegationRequest {
                 subagent_type: "tool-executor".to_owned(),
-                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
                 goal: "Generate the deterministic HTML report and open it in the browser."
                     .to_owned(),
             },
@@ -4514,7 +5920,9 @@ mod tests {
             "1. [completed] Fetch the answer\n2. [completed] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let feedback = html_todo_feedback_for_delegation(
             &todo_path,
@@ -4531,6 +5939,7 @@ mod tests {
         let feedback = feedback.expect("feedback should be present");
         assert!(feedback.contains("Only open the existing deterministic HTML report"));
         assert!(feedback.contains("Do not delegate any broader `tool-executor` work"));
+        assert!(feedback.contains("using local `bash` with `open"));
     }
 
     #[test]
@@ -4564,7 +5973,10 @@ mod tests {
             "yes, in IPL",
             &conversation_history,
         ));
-        assert!(!should_require_todos_for_turn("retry", &conversation_history));
+        assert!(!should_require_todos_for_turn(
+            "retry",
+            &conversation_history
+        ));
         assert!(!should_require_todos_for_turn(
             "best fielder is somebody who has taken the most catches",
             &conversation_history,
@@ -4605,12 +6017,52 @@ mod tests {
                 target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
                 goal: "Replace the generic todo scaffold and execute a comprehensive Hardik Pandya performance report workflow.".to_owned(),
             },
+            "tool-executor",
         )
         .expect("feedback should compute");
 
         let feedback = feedback.expect("feedback should be present");
         assert!(feedback.contains("planning-only"));
         assert!(feedback.contains("return control immediately"));
+    }
+
+    #[test]
+    fn validate_delegation_subagent_accepts_display_name_and_returns_canonical_type() {
+        let registry = test_subagent_registry();
+        let configured = validate_delegation_subagent(
+            &registry,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "Tool Executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Inspect workspace files".to_owned(),
+            },
+        )
+        .expect("display-name delegation should resolve");
+
+        assert_eq!(configured.subagent_type, "tool-executor");
+        assert_eq!(configured.display_name, "Tool Executor");
+    }
+
+    #[test]
+    fn invalid_subagent_feedback_is_actionable_for_blank_type() {
+        let registry = test_subagent_registry();
+        let feedback = invalid_subagent_feedback(
+            &registry,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "   ".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Inspect the workspace and generate a report".to_owned(),
+            },
+        );
+
+        assert!(feedback.contains("`type` is blank"));
+        assert!(feedback.contains("`tool-executor`"));
+        assert!(feedback.contains("`mcp-executor`"));
+        assert!(feedback.contains("local workspace inspection"));
     }
 
     #[test]
@@ -4623,15 +6075,20 @@ mod tests {
             "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Compute insights\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let feedback = mcp_collection_feedback_for_delegation(
             &todo_path,
             &crate::model::SubagentDelegationRequest {
                 subagent_type: "tool-executor".to_owned(),
-                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
                 goal: "Collect the season data locally".to_owned(),
             },
+            "tool-executor",
             true,
         )
         .expect("feedback should compute");
@@ -4651,15 +6108,20 @@ mod tests {
             "1. [completed] Clarify the user ask\n2. [pending] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let feedback = mcp_collection_feedback_for_delegation(
             &todo_path,
             &crate::model::SubagentDelegationRequest {
                 subagent_type: "tool-executor".to_owned(),
-                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
                 goal: "Search local inputs for the Dhoni run total".to_owned(),
             },
+            "tool-executor",
             true,
         )
         .expect("feedback should compute");
@@ -4681,9 +6143,9 @@ mod tests {
                     capability_kind: CapabilityKind::Resource,
                     capability_id: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
                 }),
-                goal: "Inspect IPL matches schema and analyze RCB's 2025 performance."
-                    .to_owned(),
+                goal: "Inspect IPL matches schema and analyze RCB's 2025 performance.".to_owned(),
             },
+            "mcp-executor",
         )
         .expect("feedback should compute");
 
@@ -4703,7 +6165,9 @@ mod tests {
             "1. [completed] Define scope\n2. [pending] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         let feedback = tool_executor_mcp_todo_partial_feedback(
             &todo_path,
@@ -4726,7 +6190,9 @@ mod tests {
             "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         sync_mcp_todo_before_delegation(
             &todo_path,
@@ -4737,6 +6203,7 @@ mod tests {
                 }),
                 goal: "Collect season data".to_owned(),
             },
+            "mcp-executor",
         )
         .expect("pre-sync should succeed");
 
@@ -4771,7 +6238,9 @@ mod tests {
             "1. [completed] Understand the requirements\n2. [in_progress] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         sync_mcp_todo_after_delegation(
             &todo_path,
@@ -4794,6 +6263,78 @@ mod tests {
     }
 
     #[test]
+    fn sync_mcp_todo_marks_failed_after_blocking_partial_result() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-blocked-partial");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] Confirm the IPL 2025 season scope.\n2. [in_progress] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "partial".to_owned(),
+                executed_action_count: 2,
+                detail:
+                    "repeated MCP failures forced an early stop after 2 errors and 2 delegated MCP actions. Last failure on server `ipl` capability `query`: set_session cannot be used inside a transaction"
+                        .to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let failed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(failed.items[1].status, TodoStatus::Failed);
+        assert_eq!(failed.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn postgres_query_calls_cycle_connection_after_success() {
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let session = fake_postgres_mcp_session(&server_name);
+        let server = session
+            .servers
+            .get(&server_name)
+            .expect("postgres server should exist");
+
+        assert!(should_cycle_mcp_connection_after_success(server, "query"));
+        assert!(!should_cycle_mcp_connection_after_success(
+            server,
+            "other_tool"
+        ));
+    }
+
+    #[test]
+    fn postgres_query_session_errors_are_retryable() {
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let session = fake_postgres_mcp_session(&server_name);
+        let server = session
+            .servers
+            .get(&server_name)
+            .expect("postgres server should exist");
+
+        assert!(should_retry_postgres_query_session_error(
+            server,
+            "query",
+            "[Text { text: \"Query execution failed: set_session cannot be used inside a transaction\" }]"
+        ));
+        assert!(!should_retry_postgres_query_session_error(
+            server,
+            "query",
+            "[Text { text: \"permission denied for table players\" }]"
+        ));
+    }
+
+    #[test]
     fn sync_mcp_todo_marks_hybrid_compute_or_extract_step_completed_after_partial_result() {
         let working_directory = workspace_root();
         let turn_dir = working_directory.join("turn-mcp-sync-hybrid-partial");
@@ -4803,7 +6344,9 @@ mod tests {
             "1. [completed] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         sync_mcp_todo_after_delegation(
             &todo_path,
@@ -4813,8 +6356,7 @@ mod tests {
                 subagent_type: "mcp-executor".to_owned(),
                 status: "partial".to_owned(),
                 executed_action_count: 1,
-                detail: "Computed the IPL 2025 bowling ranking and returned control."
-                    .to_owned(),
+                detail: "Computed the IPL 2025 bowling ranking and returned control.".to_owned(),
                 tool_mask: None,
             },
         )
@@ -4835,7 +6377,9 @@ mod tests {
             "1. [completed] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
         )
         .expect("seed todos should parse");
-        todos.save_to_path(&todo_path).expect("todo file should write");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
 
         sync_mcp_todo_before_delegation(
             &todo_path,
@@ -4846,6 +6390,7 @@ mod tests {
                 }),
                 goal: "Resolve the failed IPL 2025 bowler-ranking step.".to_owned(),
             },
+            "mcp-executor",
         )
         .expect("pre-sync should succeed");
 
@@ -4869,6 +6414,35 @@ mod tests {
         let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
         assert_eq!(completed.items[1].status, TodoStatus::Completed);
         assert_eq!(completed.items[2].status, TodoStatus::Pending);
+    }
+
+    fn test_subagent_registry() -> SubagentRegistry {
+        SubagentRegistry {
+            subagents: vec![
+                ConfiguredSubagent {
+                    subagent_type: "mcp-executor".to_owned(),
+                    display_name: "Mcp Executor".to_owned(),
+                    purpose: "Run MCP work".to_owned(),
+                    when_to_use: "When MCP is needed".to_owned(),
+                    target_requirements: "mcp target".to_owned(),
+                    result_summary: "Returns MCP results".to_owned(),
+                    prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+                    enabled: true,
+                    model_name: None,
+                },
+                ConfiguredSubagent {
+                    subagent_type: "tool-executor".to_owned(),
+                    display_name: "Tool Executor".to_owned(),
+                    purpose: "Run local tool work".to_owned(),
+                    when_to_use: "When local tools are needed".to_owned(),
+                    target_requirements: "local tools scope".to_owned(),
+                    result_summary: "Returns local tool results".to_owned(),
+                    prompt_path: PathBuf::from("subagents/tool-executor.prompt.md"),
+                    enabled: true,
+                    model_name: None,
+                },
+            ],
+        }
     }
 
     fn fake_mcp_session(server_name: &ServerName) -> McpSession {
@@ -5069,6 +6643,7 @@ mod tests {
             &registry_path,
             &configured,
             &fake_mcp_session(&server_name),
+            TurnPhase::Execution,
             &DelegationTarget::McpServerScope(McpServerScopeTarget {
                 server_name: server_name.clone(),
             }),
@@ -5077,8 +6652,10 @@ mod tests {
             &workspace_root(),
             &workspace_root().join("turn-1").join("todos.txt"),
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
                 html_output_path: workspace_root().join("outputs").join("turn-1-report.html"),
-                require_todos: false,
+                force_todo_file: false,
+                execution_todo_required: Some(false),
             },
             &[],
         )
@@ -5169,16 +6746,21 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "query");
-        assert!(!tools
-            .iter()
-            .any(|tool| tool.name == "postgres://vivek@localhost:5432/ipl/matches/schema"));
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.name == "postgres://vivek@localhost:5432/ipl/matches/schema")
+        );
     }
 
     #[test]
     fn postgres_mcp_schema_resources_are_marked_disabled() {
         let server_name = ServerName::new("ipl").expect("valid server");
         let session = fake_postgres_mcp_session(&server_name);
-        let server = session.servers.get(&server_name).expect("server should exist");
+        let server = session
+            .servers
+            .get(&server_name)
+            .expect("server should exist");
 
         let reason = disabled_mcp_capability_reason(
             server,

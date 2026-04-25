@@ -14,6 +14,7 @@ use std::{
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::model::{ExecutionHandoff, TurnPhase};
 use crate::state::{
     ConversationMessage, McpCapability, MessageRecord, PromptSection, PromptSnapshot,
     ResponseClient, ResponseFormat, ResponseTarget, SubagentCard, format_system_time,
@@ -44,8 +45,10 @@ pub struct PromptAssembler;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnPolicyPromptContext {
+    pub phase: TurnPhase,
     pub html_output_path: PathBuf,
-    pub require_todos: bool,
+    pub force_todo_file: bool,
+    pub execution_todo_required: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +68,7 @@ impl PromptAssembler {
         recent_session_messages: &[MessageRecord],
         current_turn_messages: &[MessageRecord],
         turn_policy_context: &TurnPolicyPromptContext,
+        execution_handoff: Option<&ExecutionHandoff>,
         todo_context: Option<&TodoPromptContext>,
     ) -> PromptSnapshot {
         let mut sections = Vec::new();
@@ -87,6 +91,12 @@ impl PromptAssembler {
             title: "Turn Policy".to_owned(),
             content: render_turn_policy_context(turn_policy_context),
         });
+        if let Some(execution_handoff) = execution_handoff {
+            sections.push(PromptSection {
+                title: "Execution Handoff".to_owned(),
+                content: render_execution_handoff(execution_handoff),
+            });
+        }
         if let Some(todo_context) = todo_context {
             sections.push(PromptSection {
                 title: "Current Turn Todo Plan".to_owned(),
@@ -109,9 +119,21 @@ impl PromptAssembler {
 }
 
 pub fn render_turn_policy_context(turn_policy_context: &TurnPolicyPromptContext) -> String {
+    let phase_summary = match turn_policy_context.phase {
+        TurnPhase::Planning => {
+            "Current phase: planning\nPlanning goal: inspect enough context to build a concrete execution plan. You may discover sources and sample lightly, but do not perform substantive analysis or final delivery work."
+        }
+        TurnPhase::Execution => {
+            "Current phase: execution\nExecution goal: follow the execution handoff and complete the work. Do not redo planning unless recovery is required."
+        }
+    };
+    let todo_summary = match turn_policy_context.execution_todo_required {
+        Some(required) => format!("Execution todo file required: {required}"),
+        None => "Execution todo file required: planning has not decided yet".to_owned(),
+    };
     format!(
-        "Todos required: {}\nDeterministic HTML output: {}\nIf todos are required, a todo file must exist before substantive execution. If the starter todo plan is too coarse, replan the future pending suffix before continuing.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work, generate the HTML report and open it in the browser before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
-        turn_policy_context.require_todos,
+        "{phase_summary}\nDeployment force-todo override: {}\n{todo_summary}\nDeterministic HTML output: {}\nIf a todo file is required for execution, it must exist before substantive execution begins.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work in execution, generate the HTML report and open it in the browser before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
+        turn_policy_context.force_todo_file,
         turn_policy_context.html_output_path.display()
     )
 }
@@ -119,17 +141,14 @@ pub fn render_turn_policy_context(turn_policy_context: &TurnPolicyPromptContext)
 /// Reads the prompt template from disk and replaces supported dynamic tags.
 pub fn load_and_render_system_prompt(
     path: &Path,
+    phase: TurnPhase,
     working_directory: &Path,
     mcp_capabilities: &[McpCapability],
     subagent_cards: &[SubagentCard],
     available_tools: &[ToolDescriptor],
     response_target: &ResponseTarget,
 ) -> Result<String, PromptRenderError> {
-    let template =
-        fs::read_to_string(path).map_err(|source| PromptRenderError::ReadSystemPrompt {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let template = load_phase_prompt_template(path, phase)?;
 
     render_system_prompt(
         &template,
@@ -139,6 +158,40 @@ pub fn load_and_render_system_prompt(
         available_tools,
         response_target,
     )
+}
+
+fn load_phase_prompt_template(path: &Path, phase: TurnPhase) -> Result<String, PromptRenderError> {
+    let Some(config_dir) = path.parent() else {
+        return fs::read_to_string(path).map_err(|source| PromptRenderError::ReadSystemPrompt {
+            path: path.to_path_buf(),
+            source,
+        });
+    };
+    let base_path = config_dir.join("prompt.base.md");
+    let phase_path = config_dir.join(match phase {
+        TurnPhase::Planning => "prompt.planning.md",
+        TurnPhase::Execution => "prompt.execution.md",
+    });
+    if base_path.exists() && phase_path.exists() {
+        let base = fs::read_to_string(&base_path).map_err(|source| {
+            PromptRenderError::ReadSystemPrompt {
+                path: base_path.clone(),
+                source,
+            }
+        })?;
+        let phase_template = fs::read_to_string(&phase_path).map_err(|source| {
+            PromptRenderError::ReadSystemPrompt {
+                path: phase_path.clone(),
+                source,
+            }
+        })?;
+        return Ok(format!("{base}\n\n{phase_template}"));
+    }
+
+    fs::read_to_string(path).map_err(|source| PromptRenderError::ReadSystemPrompt {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn render_system_prompt(
@@ -235,6 +288,72 @@ pub fn render_todo_context(todo_context: &TodoPromptContext) -> String {
         todo_context.todo_path.display(),
         next_actionable,
         todo_context.todo_contents
+    )
+}
+
+pub fn render_execution_handoff(handoff: &ExecutionHandoff) -> String {
+    let answer_brief = if handoff.answer_brief.trim().is_empty() {
+        "None".to_owned()
+    } else {
+        handoff.answer_brief.clone()
+    };
+    let selected_sources = if handoff.selected_sources.is_empty() {
+        "No specific sources were selected during planning.".to_owned()
+    } else {
+        handoff
+            .selected_sources
+            .iter()
+            .map(|source| {
+                format!(
+                    "- kind={:?} id={} rationale={}",
+                    source.source_kind, source.source_id, source.rationale
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let key_facts = if handoff.key_facts.is_empty() {
+        "No planning facts were recorded.".to_owned()
+    } else {
+        handoff
+            .key_facts
+            .iter()
+            .map(|fact| {
+                let evidence = if fact.evidence_source_ids.is_empty() {
+                    "none".to_owned()
+                } else {
+                    fact.evidence_source_ids.join(", ")
+                };
+                format!("- fact={} evidence={}", fact.fact, evidence)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let risks = if handoff.risks_and_constraints.is_empty() {
+        "None recorded.".to_owned()
+    } else {
+        handoff
+            .risks_and_constraints
+            .iter()
+            .map(|risk| format!("- {risk}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let todo_path = handoff
+        .todo_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "None".to_owned());
+    format!(
+        "Summary: {}\nTodo required: {}\nTodo path: {}\nPlanned answer brief: {}\nExecution strategy: {}\n\nSelected sources:\n{}\n\nKey facts:\n{}\n\nRisks and constraints:\n{}",
+        handoff.summary,
+        handoff.todo_required,
+        todo_path,
+        answer_brief,
+        handoff.execution_strategy,
+        selected_sources,
+        key_facts,
+        risks,
     )
 }
 
@@ -352,6 +471,7 @@ mod tests {
 
     use crate::{
         ids::MessageId,
+        model::TurnPhase,
         prompt::{TodoPromptContext, TurnPolicyPromptContext, load_and_render_system_prompt},
         state::{
             ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability,
@@ -380,9 +500,12 @@ mod tests {
                 content: "thinking".to_owned(),
             })],
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Planning,
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
-                require_todos: false,
+                force_todo_file: false,
+                execution_todo_required: None,
             },
+            None,
             None,
         );
 
@@ -419,9 +542,12 @@ mod tests {
             })],
             &[],
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Planning,
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
-                require_todos: false,
+                force_todo_file: false,
+                execution_todo_required: None,
             },
+            None,
             None,
         );
 
@@ -443,9 +569,12 @@ mod tests {
             &[],
             &[],
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
-                require_todos: false,
+                force_todo_file: false,
+                execution_todo_required: Some(true),
             },
+            None,
             Some(&TodoPromptContext {
                 todo_path: PathBuf::from("/tmp/session/turn/todos.txt"),
                 todo_contents: "1. [pending] Inspect data".to_owned(),
@@ -467,15 +596,22 @@ mod tests {
             &[],
             &[],
             &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
-                require_todos: true,
+                force_todo_file: true,
+                execution_todo_required: Some(true),
             },
+            None,
             None,
         );
 
         assert!(prompt.rendered.contains("## Turn Policy"));
         assert!(prompt.rendered.contains("turn-report.html"));
-        assert!(prompt.rendered.contains("Todos required: true"));
+        assert!(
+            prompt
+                .rendered
+                .contains("Deployment force-todo override: true")
+        );
         assert!(
             prompt
                 .rendered
@@ -497,6 +633,7 @@ mod tests {
 
         let rendered = load_and_render_system_prompt(
             &template_path,
+            TurnPhase::Planning,
             &temp_dir,
             &[McpCapability {
                 server_name: ServerName::new("sqlite").expect("valid server"),

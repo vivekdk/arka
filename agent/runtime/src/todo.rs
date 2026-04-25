@@ -272,7 +272,11 @@ impl TodoList {
         if next_actionable.text == GENERIC_STARTER_TODO {
             return Ok(next_actionable_index - 1);
         }
-        if self.items.iter().any(|item| item.status == TodoStatus::Failed) {
+        if self
+            .items
+            .iter()
+            .any(|item| item.status == TodoStatus::Failed)
+        {
             return self
                 .items
                 .iter()
@@ -386,8 +390,9 @@ fn canonical_mandatory_todo(value: &str) -> Option<&'static str> {
     let generate_verbs = ["generate", "create", "build", "render", "produce", "write"];
     let mentions_html_report =
         normalized.contains("html") || normalized.contains("report") || normalized.contains("page");
-    let mentions_visual_payload =
-        normalized.contains("chart") || normalized.contains("table") || normalized.contains("visual");
+    let mentions_visual_payload = normalized.contains("chart")
+        || normalized.contains("table")
+        || normalized.contains("visual");
 
     if normalized.contains("open")
         && (normalized.contains("html")
@@ -519,9 +524,11 @@ mod tests {
         let error = todos
             .set_status(1, TodoStatus::Completed)
             .expect_err("generic starter must not be completable");
-        assert!(error
-            .to_string()
-            .contains("generic starter todo cannot be completed"));
+        assert!(
+            error
+                .to_string()
+                .contains("generic starter todo cannot be completed")
+        );
     }
 
     #[test]
@@ -557,7 +564,10 @@ mod tests {
             .expect("replan should succeed");
 
         assert_eq!(todos.items[0].status, TodoStatus::Pending);
-        assert_eq!(todos.items[0].text, "Define the CSK IPL 2025 analysis scope");
+        assert_eq!(
+            todos.items[0].text,
+            "Define the CSK IPL 2025 analysis scope"
+        );
         assert_eq!(
             todos.items[1].text,
             "Collect and prepare CSK IPL 2025 season data"
@@ -620,8 +630,10 @@ mod tests {
         let error = todos
             .replan_pending_suffix(&["Compute batting metrics".to_owned()])
             .expect_err("concrete plan should not be replanned without failure");
-        assert!(error
-            .to_string()
-            .contains("cannot replan a concrete todo plan after execution has started"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replan a concrete todo plan after execution has started")
+        );
     }
 }
