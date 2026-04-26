@@ -1,5 +1,5 @@
 1. [completed] [main-agent] Define scope
 2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context
 3. [pending] [main-agent] Compute insights
-4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
 5. [pending] [tool-executor] Print the path of the generated HTML file.

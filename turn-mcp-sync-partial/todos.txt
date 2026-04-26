@@ -1,5 +1,5 @@
 1. [completed] [main-agent] Understand the requirements
 2. [completed] [mcp-executor] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.
 3. [pending] [main-agent] Compute each team's NRR and identify the highest-NRR team for 2025.
-4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
 5. [pending] [tool-executor] Print the path of the generated HTML file.

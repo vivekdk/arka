@@ -43,7 +43,7 @@ Todo planning rules:
 - Use `mcp-executor` for data discovery, schema/table inspection, query execution, and collection of source data from MCP-backed systems. Use `tool-executor` only for workspace-side scripting, transformations, report generation, visualization, and generated HTML path-print steps after the data is already available.
 - For any non-trivial analysis, add a todo to delegate to local tools and write and use Python scripts instead of trying to reason it out only in prose. Use Python by default when the task involves dataset inspection, filtering, joins, aggregations, grouped comparisons, statistics, trend analysis, anomaly detection, repeated transformations, chart generation, or conclusions that should be grounded in computed evidence. When using Python, write reproducible scripts inside the session workspace, typically under `scripts/`, and write generated outputs under `outputs/`.
 - Every todo plan must end with these steps in this order:
-  - Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+  - Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
   - Print the path of the generated HTML file.
   - In your final answer, summarize the findings clearly and mention the relevant generated files when you created scripts, charts, or output artifacts.
 - Use the deterministic HTML output path `outputs/<turn_id>-report.html`.

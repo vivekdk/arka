@@ -2284,7 +2284,7 @@ async fn complex_turn_creates_todo_file_and_injects_follow_up_prompt_context() {
     let todo_text = fs::read_to_string(&todo_path).expect("todo file should exist");
     assert!(todo_text.contains("[pending] [mcp-executor] Inspect the source data"));
     assert!(todo_text.contains(
-        "[pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy."
+        "[pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights."
     ));
     assert!(
         todo_text.contains("[pending] [tool-executor] Print the path of the generated HTML file.")
@@ -2489,7 +2489,7 @@ async fn required_todos_mode_creates_todo_file_after_planning_complete() {
         todo_text.contains("[pending] [main-agent] Inspect the request and prepare the answer.")
     );
     assert!(todo_text.contains(
-        "[pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy."
+        "[pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights."
     ));
     assert!(
         todo_text.contains("[pending] [tool-executor] Print the path of the generated HTML file.")

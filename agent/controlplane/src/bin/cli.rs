@@ -19,7 +19,7 @@ use agent_controlplane::{
     SessionEvent, SessionId, SessionRecord, SessionStatus, StartWhatsAppLoginResponse,
     SubmitApprovalRequest, TurnRecordSummary, WhatsAppGatewayStatus,
 };
-use agent_runtime::{RuntimeEvent, TerminationReason};
+use agent_runtime::{RuntimeEvent, TerminationReason, TodoItem, TodoList, TodoStatus};
 use futures_util::StreamExt;
 use mcp_client::{
     ClientInfo, McpClient, McpClientError, McpInitializeResult, McpResourceDescriptor,
@@ -95,12 +95,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let response = send_message_with_feedback(
                     &theme,
                     &request_client,
+                    &stream_client,
                     &base_url,
                     &session_id,
                     text,
                 )
                 .await?;
-                print_chat_response(&theme, &response);
+                if !response.rendered_live {
+                    print_chat_response(&theme, &response.response);
+                }
             }
             _ => return Err(usage(&bin).into()),
         },
@@ -409,12 +412,15 @@ async fn handle_chat_input(
             let response = send_message_with_feedback(
                 theme,
                 request_client,
+                stream_client,
                 base_url,
                 &session.session_id.to_string(),
                 text,
             )
             .await?;
-            print_chat_response(theme, &response);
+            if !response.rendered_live {
+                print_chat_response(theme, &response.response);
+            }
         }
     }
 
@@ -502,14 +508,48 @@ async fn send_message(
 async fn send_message_with_feedback(
     theme: &CliTheme,
     client: &reqwest::Client,
+    stream_client: &reqwest::Client,
     base_url: &str,
     session_id: &str,
     text: String,
-) -> Result<SendSessionMessageResponse, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SendFeedbackResult, Box<dyn std::error::Error + Send + Sync>> {
+    if theme.interactive() {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let watcher_client = stream_client.clone();
+        let watcher_base_url = base_url.to_owned();
+        let watcher_session_id = session_id.to_owned();
+        let watcher_theme = *theme;
+        let watcher = tokio::spawn(async move {
+            stream_session_events_until_turn_end(
+                &watcher_client,
+                &watcher_base_url,
+                &watcher_session_id,
+                &watcher_theme,
+                stop_rx,
+            )
+            .await
+        });
+
+        let response = send_message(client, base_url, session_id, text).await;
+        let _ = stop_tx.send(());
+        let rendered_live = match tokio::time::timeout(Duration::from_secs(2), watcher).await {
+            Ok(Ok(Ok(outcome))) => outcome.rendered_turn_completion,
+            _ => false,
+        };
+
+        return response.map(|response| SendFeedbackResult {
+            response,
+            rendered_live,
+        });
+    }
+
     let spinner = TurnSpinner::start(*theme, "Thinking")?;
     let response = send_message(client, base_url, session_id, text).await;
     spinner.stop().await?;
-    response
+    response.map(|response| SendFeedbackResult {
+        response,
+        rendered_live: false,
+    })
 }
 
 async fn submit_approval(
@@ -678,19 +718,72 @@ async fn stream_session_events(
                 if raw {
                     println!("{data}");
                 } else if let Ok(event) = serde_json::from_str::<SessionEvent>(data) {
-                    if let Some(lines) =
-                        render_session_event_with_theme(&theme, &mut render_state, &event)
-                    {
-                        for line in lines {
-                            println!("{line}");
-                        }
-                    }
+                    emit_session_event(&theme, &mut render_state, &event)?;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+async fn stream_session_events_until_turn_end(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    theme: &CliTheme,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> Result<LiveTurnRenderOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let response = send_with_retry(base_url, || async {
+        client
+            .get(format!("{base_url}/sessions/{session_id}/events"))
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .await?;
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut render_state = SessionEventRenderState::default();
+    let mut rendered_turn_completion = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => break,
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let chunk = chunk?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some((frame, rest)) = split_sse_frame(&buffer) {
+                    let frame = frame.to_owned();
+                    let rest = rest.to_owned();
+                    buffer = rest;
+                    let Some(data) = parse_sse_data(&frame) else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_str::<SessionEvent>(data) else {
+                        continue;
+                    };
+                    emit_session_event(theme, &mut render_state, &event)?;
+                    if matches!(event, SessionEvent::TurnCompleted { .. }) {
+                        rendered_turn_completion = true;
+                    }
+                    if event_ends_live_turn(&event) {
+                        return Ok(LiveTurnRenderOutcome {
+                            rendered_turn_completion,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(LiveTurnRenderOutcome {
+        rendered_turn_completion,
+    })
 }
 
 async fn send_with_retry<T, F, Fut>(
@@ -761,6 +854,23 @@ fn parse_sse_data(frame: &str) -> Option<&str> {
 #[derive(Default)]
 struct SessionEventRenderState {
     turn_open: bool,
+    session_id: Option<SessionId>,
+    current_turn_id: Option<String>,
+    workspace_root: Option<PathBuf>,
+    last_todo_signature: Option<String>,
+    live_header: Option<String>,
+    live_todo_card: Option<String>,
+    live_event_lines: Vec<String>,
+    live_region_height: usize,
+}
+
+struct LiveTurnRenderOutcome {
+    rendered_turn_completion: bool,
+}
+
+struct SendFeedbackResult {
+    response: SendSessionMessageResponse,
+    rendered_live: bool,
 }
 
 fn render_session_event_with_theme(
@@ -769,18 +879,36 @@ fn render_session_event_with_theme(
     event: &SessionEvent,
 ) -> Option<Vec<String>> {
     match event {
-        SessionEvent::TurnQueued { .. } => Some(vec![render_notice(
-            theme,
-            NoticeTone::Muted,
-            "turn",
-            "queued",
-        )]),
-        SessionEvent::TurnStarted { .. } => {
+        SessionEvent::TurnQueued { session_id } => {
+            state.session_id = Some(session_id.clone());
+            Some(vec![render_notice(
+                theme,
+                NoticeTone::Muted,
+                "turn",
+                "queued",
+            )])
+        }
+        SessionEvent::TurnStarted { session_id } => {
             state.turn_open = true;
+            state.session_id = Some(session_id.clone());
+            state.current_turn_id = None;
+            state.workspace_root = None;
+            state.last_todo_signature = None;
+            state.live_header = None;
+            state.live_todo_card = None;
+            state.live_event_lines.clear();
+            state.live_region_height = 0;
             Some(vec![render_group_header(theme, "Live Turn", "executing")])
         }
-        SessionEvent::TurnCompleted { summary, .. } => {
+        SessionEvent::TurnCompleted {
+            session_id,
+            summary,
+        } => {
             state.turn_open = false;
+            state.session_id = Some(session_id.clone());
+            state.current_turn_id = None;
+            state.workspace_root = None;
+            state.last_todo_signature = None;
             Some(vec![render_turn_summary(
                 theme,
                 APP_NAME,
@@ -788,7 +916,11 @@ fn render_session_event_with_theme(
                 Some(summary),
             )])
         }
-        SessionEvent::ApprovalRequested { approval, .. } => {
+        SessionEvent::ApprovalRequested {
+            session_id,
+            approval,
+        } => {
+            state.session_id = Some(session_id.clone());
             let mut lines = Vec::new();
             if state.turn_open {
                 lines.push(render_timeline_event(
@@ -807,69 +939,251 @@ fn render_session_event_with_theme(
             ));
             Some(lines)
         }
-        SessionEvent::ApprovalResolved { approval, .. } => {
+        SessionEvent::ApprovalResolved {
+            session_id,
+            approval,
+        } => {
+            state.session_id = Some(session_id.clone());
             Some(vec![render_approval_resolution(theme, approval)])
         }
         SessionEvent::RuntimeEvent { event, .. } => {
-            render_runtime_event_with_theme(theme, state.turn_open, event).map(|line| vec![line])
+            state.current_turn_id = runtime_event_turn_id(event);
+            render_runtime_event_with_theme(theme, state.turn_open, event)
         }
-        SessionEvent::ChannelDeliveryAttempted { status, .. } => Some(vec![if state.turn_open {
-            render_timeline_event(
-                theme,
-                if matches!(status, agent_controlplane::DeliveryStatus::Failed) {
-                    NoticeTone::Error
-                } else {
-                    NoticeTone::Success
-                },
-                "delivery",
-                &format!("{}", format_delivery_status(*status)),
-            )
-        } else {
-            render_notice(
-                theme,
-                if matches!(status, agent_controlplane::DeliveryStatus::Failed) {
-                    NoticeTone::Error
-                } else {
-                    NoticeTone::Success
-                },
-                "delivery",
-                &format!("{}", format_delivery_status(*status)),
-            )
-        }]),
+        SessionEvent::ChannelDeliveryAttempted {
+            session_id, status, ..
+        } => {
+            state.session_id = Some(session_id.clone());
+            Some(vec![if state.turn_open {
+                render_timeline_event(
+                    theme,
+                    if matches!(status, agent_controlplane::DeliveryStatus::Failed) {
+                        NoticeTone::Error
+                    } else {
+                        NoticeTone::Success
+                    },
+                    "delivery",
+                    &format!("{}", format_delivery_status(*status)),
+                )
+            } else {
+                render_notice(
+                    theme,
+                    if matches!(status, agent_controlplane::DeliveryStatus::Failed) {
+                        NoticeTone::Error
+                    } else {
+                        NoticeTone::Success
+                    },
+                    "delivery",
+                    &format!("{}", format_delivery_status(*status)),
+                )
+            }])
+        }
         SessionEvent::SessionCreated { .. } | SessionEvent::SessionMessageReceived { .. } => None,
     }
+}
+
+fn emit_session_event(
+    theme: &CliTheme,
+    state: &mut SessionEventRenderState,
+    event: &SessionEvent,
+) -> io::Result<()> {
+    let lines = render_session_event_with_theme(theme, state, event);
+    let todo_card = matches!(event, SessionEvent::RuntimeEvent { .. })
+        .then(|| render_todo_progress_from_workspace(theme, state))
+        .flatten();
+
+    if !theme.interactive() {
+        if let Some(lines) = lines {
+            print_rendered_lines(&lines)?;
+        }
+        if let Some(todo_card) = todo_card {
+            print_rendered_lines(&[todo_card])?;
+        }
+        return Ok(());
+    }
+
+    match event {
+        SessionEvent::TurnStarted { .. } => {
+            state.live_header = lines.and_then(|mut lines| lines.drain(..).next());
+            redraw_live_turn_region(state)?;
+        }
+        SessionEvent::RuntimeEvent { .. } if state.turn_open => {
+            if let Some(lines) = lines {
+                state.live_event_lines.extend(lines);
+            }
+            if let Some(todo_card) = todo_card {
+                state.live_todo_card = Some(todo_card);
+            }
+            if !state.live_event_lines.is_empty() || state.live_todo_card.is_some() {
+                redraw_live_turn_region(state)?;
+            }
+        }
+        _ => {
+            reset_live_turn_region(state);
+            if let Some(lines) = lines {
+                print_rendered_lines(&lines)?;
+            }
+            if let Some(todo_card) = todo_card {
+                print_rendered_lines(&[todo_card])?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_todo_progress_from_workspace(
+    theme: &CliTheme,
+    state: &mut SessionEventRenderState,
+) -> Option<String> {
+    if state.workspace_root.is_none() {
+        state.workspace_root = resolve_runtime_workspace_root(state.session_id.as_ref());
+    }
+    let workspace_root = state.workspace_root.clone()?;
+    render_todo_progress_from_workspace_root(theme, state, &workspace_root)
+}
+
+fn reset_live_turn_region(state: &mut SessionEventRenderState) {
+    state.live_header = None;
+    state.live_todo_card = None;
+    state.live_event_lines.clear();
+    state.live_region_height = 0;
+}
+
+fn redraw_live_turn_region(state: &mut SessionEventRenderState) -> io::Result<()> {
+    let components = live_turn_region_components(state);
+    if components.is_empty() {
+        return Ok(());
+    }
+
+    clear_rendered_region(state.live_region_height)?;
+    let rendered = components.join("\n");
+    print!("{rendered}\n");
+    io::stdout().flush()?;
+    state.live_region_height = rendered_terminal_line_count(&rendered);
+    Ok(())
+}
+
+fn live_turn_region_components(state: &SessionEventRenderState) -> Vec<String> {
+    let mut components = Vec::new();
+    if let Some(header) = state.live_header.as_ref() {
+        components.push(header.clone());
+    }
+    if let Some(todo_card) = state.live_todo_card.as_ref() {
+        components.push(todo_card.clone());
+    }
+    components.extend(state.live_event_lines.iter().cloned());
+    components
+}
+
+fn clear_rendered_region(height: usize) -> io::Result<()> {
+    if height == 0 {
+        return Ok(());
+    }
+
+    move_cursor_up(height)?;
+    for line_index in 0..height {
+        clear_current_line()?;
+        if line_index + 1 < height {
+            move_cursor_down(1)?;
+        }
+    }
+    move_cursor_up(height.saturating_sub(1))?;
+    Ok(())
+}
+
+fn print_rendered_lines(lines: &[String]) -> io::Result<()> {
+    for line in lines {
+        println!("{line}");
+    }
+    io::stdout().flush()
+}
+
+fn rendered_terminal_line_count(rendered: &str) -> usize {
+    rendered.lines().count()
+}
+
+fn render_todo_progress_from_workspace_root(
+    theme: &CliTheme,
+    state: &mut SessionEventRenderState,
+    workspace_root: &PathBuf,
+) -> Option<String> {
+    let session_id = state.session_id.as_ref()?;
+    let turn_id = state.current_turn_id.as_deref()?;
+    let todo_path = runtime_workspace_todo_path(workspace_root, session_id, turn_id);
+    let todos = TodoList::load_from_path(&todo_path).ok()?;
+    let signature = todos.render();
+    if state.last_todo_signature.as_deref() == Some(signature.as_str()) {
+        return None;
+    }
+    state.last_todo_signature = Some(signature);
+    Some(render_todo_progress_card(theme, &todos.items))
+}
+
+fn resolve_runtime_workspace_root(session_id: Option<&SessionId>) -> Option<PathBuf> {
+    if let Ok(value) = env::var("ARKA_WORKSPACE_ROOT") {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let current_dir = env::current_dir().ok()?;
+    for candidate in current_dir.ancestors() {
+        let workspace_root = candidate.join(".arka").join("tmp");
+        if let Some(session_id) = session_id {
+            if workspace_root.join(session_id.to_string()).exists() {
+                return Some(workspace_root);
+            }
+        } else if workspace_root.exists() {
+            return Some(workspace_root);
+        }
+    }
+
+    None
+}
+
+fn runtime_workspace_todo_path(
+    workspace_root: &PathBuf,
+    session_id: &SessionId,
+    turn_id: &str,
+) -> PathBuf {
+    workspace_root
+        .join(session_id.to_string())
+        .join(turn_id)
+        .join("todos.txt")
 }
 
 fn render_runtime_event_with_theme(
     theme: &CliTheme,
     grouped: bool,
     event: &RuntimeEvent,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     match event {
-        RuntimeEvent::HandoffToSubagent { subagent_type, .. } => Some(render_event_line(
+        RuntimeEvent::HandoffToSubagent { subagent_type, .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Info,
             "handoff",
             &format!("main agent -> {subagent_type}"),
-        )),
+        )]),
         RuntimeEvent::McpCalled {
             server_name,
             tool_name,
             ..
-        } => Some(render_event_line(
+        } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Info,
             "mcp",
             &format!("calling {server_name}/{tool_name}"),
-        )),
+        )]),
         RuntimeEvent::McpResponded {
             server_name,
             tool_name,
             was_error,
             ..
-        } => Some(render_event_line(
+        } => Some(vec![render_event_line(
             theme,
             grouped,
             if *was_error {
@@ -882,56 +1196,105 @@ fn render_runtime_event_with_theme(
                 "{} {server_name}/{tool_name}",
                 if *was_error { "error" } else { "done" }
             ),
-        )),
-        RuntimeEvent::TurnEnded { termination, .. } => Some(render_event_line(
+        )]),
+        RuntimeEvent::LocalToolResponded {
+            tool_name,
+            was_error,
+            result_summary,
+            error,
+            ..
+        } if tool_name == "write_todos" => {
+            if *was_error {
+                Some(vec![render_event_line(
+                    theme,
+                    grouped,
+                    NoticeTone::Error,
+                    "todo",
+                    error.as_deref().unwrap_or(result_summary),
+                )])
+            } else {
+                None
+            }
+        }
+        RuntimeEvent::TurnEnded { termination, .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Muted,
             "status",
             &format!("turn ended ({})", format_termination(termination)),
-        )),
-        RuntimeEvent::AnswerRenderStarted { .. } => Some(render_event_line(
+        )]),
+        RuntimeEvent::AnswerRenderStarted { .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Info,
             "answer",
             "drafting final answer",
-        )),
-        RuntimeEvent::AnswerRenderFailed { error, .. } => Some(render_event_line(
+        )]),
+        RuntimeEvent::AnswerRenderFailed { error, .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Error,
             "answer",
             &format!("render failed ({error})"),
-        )),
-        RuntimeEvent::ModelCalled { .. } => Some(render_event_line(
+        )]),
+        RuntimeEvent::ModelCalled { .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Info,
             "model",
             "querying model",
-        )),
-        RuntimeEvent::ModelResponded { latency, .. } => Some(render_event_line(
+        )]),
+        RuntimeEvent::ModelResponded { latency, .. } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Success,
             "model",
             &format!("responded in {}", format_elapsed_ms(latency.as_millis())),
-        )),
+        )]),
         RuntimeEvent::HandoffToMainAgent {
             subagent_type,
             status,
             ..
-        } => Some(render_event_line(
+        } => Some(vec![render_event_line(
             theme,
             grouped,
             NoticeTone::Success,
             "handoff",
             &format!("{subagent_type} -> main agent ({status})"),
-        )),
+        )]),
         RuntimeEvent::AnswerTextDelta { .. } | RuntimeEvent::AnswerRenderCompleted { .. } => None,
         _ => None,
     }
+}
+
+fn runtime_event_turn_id(event: &RuntimeEvent) -> Option<String> {
+    match event {
+        RuntimeEvent::TurnStarted { turn_id, .. }
+        | RuntimeEvent::StepStarted { turn_id, .. }
+        | RuntimeEvent::PromptBuilt { turn_id, .. }
+        | RuntimeEvent::HandoffToSubagent { turn_id, .. }
+        | RuntimeEvent::ModelCalled { turn_id, .. }
+        | RuntimeEvent::ModelResponded { turn_id, .. }
+        | RuntimeEvent::AnswerRenderStarted { turn_id, .. }
+        | RuntimeEvent::AnswerTextDelta { turn_id, .. }
+        | RuntimeEvent::AnswerRenderCompleted { turn_id, .. }
+        | RuntimeEvent::AnswerRenderFailed { turn_id, .. }
+        | RuntimeEvent::HandoffToMainAgent { turn_id, .. }
+        | RuntimeEvent::ToolMaskEvaluated { turn_id, .. }
+        | RuntimeEvent::McpCalled { turn_id, .. }
+        | RuntimeEvent::McpResponded { turn_id, .. }
+        | RuntimeEvent::LocalToolCalled { turn_id, .. }
+        | RuntimeEvent::LocalToolResponded { turn_id, .. }
+        | RuntimeEvent::StepEnded { turn_id, .. }
+        | RuntimeEvent::TurnEnded { turn_id, .. } => Some(turn_id.to_string()),
+    }
+}
+
+fn event_ends_live_turn(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::TurnCompleted { .. } | SessionEvent::ApprovalRequested { .. }
+    )
 }
 
 fn print_chat_response(theme: &CliTheme, response: &SendSessionMessageResponse) {
@@ -2218,6 +2581,22 @@ fn clear_current_line() -> io::Result<()> {
     io::stdout().flush()
 }
 
+fn move_cursor_up(lines: usize) -> io::Result<()> {
+    if lines == 0 {
+        return Ok(());
+    }
+    print!("\x1b[{lines}A");
+    io::stdout().flush()
+}
+
+fn move_cursor_down(lines: usize) -> io::Result<()> {
+    if lines == 0 {
+        return Ok(());
+    }
+    print!("\x1b[{lines}B\r");
+    io::stdout().flush()
+}
+
 fn clear_previous_line() -> io::Result<()> {
     print!("\x1b[1A\r\x1b[2K");
     io::stdout().flush()
@@ -2380,6 +2759,56 @@ fn render_group_header(theme: &CliTheme, title: &str, status: &str) -> String {
         theme.strong(title),
         theme.muted(status)
     )
+}
+
+fn render_todo_progress_card(theme: &CliTheme, items: &[TodoItem]) -> String {
+    let completed = items
+        .iter()
+        .filter(|item| item.status == TodoStatus::Completed)
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|item| item.status == TodoStatus::InProgress)
+        .count();
+    let failed = items
+        .iter()
+        .filter(|item| item.status == TodoStatus::Failed)
+        .count();
+    let meta = format!(
+        "{} total · {} done · {} active{}",
+        items.len(),
+        completed,
+        in_progress,
+        if failed > 0 {
+            format!(" · {} failed", failed)
+        } else {
+            String::new()
+        }
+    );
+    let lines = items
+        .iter()
+        .map(format_todo_progress_line)
+        .collect::<Vec<_>>();
+    render_card(
+        theme,
+        CardTone::Status,
+        "Todo Progress",
+        Some(&meta),
+        &lines,
+    )
+}
+
+fn format_todo_progress_line(item: &TodoItem) -> String {
+    let marker = match item.status {
+        TodoStatus::Pending => "[☐]",
+        TodoStatus::InProgress => "[■]",
+        TodoStatus::Completed => "[☑]",
+        TodoStatus::Failed => "[✖]",
+    };
+    match item.executor_hint {
+        Some(executor_hint) => format!("{marker} {} · {}", item.text, executor_hint),
+        None => format!("{marker} {}", item.text),
+    }
 }
 
 fn render_event_line(
@@ -2718,6 +3147,9 @@ fn format_card_line(
 
 fn style_kv_line(theme: &CliTheme, tone: CardTone, line: &str) -> String {
     let Some((label, value)) = line.split_once(':') else {
+        if is_todo_progress_line(line) {
+            return style_todo_progress_line(theme, line);
+        }
         return style_inline_tokens(theme, line);
     };
     format!(
@@ -2725,6 +3157,37 @@ fn style_kv_line(theme: &CliTheme, tone: CardTone, line: &str) -> String {
         style_card_border(theme, tone, &theme.bold(label)),
         style_inline_tokens(theme, value)
     )
+}
+
+fn is_todo_progress_line(line: &str) -> bool {
+    matches!(
+        line.split_once(' ').map(|(marker, _)| marker),
+        Some("[☐]") | Some("[■]") | Some("[☑]") | Some("[✖]")
+    )
+}
+
+fn style_todo_progress_line(theme: &CliTheme, line: &str) -> String {
+    let Some((marker, rest)) = line.split_once(' ') else {
+        return line.to_owned();
+    };
+    let marker = match marker {
+        "[☐]" => theme.bold(&theme.muted(marker)),
+        "[■]" => theme.bold(&theme.info(marker)),
+        "[☑]" => theme.bold(&theme.success(marker)),
+        "[✖]" => theme.bold(&theme.error(marker)),
+        _ => marker.to_owned(),
+    };
+    let rest = if let Some((text, executor)) = rest.rsplit_once(" · ") {
+        format!(
+            "{} {} {}",
+            style_inline_tokens(theme, text),
+            theme.muted("·"),
+            theme.muted(executor)
+        )
+    } else {
+        style_inline_tokens(theme, rest)
+    };
+    format!("{marker} {rest}")
 }
 
 fn style_inline_tokens(theme: &CliTheme, text: &str) -> String {
@@ -2856,7 +3319,8 @@ mod tests {
         SessionStatus, TurnRecordSummary,
     };
     use agent_runtime::{
-        RuntimeEvent, RuntimeExecutor, StepId, TerminationReason, TurnId, UsageSummary,
+        RuntimeEvent, RuntimeExecutor, StepId, TerminationReason, TodoItem, TodoStatus, TurnId,
+        UsageSummary,
     };
     use mcp_client::McpInitializeResult;
     use mcp_config::McpServerConfig;
@@ -2865,9 +3329,11 @@ mod tests {
     use super::{
         CONNECT_RETRY_COUNT, ChatCommand, CliTheme, INITIAL_BACKOFF_MS, McpCommand,
         SessionEventRenderState, build_metadata_catalogs, format_mcp_remote_refresh_error,
-        format_turn_meta_line, is_mcp_remote_stdio, mcp_remote_defaults, parse_chat_command,
-        parse_sse_data, prompt_text, render_markdownish_text, render_runtime_event_with_theme,
-        render_session_event_with_theme, render_user_message, send_with_retry,
+        format_turn_meta_line, is_mcp_remote_stdio, live_turn_region_components,
+        mcp_remote_defaults, parse_chat_command, parse_sse_data, prompt_text,
+        render_markdownish_text, render_runtime_event_with_theme, render_session_event_with_theme,
+        render_todo_progress_card, render_todo_progress_from_workspace_root, render_user_message,
+        resolve_runtime_workspace_root, runtime_workspace_todo_path, send_with_retry,
         server_supports_capability, should_retry_request, split_sse_frame,
     };
 
@@ -3132,8 +3598,9 @@ mod tests {
         };
         let runtime_line = render_runtime_event_with_theme(&theme, false, &runtime)
             .expect("runtime should render");
-        assert!(runtime_line.contains("mcp"));
-        assert!(runtime_line.contains("calling postgres/run-sql"));
+        let runtime_text = runtime_line.join("\n");
+        assert!(runtime_text.contains("mcp"));
+        assert!(runtime_text.contains("calling postgres/run-sql"));
 
         let turn_started = SessionEvent::TurnStarted {
             session_id: agent_controlplane::SessionId::new(),
@@ -3209,6 +3676,137 @@ mod tests {
             render_session_event_with_theme(&theme, &mut state, &ignored),
             None
         );
+    }
+
+    #[test]
+    fn renders_todo_progress_card() {
+        let theme = CliTheme::plain();
+        let rendered = render_todo_progress_card(
+            &theme,
+            &[
+                TodoItem {
+                    status: TodoStatus::Pending,
+                    executor_hint: Some(agent_runtime::TodoExecutor::MainAgent),
+                    text: "Clarify the ask".to_owned(),
+                },
+                TodoItem {
+                    status: TodoStatus::InProgress,
+                    executor_hint: Some(agent_runtime::TodoExecutor::McpExecutor),
+                    text: "Inspect source data".to_owned(),
+                },
+                TodoItem {
+                    status: TodoStatus::Completed,
+                    executor_hint: Some(agent_runtime::TodoExecutor::ToolExecutor),
+                    text: "Generate tables".to_owned(),
+                },
+                TodoItem {
+                    status: TodoStatus::Failed,
+                    executor_hint: None,
+                    text: "Retry blocked step".to_owned(),
+                },
+            ],
+        );
+
+        assert!(rendered.contains("Todo Progress"));
+        assert!(rendered.contains("[☐] Clarify the ask"));
+        assert!(rendered.contains("[■] Inspect source data"));
+        assert!(rendered.contains("[☑] Generate tables"));
+        assert!(rendered.contains("[✖] Retry blocked step"));
+    }
+
+    #[test]
+    fn live_turn_region_places_todo_before_events() {
+        let state = SessionEventRenderState {
+            turn_open: true,
+            session_id: None,
+            current_turn_id: None,
+            workspace_root: None,
+            last_todo_signature: None,
+            live_header: Some("● Live Turn executing".to_owned()),
+            live_todo_card: Some("TODO CARD".to_owned()),
+            live_event_lines: vec![
+                "  • [model] querying model".to_owned(),
+                "  • [mcp] calling ipl/query".to_owned(),
+            ],
+            live_region_height: 0,
+        };
+
+        assert_eq!(
+            live_turn_region_components(&state),
+            vec![
+                "● Live Turn executing".to_owned(),
+                "TODO CARD".to_owned(),
+                "  • [model] querying model".to_owned(),
+                "  • [mcp] calling ipl/query".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_todo_progress_from_workspace_file() {
+        let theme = CliTheme::plain();
+        let workspace_root =
+            std::env::temp_dir().join(format!("arka-cli-todo-progress-{}", uuid::Uuid::new_v4()));
+        let session_id = agent_controlplane::SessionId::new();
+        let turn_id = TurnId::new();
+        let todo_path =
+            runtime_workspace_todo_path(&workspace_root, &session_id, &turn_id.to_string());
+        std::fs::create_dir_all(
+            todo_path
+                .parent()
+                .expect("todo path should have parent directory"),
+        )
+        .expect("todo directory should be creatable");
+        std::fs::write(
+            &todo_path,
+            "1. [pending] [main-agent] Clarify scope\n2. [in_progress] [mcp-executor] Query IPL data\n3. [completed] [tool-executor] Prepare chart\n",
+        )
+        .expect("todo file should be writable");
+
+        let mut state = SessionEventRenderState {
+            turn_open: true,
+            session_id: Some(session_id),
+            current_turn_id: Some(turn_id.to_string()),
+            workspace_root: None,
+            last_todo_signature: None,
+            live_header: None,
+            live_todo_card: None,
+            live_event_lines: Vec::new(),
+            live_region_height: 0,
+        };
+        let rendered =
+            render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
+                .expect("todo file should render");
+        assert!(rendered.contains("Todo Progress"));
+        assert!(rendered.contains("[☐] Clarify scope"));
+        assert!(rendered.contains("[■] Query IPL data"));
+        assert!(rendered.contains("[☑] Prepare chart"));
+        assert_eq!(
+            render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root),
+            None
+        );
+
+        std::fs::remove_dir_all(&workspace_root).expect("temp workspace should be removable");
+    }
+
+    #[test]
+    fn resolves_runtime_workspace_root_from_ancestor_chain() {
+        let original_dir = std::env::current_dir().expect("cwd should resolve");
+        let sandbox_root =
+            std::env::temp_dir().join(format!("arka-cli-root-discovery-{}", uuid::Uuid::new_v4()));
+        let nested = sandbox_root.join("agent").join("controlplane");
+        std::fs::create_dir_all(&nested).expect("nested cwd should be creatable");
+        let session_id = agent_controlplane::SessionId::new();
+        let workspace_root = sandbox_root.join(".arka").join("tmp");
+        std::fs::create_dir_all(workspace_root.join(session_id.to_string()))
+            .expect("session workspace should be creatable");
+
+        std::env::set_current_dir(&nested).expect("cwd should be settable");
+        let resolved = resolve_runtime_workspace_root(Some(&session_id));
+        std::env::set_current_dir(&original_dir).expect("cwd should be restorable");
+
+        assert_eq!(resolved, Some(workspace_root.clone()));
+        std::fs::remove_dir_all(&sandbox_root).expect("sandbox root should be removable");
     }
 
     #[test]

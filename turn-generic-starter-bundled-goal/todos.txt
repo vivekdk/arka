@@ -1,3 +1,3 @@
 1. [pending] Understand and complete the user request.
-2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
 3. [pending] Print the path of the generated HTML file.
