@@ -1,5 +1,5 @@
 1. [completed] Inspect schema
 2. [completed] Compute captaincy record
 3. [completed] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.
-4. [pending] Generate an output HTML page with charts and tables.
-5. [pending] Open the generated output HTML page in the browser.
+4. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+5. [pending] Print the path of the generated HTML file.

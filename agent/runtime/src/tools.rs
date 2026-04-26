@@ -286,7 +286,7 @@ pub fn builtin_local_tool_catalog() -> Vec<ToolDescriptor> {
         ToolDescriptor::local(
             "write_todos",
             "Write Todos",
-            "Create or update the current turn's todo list at `.arka/tmp/<session_id>/<turn_id>/todos.txt`.",
+            "Create or update the current turn's todo list at `.arka/tmp/<session_id>/<turn_id>/todos.txt`. New todo items must begin with an executor hint: `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`.",
             vec!["file_write"],
             json!({
                 "type": "object",
@@ -298,7 +298,11 @@ pub fn builtin_local_tool_catalog() -> Vec<ToolDescriptor> {
                     },
                     "items": {
                         "type": "array",
-                        "items": { "type": "string", "minLength": 1 }
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Todo text prefixed with an executor hint, for example `[mcp-executor] Query the users table`."
+                        }
                     },
                     "item_index": { "type": "integer", "minimum": 1 },
                     "status": {
@@ -397,6 +401,7 @@ fn execute_write_todos(
             todos
                 .set_status(item_index, status)
                 .map_err(map_todo_error)?;
+            reject_invalid_mandatory_todo_completion(&todos, item_index, status, context)?;
             todos
                 .save_to_path(&context.todo_path)
                 .map_err(map_todo_error)?;
@@ -440,6 +445,7 @@ fn todo_result_envelope(
             json!({
                 "item_index": index,
                 "status": item.status.as_str(),
+                "executor_hint": item.executor_hint.map(|executor| executor.as_str()),
                 "text": item.text,
             })
         })
@@ -469,6 +475,36 @@ fn map_todo_error(error: TodoError) -> LocalToolExecutionError {
             LocalToolExecutionError::Io(error.to_string())
         }
     }
+}
+
+fn reject_invalid_mandatory_todo_completion(
+    todos: &TodoList,
+    item_index: usize,
+    status: TodoStatus,
+    context: &LocalToolContext,
+) -> Result<(), LocalToolExecutionError> {
+    if status != TodoStatus::Completed {
+        return Ok(());
+    }
+    let Some(item) = item_index
+        .checked_sub(1)
+        .and_then(|zero_based| todos.items.get(zero_based))
+    else {
+        return Ok(());
+    };
+    if item.text == MANDATORY_TODO_GENERATE_HTML && !html_report_file_is_acceptable(context) {
+        return Err(LocalToolExecutionError::Path(format!(
+            "cannot mark the HTML-generation todo completed before a non-placeholder deterministic HTML report exists at `{}`",
+            context.html_output_path.display()
+        )));
+    }
+    if item.text == MANDATORY_TODO_OPEN_HTML && !html_report_file_is_acceptable(context) {
+        return Err(LocalToolExecutionError::Path(format!(
+            "cannot mark the html-path-print todo completed because the deterministic HTML report is missing or still a placeholder at `{}`",
+            context.html_output_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn execute_read_file(
@@ -503,6 +539,14 @@ fn execute_write_file(
     let path = resolve_tool_path(&context.working_directory, &args.path, false)?;
     reject_protected_todo_mutation(&path, context)?;
     reject_out_of_order_html_write(&path, context)?;
+    if tool_paths_equivalent(&path, &context.html_output_path)?
+        && !html_report_content_is_acceptable(&args.content)
+    {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` cannot be a placeholder; include the grounded report content before completing the HTML-generation todo",
+            context.html_output_path.display()
+        )));
+    }
     let parent = path.parent().ok_or_else(|| {
         LocalToolExecutionError::Path(format!(
             "file `{}` does not have a writable parent directory",
@@ -771,6 +815,16 @@ async fn execute_bash(
     let stdout = join_capture(stdout_task, "stdout").await?;
     let stderr = join_capture(stderr_task, "stderr").await?;
     let exit_code = status.code().unwrap_or(-1);
+    if status.success()
+        && bash_command_mentions_html_path(&args.command, context)
+        && context.html_output_path.exists()
+        && !html_report_file_is_acceptable(context)
+    {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` cannot be a placeholder; include the grounded report content before completing the HTML-generation todo",
+            context.html_output_path.display()
+        )));
+    }
 
     let mut summary = format!("command: {}\nexit_code: {}", args.command, exit_code);
     if !stdout.text.is_empty() {
@@ -831,6 +885,19 @@ fn bash_command_mentions_protected_todo(command: &str, context: &LocalToolContex
 
     command.contains(&absolute)
         || relative_to_working_directory
+            .as_ref()
+            .is_some_and(|path| command.contains(path) || command.contains(&format!("./{path}")))
+}
+
+fn bash_command_mentions_html_path(command: &str, context: &LocalToolContext) -> bool {
+    let html_absolute = context.html_output_path.display().to_string();
+    let html_relative = context
+        .html_output_path
+        .strip_prefix(&context.working_directory)
+        .ok()
+        .map(|path| path.display().to_string());
+    command.contains(&html_absolute)
+        || html_relative
             .as_ref()
             .is_some_and(|path| command.contains(path) || command.contains(&format!("./{path}")))
 }
@@ -903,11 +970,7 @@ fn reject_out_of_order_html_bash(
         .strip_prefix(&context.working_directory)
         .ok()
         .map(|path| path.display().to_string());
-    let mentions_html = command.contains(&html_absolute)
-        || html_relative
-            .as_ref()
-            .is_some_and(|path| command.contains(path) || command.contains(&format!("./{path}")));
-    if !mentions_html {
+    if !bash_command_mentions_html_path(command, context) {
         return Ok(());
     }
 
@@ -918,13 +981,30 @@ fn reject_out_of_order_html_bash(
         });
 
     if opens_html {
-        if todo_text != MANDATORY_TODO_OPEN_HTML {
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` should not be opened in the browser; print the generated HTML file path instead",
+            context.html_output_path.display()
+        )));
+    } else if todo_text == MANDATORY_TODO_OPEN_HTML {
+        if !html_report_file_is_acceptable(context) {
             return Err(LocalToolExecutionError::Path(format!(
-                "the deterministic HTML report `{}` cannot be opened while the current actionable todo is `{}`; finish todos in order",
-                context.html_output_path.display(),
-                todo_text
+                "the deterministic HTML report `{}` cannot have its path printed because it is missing or still a placeholder; finish the HTML-generation todo first",
+                context.html_output_path.display()
             )));
         }
+        let prints_html_path = bash_command_prints_path(command, &html_absolute)
+            || html_relative.as_ref().is_some_and(|path| {
+                bash_command_prints_path(command, path)
+                    || bash_command_prints_path(command, &format!("./{path}"))
+            });
+        if prints_html_path {
+            return Ok(());
+        }
+        return Err(LocalToolExecutionError::Path(format!(
+            "the deterministic HTML report `{}` must be handled by printing its path while the current actionable todo is `{}`",
+            context.html_output_path.display(),
+            todo_text
+        )));
     } else if todo_text != MANDATORY_TODO_GENERATE_HTML {
         return Err(LocalToolExecutionError::Path(format!(
             "the deterministic HTML report `{}` cannot be written from bash while the current actionable todo is `{}`; finish todos in order",
@@ -943,6 +1023,37 @@ fn bash_command_opens_path(command: &str, path: &str) -> bool {
     ]
     .iter()
     .any(|pattern| command.contains(pattern))
+}
+
+fn bash_command_prints_path(command: &str, path: &str) -> bool {
+    [
+        format!("echo {path}"),
+        format!("echo '{path}'"),
+        format!("echo \"{path}\""),
+        format!("printf '%s\\n' {path}"),
+        format!("printf '%s\\n' '{path}'"),
+        format!("printf '%s\\n' \"{path}\""),
+        format!("printf \"%s\\n\" {path}"),
+        format!("printf \"%s\\n\" '{path}'"),
+        format!("printf \"%s\\n\" \"{path}\""),
+        format!("printf '{path}\\n'"),
+        format!("printf \"{path}\\n\""),
+    ]
+    .iter()
+    .any(|pattern| command.contains(pattern))
+}
+
+fn html_report_file_is_acceptable(context: &LocalToolContext) -> bool {
+    fs::read_to_string(&context.html_output_path)
+        .map(|content| html_report_content_is_acceptable(&content))
+        .unwrap_or(false)
+}
+
+fn html_report_content_is_acceptable(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    normalized.contains("<html")
+        && normalized.contains("</html")
+        && !normalized.contains("placeholder")
 }
 
 fn load_next_actionable_todo_text(
@@ -1102,6 +1213,7 @@ mod tests {
 
     use super::{LocalToolContext, builtin_local_tool_catalog, execute_local_tool};
     use crate::state::LocalToolName;
+    use crate::todo::{MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML};
 
     #[test]
     fn builtin_catalog_contains_six_local_tools() {
@@ -1312,7 +1424,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1338,7 +1450,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1364,7 +1476,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [pending] Generate an output HTML page with charts and tables.\n2. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n2. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1379,7 +1491,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cannot be opened while the current actionable todo is")
+                .contains("should not be opened in the browser")
         );
     }
 
@@ -1390,7 +1502,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [pending] Generate an output HTML page with charts and tables.\n2. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n2. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1403,7 +1515,7 @@ mod tests {
         .await
         .expect_err("quoted bash open should still be recognized as open");
         let message = error.to_string();
-        assert!(message.contains("cannot be opened while the current actionable todo is"));
+        assert!(message.contains("should not be opened in the browser"));
         assert!(!message.contains("cannot be written from bash"));
     }
 
@@ -1413,7 +1525,7 @@ mod tests {
         let context = local_tool_context(&temp_dir);
         let result = execute_local_tool(
             &LocalToolName::new("write_todos").expect("valid tool"),
-            &json!({"operation":"initialize","items":["Inspect source data","Compute metrics"]}),
+            &json!({"operation":"initialize","items":["[mcp-executor] Inspect source data","[main-agent] Compute metrics"]}),
             &context,
             Duration::from_secs(5),
         )
@@ -1421,8 +1533,14 @@ mod tests {
         .expect("write_todos initialize should succeed");
 
         let raw = std::fs::read_to_string(&context.todo_path).expect("todo file should exist");
-        assert!(raw.contains("[pending] Inspect source data"));
-        assert!(raw.contains("[pending] Generate an output HTML page with charts and tables."));
+        assert!(raw.contains("[pending] [mcp-executor] Inspect source data"));
+        assert!(raw.contains(
+            "[pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy."
+        ));
+        assert_eq!(
+            result.payload["next_actionable"]["executor_hint"].as_str(),
+            Some("mcp-executor")
+        );
         assert!(result.summary.contains("initialized todo list"));
     }
 
@@ -1432,7 +1550,7 @@ mod tests {
         let context = local_tool_context(&temp_dir);
         execute_local_tool(
             &LocalToolName::new("write_todos").expect("valid tool"),
-            &json!({"operation":"initialize","items":["Inspect source data"]}),
+            &json!({"operation":"initialize","items":["[mcp-executor] Inspect source data"]}),
             &context,
             Duration::from_secs(5),
         )
@@ -1466,7 +1584,102 @@ mod tests {
         )
         .await
         .expect("in_progress -> failed should succeed");
-        assert!(result.summary.contains("[failed] Inspect source data"));
+        assert!(
+            result
+                .summary
+                .contains("[failed] [mcp-executor] Inspect source data")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_todos_cannot_complete_html_generation_without_report() {
+        let temp_dir = temp_dir("tool-write-todos-html-report-required");
+        let context = local_tool_context(&temp_dir);
+        std::fs::write(
+            &context.todo_path,
+            format!("1. [in_progress] {MANDATORY_TODO_GENERATE_HTML}"),
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({"operation":"set_status","item_index":1,"status":"completed"}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("html todo completion requires a report file");
+        assert!(
+            error
+                .to_string()
+                .contains("before a non-placeholder deterministic HTML report exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_placeholder_html_report() {
+        let temp_dir = temp_dir("tool-write-file-placeholder-html");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(
+            context
+                .html_output_path
+                .parent()
+                .expect("html output parent should exist"),
+        )
+        .expect("output dir should exist");
+        std::fs::write(
+            &context.todo_path,
+            format!("1. [in_progress] {MANDATORY_TODO_GENERATE_HTML}"),
+        )
+        .expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("write_file").expect("valid tool"),
+            &json!({
+                "path": "outputs/turn-123-report.html",
+                "content": "<html><body><p>Report placeholder.</p></body></html>"
+            }),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("placeholder report should be rejected");
+        assert!(error.to_string().contains("cannot be a placeholder"));
+    }
+
+    #[tokio::test]
+    async fn bash_cannot_create_missing_report_during_open_todo() {
+        let temp_dir = temp_dir("tool-bash-open-cannot-create-html");
+        let context = local_tool_context(&temp_dir);
+        std::fs::create_dir_all(
+            context
+                .html_output_path
+                .parent()
+                .expect("html output parent should exist"),
+        )
+        .expect("output dir should exist");
+        std::fs::write(
+            &context.todo_path,
+            format!(
+                "1. [completed] {MANDATORY_TODO_GENERATE_HTML}\n2. [in_progress] {MANDATORY_TODO_OPEN_HTML}"
+            ),
+        )
+        .expect("seed todo file");
+
+        let command = format!("printf '%s\\n' {}", context.html_output_path.display());
+        let error = execute_local_tool(
+            &LocalToolName::new("bash").expect("valid tool"),
+            &json!({"command": command}),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("path-print step cannot proceed with a missing html report");
+        assert!(
+            error.to_string().contains(
+                "cannot have its path printed because it is missing or still a placeholder"
+            )
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +1688,7 @@ mod tests {
         let context = local_tool_context(&temp_dir);
         execute_local_tool(
             &LocalToolName::new("write_todos").expect("valid tool"),
-            &json!({"operation":"initialize","items":["Inspect source data","Analyze outliers"]}),
+            &json!({"operation":"initialize","items":["[mcp-executor] Inspect source data","[main-agent] Analyze outliers"]}),
             &context,
             Duration::from_secs(5),
         )
@@ -1516,7 +1729,7 @@ mod tests {
 
         let result = execute_local_tool(
             &LocalToolName::new("write_todos").expect("valid tool"),
-            &json!({"operation":"replan_pending_suffix","items":["Analyze cohorts instead"]}),
+            &json!({"operation":"replan_pending_suffix","items":["[main-agent] Analyze cohorts instead"]}),
             &context,
             Duration::from_secs(5),
         )
@@ -1524,9 +1737,11 @@ mod tests {
         .expect("replan should succeed");
 
         let raw = std::fs::read_to_string(&context.todo_path).expect("todo file should exist");
-        assert!(raw.contains("[completed] Inspect source data"));
-        assert!(raw.contains("[pending] Analyze cohorts instead"));
-        assert!(raw.contains("[pending] Open the generated output HTML page in the browser."));
+        assert!(raw.contains("[completed] [mcp-executor] Inspect source data"));
+        assert!(raw.contains("[pending] [main-agent] Analyze cohorts instead"));
+        assert!(
+            raw.contains("[pending] [tool-executor] Print the path of the generated HTML file.")
+        );
         assert!(result.summary.contains("replanned pending todo suffix"));
     }
 

@@ -14,6 +14,7 @@ Planning rules:
 Planning output rules:
 - Decide whether this turn needs an elaborate todo file.
 - If a todo file is needed, return `planning_complete` with concrete ordered `todo_items`.
+- Every `todo_items` string must start with exactly one executor hint: `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`. Choose the hint semantically from where the work must run; do not leave hint selection for runtime.
 - If a todo file is not needed, return `planning_complete` with `todo_required=false`.
 - Put the concise answer in `content` when planning already resolved a simple factual request or direct reply.
 - Use `selected_sources`, `discovered_facts`, `execution_strategy`, and `risks_and_constraints` to make the execution handoff explicit.

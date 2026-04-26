@@ -1,5 +1,5 @@
-1. [completed] Define scope
-2. [completed] Collect and prepare CSK IPL 2025 season data and supporting context
-3. [pending] Perform analysis
-4. [pending] Generate an output HTML page with charts and tables.
-5. [pending] Open the generated output HTML page in the browser.
+1. [completed] [main-agent] Define scope
+2. [completed] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context
+3. [pending] [main-agent] Perform analysis
+4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+5. [pending] [tool-executor] Print the path of the generated HTML file.

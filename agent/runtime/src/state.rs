@@ -104,6 +104,8 @@ pub struct RuntimeLimits {
     pub max_subagent_steps_per_invocation: u32,
     /// Upper bound on MCP actions a sub-agent may execute inside one delegation.
     pub max_subagent_mcp_calls_per_invocation: u32,
+    /// Number of identical MCP actions allowed inside one sub-agent delegation.
+    pub max_duplicate_mcp_calls_per_invocation: u32,
     /// Timeout applied to each individual MCP tool call.
     pub mcp_call_timeout: Duration,
     /// Total wall-clock budget for the full turn.
@@ -117,6 +119,7 @@ impl Default for RuntimeLimits {
             max_mcp_calls_per_step: 4,
             max_subagent_steps_per_invocation: 8,
             max_subagent_mcp_calls_per_invocation: 4,
+            max_duplicate_mcp_calls_per_invocation: 3,
             mcp_call_timeout: Duration::from_secs(10),
             turn_timeout: Duration::from_secs(60),
         }

@@ -12,6 +12,7 @@ Operating rules:
 - If recent computed results are included in the delegated context, treat them as valid analysis input. Materialize the relevant rows into a local file first, then build the visualization from that file.
 - Follow the runtime turn policy section for whether todos are required on this deployment.
 - When current-turn todo context is present, treat it as the execution plan for this turn.
+- If you create or replan todos with `write_todos`, every new item must start with `[mcp-executor]`, `[tool-executor]`, or `[main-agent]` to identify the intended executor.
 - If todos are required and the existing starter plan is too coarse for the delegated task, replan only the future pending suffix before substantive execution.
 - If the next actionable todo is the generic starter scaffold such as `Understand and complete the user request.`, replace that scaffold with concrete ordered todos for the actual task before substantive execution.
 - If the generic starter scaffold has already been replaced with a concrete plan and no todo has failed, do not call `replan_pending_suffix` again. Continue the current todo instead.
@@ -25,7 +26,7 @@ Operating rules:
 - Do not feed rendered todo lines back into `replan_pending_suffix`. Pass only clean future step texts.
 - If the current todo is primarily about data discovery, schema inspection, or querying an MCP-backed system, return `partial` instead of trying to do that work with local tools.
 - If local inspection shows there is no relevant dataset or source file in the workspace and the next actionable todo is still an MCP-style data-loading or discovery step, return `partial` immediately. Do not create placeholder scripts that only restate the absence of local data.
-- If todos are optional and no todo context exists, analysis/reporting work is not complete until the deterministic HTML report has been written and opened, unless the task is only a very simple factual reply.
+- If todos are optional and no todo context exists, analysis/reporting work is not complete until the deterministic HTML report has been written and its path printed, unless the task is only a very simple factual reply.
 - Use workspace-relative paths and prefer these conventions:
   - `scripts/` for generated Python programs
   - `outputs/` for charts, PNG and HTML visualizations, tables, JSON summaries, and other analysis artifacts
@@ -45,8 +46,8 @@ Operating rules:
 - read back the important results before returning `done`
 - if todos are required and the starter plan is not sufficient, replan the future pending suffix before continuing
 - When the plan requires an HTML deliverable, write it to the deterministic output path included in the prompt.
-- When the current todo item is to open the HTML page, use `bash` with `open <html_path>`.
-- When todos are optional and no todo context exists but the delegated work is analysis/reporting work, still write the HTML report to the deterministic path and open it before returning `done`.
+- When the current todo item is to print the HTML path, use `bash` with `printf '%s\n' <html_path>`.
+- When todos are optional and no todo context exists but the delegated work is analysis/reporting work, still write the HTML report to the deterministic path and print its path before returning `done`.
 - If a useful visual can clarify the outcome, include it in `outputs/` instead of returning text findings alone.
 - Prefer `glob` for path discovery before opening files.
 - Use `read_file` before mutating when the current file contents are not already known.

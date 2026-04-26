@@ -23,10 +23,9 @@
 use agent_runtime::{
     model::{
         FinalAnswerRenderRequest, FinalAnswerRenderResponse, FinalAnswerStreamSink, ModelAdapter,
-        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink,
-        ModelAdapterError, ModelAdapterResponse, ModelStepDecision, ModelStepRequest,
-        SubagentAdapterResponse, SubagentDecision, SubagentDelegationRequest,
-        SubagentStepRequest, TurnPhase,
+        ModelAdapterArtifact, ModelAdapterArtifactKind, ModelAdapterDebugSink, ModelAdapterError,
+        ModelAdapterResponse, ModelStepDecision, ModelStepRequest, SubagentAdapterResponse,
+        SubagentDecision, SubagentDelegationRequest, SubagentStepRequest, TurnPhase,
     },
     policy::ToolMaskPlan,
     state::{DelegationTarget, ResponseClient, ResponseFormat, UsageSummary},
@@ -869,10 +868,7 @@ fn classify_output_text_candidate(text: &str) -> OutputTextCandidateKind {
 
     match value.get("type").and_then(Value::as_str) {
         Some(
-            "planning_complete"
-            | "delegate_subagent"
-            | "mcp_tool_call"
-            | "mcp_resource_read"
+            "planning_complete" | "delegate_subagent" | "mcp_tool_call" | "mcp_resource_read"
             | "local_tool_call",
         ) => OutputTextCandidateKind::Action,
         Some("final" | "done" | "partial" | "cannot_execute") => OutputTextCandidateKind::Terminal,
@@ -1079,7 +1075,10 @@ fn decision_schema(phase: TurnPhase) -> Value {
             "execution_strategy": { "type": "string" },
             "todo_items": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": {
+                    "type": "string",
+                    "description": "Concrete todo item prefixed with exactly one executor hint: `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`."
+                }
             },
             "risks_and_constraints": {
                 "type": "array",
@@ -1504,7 +1503,10 @@ mod tests {
         assert_eq!(body["input"], "hello");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["strict"], true);
-        assert_eq!(body["text"]["format"]["schema"], decision_schema(TurnPhase::Planning));
+        assert_eq!(
+            body["text"]["format"]["schema"],
+            decision_schema(TurnPhase::Planning)
+        );
         assert_eq!(body["metadata"]["step_number"], "2");
         assert_eq!(body["metadata"]["phase"], "planning");
     }
@@ -1621,7 +1623,7 @@ mod tests {
     #[test]
     fn parses_subagent_arguments_and_prunes_null_placeholders() {
         let decision = parse_subagent_decision_text(
-            r#"{"type":"mcp_tool_call","server_name":"ex-vol","tool_name":"list_tables","arguments":{"database":"volonte","include_detailed_columns":true,"like":null},"resource_uri":null,"summary":"list tables","reason":"inspect schema"}"#,
+            r#"{"type":"mcp_tool_call","server_name":"ex-vol","tool_name":"list_tables","arguments":{"database":"analytics_db","include_detailed_columns":true,"like":null},"resource_uri":null,"summary":"list tables","reason":"inspect schema"}"#,
         )
         .expect("mcp tool call should parse");
 
@@ -1632,7 +1634,7 @@ mod tests {
                     .expect("valid server name"),
                 tool_name: "list_tables".to_owned(),
                 arguments: json!({
-                    "database": "volonte",
+                    "database": "analytics_db",
                     "include_detailed_columns": true,
                 }),
             }
@@ -1793,7 +1795,7 @@ mod tests {
     fn prune_null_json_removes_nested_null_placeholders() {
         assert_eq!(
             prune_null_json(json!({
-                "database": "volonte",
+                "database": "analytics_db",
                 "like": null,
                 "options": {
                     "include_detailed_columns": true,
@@ -1802,7 +1804,7 @@ mod tests {
                 "items": [1, null, 2]
             })),
             json!({
-                "database": "volonte",
+                "database": "analytics_db",
                 "options": {
                     "include_detailed_columns": true
                 },
@@ -1921,7 +1923,7 @@ mod tests {
                     "phase": "commentary",
                     "content": [{
                         "type": "output_text",
-                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":\"volonte\",\"include_detailed_columns\":false,\"like\":\"%checkin%\",\"not_like\":\"%response%\",\"page_size\":50,\"page_token\":null,\"query\":null},\"resource_uri\":null,\"summary\":\"Schema discovery suggests weekly active users may be inferred from check-in responses. Next step is to run a SELECT query for weekly distinct users and compare recent weeks.\",\"reason\":\"Need a query to compute week-on-week user counts from the most relevant engagement table(s).\"}"
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":\"analytics_db\",\"include_detailed_columns\":false,\"like\":\"%checkin%\",\"not_like\":\"%response%\",\"page_size\":50,\"page_token\":null,\"query\":null},\"resource_uri\":null,\"summary\":\"Schema discovery suggests weekly active users may be inferred from check-in responses. Next step is to run a SELECT query for weekly distinct users and compare recent weeks.\",\"reason\":\"Need a query to compute week-on-week user counts from the most relevant engagement table(s).\"}"
                     }]
                 },
                 {
@@ -1929,7 +1931,7 @@ mod tests {
                     "phase": "final_answer",
                     "content": [{
                         "type": "output_text",
-                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for Volonte.\",\"reason\":\"Execute the weekly distinct user count query on volonte.checkin_responses to complete the delegated goal.\"}"
+                        "text": "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for ExampleCo.\",\"reason\":\"Execute the weekly distinct user count query on analytics_db.checkin_responses to complete the delegated goal.\"}"
                     }]
                 }
             ]
@@ -1940,7 +1942,7 @@ mod tests {
             payload
                 .extract_output_text()
                 .expect("final answer candidate should win"),
-            "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for Volonte.\",\"reason\":\"Execute the weekly distinct user count query on volonte.checkin_responses to complete the delegated goal.\"}"
+            "{\"type\":\"mcp_tool_call\",\"server_name\":\"ex-vol\",\"tool_name\":\"run_select_query\",\"arguments\":{\"database\":null,\"include_detailed_columns\":null,\"like\":null,\"not_like\":null,\"page_size\":null,\"page_token\":null,\"query\":\"select 1\"},\"resource_uri\":null,\"summary\":\"Running query to calculate recent weekly user counts and week-on-week change for ExampleCo.\",\"reason\":\"Execute the weekly distinct user count query on analytics_db.checkin_responses to complete the delegated goal.\"}"
         );
     }
 
@@ -2049,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_subagent_output_text_prefers_first_actionable_commentary_over_later_final_answer_duplicate() {
+    fn extract_subagent_output_text_prefers_actionable_commentary_before_final_duplicate() {
         let payload: ResponsesCreateResponse = serde_json::from_value(json!({
             "output": [
                 {
@@ -2162,9 +2164,13 @@ mod tests {
 
     #[test]
     fn retryable_provider_statuses_are_classified_correctly() {
-        assert!(should_retry_provider_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(should_retry_provider_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
         assert!(should_retry_provider_status(StatusCode::BAD_GATEWAY));
-        assert!(should_retry_provider_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(should_retry_provider_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
         assert!(should_retry_provider_status(StatusCode::GATEWAY_TIMEOUT));
         assert!(should_retry_provider_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry_provider_status(StatusCode::REQUEST_TIMEOUT));

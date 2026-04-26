@@ -29,6 +29,7 @@ Beginning of every turn, do elborate planning and task breakdown in form of todo
 Todo planning rules:
 - Initialize a todo file before substantive execution on every turn.
 - Write todo items as outcome-oriented steps, not low-level tool clicks. But the outcome steps as elaborate as possible. Think deepply when you do plan breakdown to create todos
+- Prefix every todo item with exactly one executor hint: `[mcp-executor]` for MCP/database/API-backed discovery and queries, `[tool-executor]` for local files/scripts/HTML/charts/path printing, or `[main-agent]` for synthesis/final-answer steps. Choose the executor semantically based on where the work must run.
 - Keep the plan concrete, ordered, and directly executable.
 - Execute one todo item at a time and do not skip ahead.
 - Mark a todo item `completed` only after the corresponding work is actually finished.
@@ -38,12 +39,12 @@ Todo planning rules:
 - If a todo file exists, use it as the execution plan
 - If the todo file still contains the generic starter scaffold such as `Understand and complete the user request.`, do not begin substantive MCP or analysis work yet. First delegate `tool-executor` with local tools scope and use `write_todos` `replan_pending_suffix` to replace that scaffold with concrete ordered todos for this specific turn.
 - A delegation whose goal is to create, refine, or replan the todo list is planning-only work. In that delegation, do not start executing the new plan, do not inspect unrelated workspace data, and do not mark later execution todos `in_progress` or `completed`. Rewrite the pending todo suffix, then return control immediately.
-- For genuinely complex work, the todo plan must be meaningfully more specific than the generic starter scaffold. Break the work into concrete phases such as data discovery, computation, validation, synthesis, visualization, and browser-open when those phases are actually needed.
-- Use `mcp-executor` for data discovery, schema/table inspection, query execution, and collection of source data from MCP-backed systems. Use `tool-executor` only for workspace-side scripting, transformations, report generation, visualization, and browser-open steps after the data is already available.
+- For genuinely complex work, the todo plan must be meaningfully more specific than the generic starter scaffold. Break the work into concrete phases such as data discovery, computation, validation, synthesis, visualization, and generated HTML path-printing when those phases are actually needed.
+- Use `mcp-executor` for data discovery, schema/table inspection, query execution, and collection of source data from MCP-backed systems. Use `tool-executor` only for workspace-side scripting, transformations, report generation, visualization, and generated HTML path-print steps after the data is already available.
 - For any non-trivial analysis, add a todo to delegate to local tools and write and use Python scripts instead of trying to reason it out only in prose. Use Python by default when the task involves dataset inspection, filtering, joins, aggregations, grouped comparisons, statistics, trend analysis, anomaly detection, repeated transformations, chart generation, or conclusions that should be grounded in computed evidence. When using Python, write reproducible scripts inside the session workspace, typically under `scripts/`, and write generated outputs under `outputs/`.
 - Every todo plan must end with these steps in this order:
-  - Generate an output HTML page with charts and tables.
-  - Open the generated output HTML page in the browser.
+  - Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.
+  - Print the path of the generated HTML file.
   - In your final answer, summarize the findings clearly and mention the relevant generated files when you created scripts, charts, or output artifacts.
 - Use the deterministic HTML output path `outputs/<turn_id>-report.html`.
 

@@ -2059,6 +2059,22 @@ impl CliTheme {
         self.paint(text, "1;38;5;255")
     }
 
+    fn assistant(&self, text: &str) -> String {
+        self.paint(text, "1;38;5;45")
+    }
+
+    fn assistant_soft(&self, text: &str) -> String {
+        self.paint(text, "38;5;81")
+    }
+
+    fn info(&self, text: &str) -> String {
+        self.paint(text, "1;38;5;110")
+    }
+
+    fn info_soft(&self, text: &str) -> String {
+        self.paint(text, "38;5;74")
+    }
+
     fn muted(&self, text: &str) -> String {
         self.paint(text, "38;5;244")
     }
@@ -2069,6 +2085,10 @@ impl CliTheme {
 
     fn accent_soft(&self, text: &str) -> String {
         self.paint(text, "38;5;117")
+    }
+
+    fn command(&self, text: &str) -> String {
+        self.paint(text, "1;38;5;223")
     }
 
     fn success(&self, text: &str) -> String {
@@ -2094,13 +2114,13 @@ impl CliTheme {
     fn transcript_width(&self) -> usize {
         self.presentation
             .transcript_width_override
-            .unwrap_or_else(|| default_card_width(84))
+            .unwrap_or_else(|| default_card_width(156))
     }
 
     fn card_width(&self) -> usize {
         self.presentation
             .transcript_width_override
-            .unwrap_or_else(|| default_card_width(82))
+            .unwrap_or_else(|| default_card_width(154))
     }
 
     fn uses_rich_borders(&self) -> bool {
@@ -2295,12 +2315,7 @@ fn render_card(
         };
     let title_plain = format!(" {title} ");
     let fill = horizontal.repeat(inner_width.saturating_sub(title_plain.chars().count()));
-    let title_styled = match tone {
-        CardTone::Assistant => theme.accent(title),
-        CardTone::User => theme.strong(title),
-        CardTone::Status => theme.bold(title),
-        CardTone::Warning => theme.warning(title),
-    };
+    let title_styled = style_card_heading(theme, tone, title);
     let title_styled = format!(" {} ", title_styled);
 
     let mut rendered = vec![format!(
@@ -2331,12 +2346,13 @@ fn render_card(
         for line in lines {
             let wrapped = wrap_text(line, inner_width.saturating_sub(2));
             for wrapped_line in wrapped {
-                let formatted =
-                    if wrapped_line.starts_with('/') || is_section_heading(&wrapped_line) {
-                        wrapped_line.clone()
-                    } else {
-                        style_kv_line(theme, &wrapped_line)
-                    };
+                let formatted = if wrapped_line.starts_with('/') {
+                    theme.command(&wrapped_line)
+                } else if is_section_heading(&wrapped_line) {
+                    style_card_heading(theme, tone, &wrapped_line)
+                } else {
+                    style_kv_line(theme, tone, &wrapped_line)
+                };
                 rendered.push(format_card_line(
                     theme,
                     tone,
@@ -2462,8 +2478,8 @@ fn default_card_width(fallback: usize) -> usize {
     let columns = env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(fallback + 4);
-    columns.saturating_sub(4).clamp(56, fallback)
+        .unwrap_or(fallback + 1);
+    columns.saturating_sub(1).clamp(72, fallback)
 }
 
 fn format_count(value: u32) -> String {
@@ -2666,8 +2682,18 @@ fn split_long_word(word: &str, width: usize) -> Vec<String> {
 
 fn style_card_border(theme: &CliTheme, tone: CardTone, text: &str) -> String {
     match tone {
-        CardTone::Assistant | CardTone::Status => theme.muted(text),
+        CardTone::Assistant => theme.assistant_soft(text),
+        CardTone::Status => theme.info_soft(text),
         CardTone::User => theme.success(text),
+        CardTone::Warning => theme.warning(text),
+    }
+}
+
+fn style_card_heading(theme: &CliTheme, tone: CardTone, text: &str) -> String {
+    match tone {
+        CardTone::Assistant => theme.assistant(text),
+        CardTone::User => theme.strong(text),
+        CardTone::Status => theme.info(text),
         CardTone::Warning => theme.warning(text),
     }
 }
@@ -2690,11 +2716,56 @@ fn format_card_line(
     )
 }
 
-fn style_kv_line(theme: &CliTheme, line: &str) -> String {
+fn style_kv_line(theme: &CliTheme, tone: CardTone, line: &str) -> String {
     let Some((label, value)) = line.split_once(':') else {
-        return line.to_owned();
+        return style_inline_tokens(theme, line);
     };
-    format!("{}:{}", theme.bold(label), value)
+    format!(
+        "{}:{}",
+        style_card_border(theme, tone, &theme.bold(label)),
+        style_inline_tokens(theme, value)
+    )
+}
+
+fn style_inline_tokens(theme: &CliTheme, text: &str) -> String {
+    text.split(' ')
+        .map(|token| style_inline_token(theme, token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn style_inline_token(theme: &CliTheme, token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+
+    let start = token
+        .char_indices()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '`'))
+        .map(|(index, _)| index)
+        .unwrap_or(token.len());
+    let end = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '`'))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+
+    if start >= end {
+        return token.to_owned();
+    }
+
+    let prefix = &token[..start];
+    let core = &token[start..end];
+    let suffix = &token[end..];
+    let styled = if core.starts_with('/') || core.starts_with('\\') {
+        theme.command(core)
+    } else if core.starts_with('`') && core.ends_with('`') && core.len() > 1 {
+        theme.accent_soft(core)
+    } else {
+        core.to_owned()
+    };
+    format!("{prefix}{styled}{suffix}")
 }
 
 fn print_prompt(theme: &CliTheme) {

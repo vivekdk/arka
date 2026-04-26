@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const MANDATORY_TODO_GENERATE_HTML: &str =
-    "Generate an output HTML page with charts and tables.";
-pub const MANDATORY_TODO_OPEN_HTML: &str = "Open the generated output HTML page in the browser.";
+    "Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.";
+pub const MANDATORY_TODO_OPEN_HTML: &str = "Print the path of the generated HTML file.";
 pub const GENERIC_STARTER_TODO: &str = "Understand and complete the user request.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,9 +55,50 @@ impl std::str::FromStr for TodoStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TodoExecutor {
+    MainAgent,
+    McpExecutor,
+    ToolExecutor,
+}
+
+impl TodoExecutor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MainAgent => "main-agent",
+            Self::McpExecutor => "mcp-executor",
+            Self::ToolExecutor => "tool-executor",
+        }
+    }
+}
+
+impl fmt::Display for TodoExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TodoExecutor {
+    type Err = TodoError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "main-agent" => Ok(Self::MainAgent),
+            "mcp-executor" => Ok(Self::McpExecutor),
+            "tool-executor" => Ok(Self::ToolExecutor),
+            other => Err(TodoError::Parse(format!(
+                "unknown todo executor `{other}`; expected main-agent, mcp-executor, or tool-executor"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub status: TodoStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_hint: Option<TodoExecutor>,
     pub text: String,
 }
 
@@ -68,14 +109,7 @@ pub struct TodoList {
 
 impl TodoList {
     pub fn initialize(items: &[String]) -> Result<Self, TodoError> {
-        let items = with_mandatory_tail(items)?;
-        let items = items
-            .into_iter()
-            .map(|text| TodoItem {
-                status: TodoStatus::Pending,
-                text,
-            })
-            .collect();
+        let items = new_todo_items_with_mandatory_tail(items, &[])?;
         let todo_list = Self { items };
         todo_list.validate()?;
         Ok(todo_list)
@@ -123,7 +157,7 @@ impl TodoList {
                         line_number + 1
                     ))
                 })?;
-            let text = remainder
+            let raw_text = remainder
                 .get(status_end + 1..)
                 .map(str::trim)
                 .ok_or_else(|| {
@@ -132,6 +166,7 @@ impl TodoList {
                         line_number + 1
                     ))
                 })?;
+            let (executor_hint, text) = parse_optional_executor_hint(raw_text)?;
             if text.is_empty() {
                 return Err(TodoError::Parse(format!(
                     "todo line {} has empty todo text",
@@ -141,6 +176,7 @@ impl TodoList {
 
             items.push(TodoItem {
                 status: status_text.parse()?,
+                executor_hint,
                 text: text.to_owned(),
             });
         }
@@ -170,7 +206,19 @@ impl TodoList {
         self.items
             .iter()
             .enumerate()
-            .map(|(index, item)| format!("{}. [{}] {}", index + 1, item.status, item.text))
+            .map(|(index, item)| {
+                if let Some(executor_hint) = item.executor_hint {
+                    format!(
+                        "{}. [{}] [{}] {}",
+                        index + 1,
+                        item.status,
+                        executor_hint,
+                        item.text
+                    )
+                } else {
+                    format!("{}. [{}] {}", index + 1, item.status, item.text)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -247,17 +295,7 @@ impl TodoList {
             .iter()
             .map(|item| item.text.as_str())
             .collect::<Vec<_>>();
-        let sanitized_items = items
-            .iter()
-            .filter_map(|text| sanitize_replan_item(text, &preserved_texts))
-            .collect::<Vec<_>>();
-        let replacement = with_mandatory_tail(&sanitized_items)?
-            .into_iter()
-            .map(|text| TodoItem {
-                status: TodoStatus::Pending,
-                text,
-            })
-            .collect::<Vec<_>>();
+        let replacement = new_todo_items_with_mandatory_tail(items, &preserved_texts)?;
         preserved.extend(replacement);
         self.items = preserved;
         self.validate()
@@ -335,38 +373,76 @@ enum TodoValidationPhase {
     PendingSuffix,
 }
 
-fn with_mandatory_tail(items: &[String]) -> Result<Vec<String>, TodoError> {
+fn new_todo_items_with_mandatory_tail(
+    items: &[String],
+    preserved_texts: &[&str],
+) -> Result<Vec<TodoItem>, TodoError> {
     let mut normalized = Vec::new();
     for item in items {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
-            return Err(TodoError::Validation(
-                "todo items cannot be blank".to_owned(),
-            ));
+        if let Some(item) = sanitize_new_todo_item(item, preserved_texts)? {
+            normalized.push(item);
         }
-        if canonical_mandatory_todo(trimmed).is_some() {
-            continue;
-        }
-        normalized.push(trimmed.to_owned());
     }
-    normalized.push(MANDATORY_TODO_GENERATE_HTML.to_owned());
-    normalized.push(MANDATORY_TODO_OPEN_HTML.to_owned());
+    normalized.push(TodoItem {
+        status: TodoStatus::Pending,
+        executor_hint: Some(TodoExecutor::ToolExecutor),
+        text: MANDATORY_TODO_GENERATE_HTML.to_owned(),
+    });
+    normalized.push(TodoItem {
+        status: TodoStatus::Pending,
+        executor_hint: Some(TodoExecutor::ToolExecutor),
+        text: MANDATORY_TODO_OPEN_HTML.to_owned(),
+    });
     Ok(normalized)
 }
 
-fn sanitize_replan_item(item: &str, preserved_texts: &[&str]) -> Option<String> {
+fn sanitize_new_todo_item(
+    item: &str,
+    preserved_texts: &[&str],
+) -> Result<Option<TodoItem>, TodoError> {
     let mut text = item.trim();
     if let Some(stripped) = strip_rendered_todo_prefix(text) {
         text = stripped;
     }
-    let trimmed = text.trim();
+    let (executor_hint, trimmed) = parse_optional_executor_hint(text)?;
     if trimmed.is_empty()
         || canonical_mandatory_todo(trimmed).is_some()
         || preserved_texts.iter().any(|existing| *existing == trimmed)
     {
-        return None;
+        return Ok(None);
     }
-    Some(trimmed.to_owned())
+    let executor_hint = executor_hint.or_else(|| {
+        if trimmed == GENERIC_STARTER_TODO {
+            Some(TodoExecutor::MainAgent)
+        } else {
+            None
+        }
+    });
+    let Some(executor_hint) = executor_hint else {
+        return Err(TodoError::Validation(format!(
+            "todo item `{trimmed}` must include an executor hint like `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`"
+        )));
+    };
+    Ok(Some(TodoItem {
+        status: TodoStatus::Pending,
+        executor_hint: Some(executor_hint),
+        text: trimmed.to_owned(),
+    }))
+}
+
+fn parse_optional_executor_hint(value: &str) -> Result<(Option<TodoExecutor>, &str), TodoError> {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix('[') else {
+        return Ok((None, value));
+    };
+    let Some(end) = rest.find(']') else {
+        return Ok((None, value));
+    };
+    let candidate = &rest[..end];
+    match candidate.parse::<TodoExecutor>() {
+        Ok(executor) => Ok((Some(executor), rest[end + 1..].trim())),
+        Err(_) => Ok((None, value)),
+    }
 }
 
 fn strip_rendered_todo_prefix(value: &str) -> Option<&str> {
@@ -389,10 +465,26 @@ fn canonical_mandatory_todo(value: &str) -> Option<&'static str> {
     let normalized = normalize_for_match(value);
     let generate_verbs = ["generate", "create", "build", "render", "produce", "write"];
     let mentions_html_report =
-        normalized.contains("html") || normalized.contains("report") || normalized.contains("page");
+        normalized.contains("html")
+            || normalized.contains("report")
+            || normalized.contains("page")
+            || normalized.contains("story");
     let mentions_visual_payload = normalized.contains("chart")
         || normalized.contains("table")
         || normalized.contains("visual");
+
+    let mentions_print_path = (normalized.contains("print")
+        || normalized.contains("display")
+        || normalized.contains("show")
+        || normalized.contains("return"))
+        && normalized.contains("path")
+        && (normalized.contains("html")
+            || normalized.contains("report")
+            || normalized.contains("file"));
+
+    if mentions_print_path {
+        return Some(MANDATORY_TODO_OPEN_HTML);
+    }
 
     if normalized.contains("open")
         && (normalized.contains("html")
@@ -448,21 +540,65 @@ pub enum TodoError {
 mod tests {
     use super::{
         GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError,
-        TodoList, TodoStatus,
+        TodoExecutor, TodoList, TodoStatus,
     };
 
     #[test]
     fn initialize_sets_all_items_to_pending_and_appends_mandatory_tail() {
         let todos = TodoList::initialize(&[
-            "Inspect the data".to_owned(),
+            "[mcp-executor] Inspect the data".to_owned(),
             MANDATORY_TODO_GENERATE_HTML.to_owned(),
         ])
         .expect("initialize should succeed");
 
         assert_eq!(todos.items.len(), 3);
         assert_eq!(todos.items[0].status, TodoStatus::Pending);
+        assert_eq!(
+            todos.items[0].executor_hint,
+            Some(TodoExecutor::McpExecutor)
+        );
         assert_eq!(todos.items[1].text, MANDATORY_TODO_GENERATE_HTML);
+        assert_eq!(
+            todos.items[1].executor_hint,
+            Some(TodoExecutor::ToolExecutor)
+        );
         assert_eq!(todos.items[2].text, MANDATORY_TODO_OPEN_HTML);
+    }
+
+    #[test]
+    fn render_includes_executor_hints_when_present() {
+        let todos = TodoList::initialize(&[
+            "[mcp-executor] Inspect the data".to_owned(),
+            "[main-agent] Summarize findings".to_owned(),
+        ])
+        .expect("initialize should succeed");
+
+        let rendered = todos.render();
+
+        assert!(rendered.contains("1. [pending] [mcp-executor] Inspect the data"));
+        assert!(rendered.contains("2. [pending] [main-agent] Summarize findings"));
+        assert!(rendered.contains(
+            "3. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy."
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_legacy_unhinted_todo_files() {
+        let todos = TodoList::parse(
+            "1. [pending] Inspect\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("legacy todo file should parse");
+
+        assert_eq!(todos.items[0].executor_hint, None);
+        assert_eq!(todos.items[0].text, "Inspect");
+    }
+
+    #[test]
+    fn initialize_rejects_unhinted_new_non_mandatory_items() {
+        let error = TodoList::initialize(&["Inspect the data".to_owned()])
+            .expect_err("new concrete items require executor hints");
+
+        assert!(error.to_string().contains("must include an executor hint"));
     }
 
     #[test]
@@ -482,8 +618,11 @@ mod tests {
 
     #[test]
     fn set_status_enforces_ordered_progression() {
-        let mut todos = TodoList::initialize(&["Inspect".to_owned(), "Analyze".to_owned()])
-            .expect("initialize should succeed");
+        let mut todos = TodoList::initialize(&[
+            "[mcp-executor] Inspect".to_owned(),
+            "[main-agent] Analyze".to_owned(),
+        ])
+        .expect("initialize should succeed");
         todos
             .set_status(1, TodoStatus::InProgress)
             .expect("pending -> in_progress should succeed");
@@ -498,8 +637,11 @@ mod tests {
 
     #[test]
     fn set_status_is_idempotent_for_same_status() {
-        let mut todos = TodoList::initialize(&["Inspect".to_owned(), "Analyze".to_owned()])
-            .expect("initialize should succeed");
+        let mut todos = TodoList::initialize(&[
+            "[mcp-executor] Inspect".to_owned(),
+            "[main-agent] Analyze".to_owned(),
+        ])
+        .expect("initialize should succeed");
         todos
             .set_status(1, TodoStatus::InProgress)
             .expect("pending -> in_progress should succeed");
@@ -534,12 +676,12 @@ mod tests {
     #[test]
     fn replan_rewrites_only_pending_suffix() {
         let mut todos = TodoList::parse(
-            "1. [completed] Inspect\n2. [failed] Analyze\n3. [pending] Summarize\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Inspect\n2. [failed] Analyze\n3. [pending] Summarize\n4. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
         todos
-            .replan_pending_suffix(&["Retry analysis with grouping".to_owned()])
+            .replan_pending_suffix(&["[main-agent] Retry analysis with grouping".to_owned()])
             .expect("replan should succeed");
 
         assert_eq!(todos.items[0].status, TodoStatus::Completed);
@@ -552,14 +694,14 @@ mod tests {
     #[test]
     fn replan_replaces_generic_starter_when_it_is_current_actionable() {
         let mut todos = TodoList::parse(
-            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
         todos
             .replan_pending_suffix(&[
-                "Define the CSK IPL 2025 analysis scope".to_owned(),
-                "Collect and prepare CSK IPL 2025 season data".to_owned(),
+                "[main-agent] Define the CSK IPL 2025 analysis scope".to_owned(),
+                "[mcp-executor] Collect and prepare CSK IPL 2025 season data".to_owned(),
             ])
             .expect("replan should succeed");
 
@@ -585,9 +727,9 @@ mod tests {
     #[test]
     fn initialize_dedupes_equivalent_html_tail_aliases() {
         let todos = TodoList::initialize(&[
-            "Define scope".to_owned(),
+            "[main-agent] Define scope".to_owned(),
             "Generate the output HTML page with analysis, charts, and tables".to_owned(),
-            "Open the generated HTML report in the browser".to_owned(),
+            "Print the path of the generated HTML file".to_owned(),
             "Generate a final consolidated HTML summary page with charts and tables".to_owned(),
         ])
         .expect("initialize should succeed");
@@ -601,7 +743,7 @@ mod tests {
     #[test]
     fn replan_strips_rendered_prefixes_and_drops_preserved_duplicates() {
         let mut todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [failed] Collect data\n3. [pending] Analyze\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Define scope\n2. [failed] Collect data\n3. [pending] Analyze\n4. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
@@ -609,7 +751,7 @@ mod tests {
             .replan_pending_suffix(&[
                 "1. [completed] Define scope".to_owned(),
                 "2. [failed] Collect data".to_owned(),
-                "3. [pending] Build local analysis files".to_owned(),
+                "3. [pending] [tool-executor] Build local analysis files".to_owned(),
             ])
             .expect("replan should succeed");
 
@@ -623,12 +765,12 @@ mod tests {
     #[test]
     fn replan_rejects_concrete_plan_without_failed_todo() {
         let mut todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [pending] Collect data\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Define scope\n2. [pending] Collect data\n3. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
         let error = todos
-            .replan_pending_suffix(&["Compute batting metrics".to_owned()])
+            .replan_pending_suffix(&["[main-agent] Compute batting metrics".to_owned()])
             .expect_err("concrete plan should not be replanned without failure");
         assert!(
             error

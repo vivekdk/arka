@@ -132,7 +132,7 @@ pub fn render_turn_policy_context(turn_policy_context: &TurnPolicyPromptContext)
         None => "Execution todo file required: planning has not decided yet".to_owned(),
     };
     format!(
-        "{phase_summary}\nDeployment force-todo override: {}\n{todo_summary}\nDeterministic HTML output: {}\nIf a todo file is required for execution, it must exist before substantive execution begins.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work in execution, generate the HTML report and open it in the browser before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
+        "{phase_summary}\nDeployment force-todo override: {}\n{todo_summary}\nDeterministic HTML output: {}\nIf a todo file is required for execution, it must exist before substantive execution begins.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work in execution, generate the HTML report and print the generated HTML file path before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
         turn_policy_context.force_todo_file,
         turn_policy_context.html_output_path.display()
     )

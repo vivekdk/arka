@@ -38,7 +38,7 @@ pub use state::{
     TurnOutcome, TurnRecord, UsageSummary,
 };
 pub use todo::{
-    MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError, TodoItem, TodoList,
-    TodoStatus,
+    MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError, TodoExecutor, TodoItem,
+    TodoList, TodoStatus,
 };
 pub use tools::{ToolCallResultEnvelope, ToolDescriptor, ToolFamily, builtin_local_tool_catalog};

@@ -105,6 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "RUNTIME_MAX_SUBAGENT_MCP_CALLS_PER_INVOCATION",
             4,
         ),
+        max_duplicate_mcp_calls_per_invocation: read_env_u32(
+            "RUNTIME_MAX_DUPLICATE_MCP_CALLS_PER_INVOCATION",
+            3,
+        ),
         turn_timeout: Duration::from_secs(read_env_u64("RUNTIME_TURN_TIMEOUT_SECS", 180)),
         mcp_call_timeout: Duration::from_secs(read_env_u64("RUNTIME_MCP_CALL_TIMEOUT_SECS", 10)),
         ..RuntimeLimits::default()

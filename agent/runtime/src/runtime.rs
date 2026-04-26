@@ -33,7 +33,8 @@ use crate::{
     },
     subagent::{ConfiguredSubagent, SubagentConfigError, SubagentRegistry, load_subagent_prompt},
     todo::{
-        GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoList,
+        GENERIC_STARTER_TODO, MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError,
+        TodoExecutor, TodoItem, TodoList,
     },
     tools::{LocalToolContext, ToolDescriptor, builtin_local_tool_catalog, execute_local_tool},
 };
@@ -326,7 +327,7 @@ where
                 "prompt built"
             );
 
-            let (decision, step_usage) = self
+            let generated_step = self
                 .generate_validated_step(
                     step_number,
                     phase,
@@ -339,7 +340,45 @@ where
                     &turn_id,
                     &step_id,
                 )
-                .await?;
+                .await;
+            let (decision, step_usage) = match generated_step {
+                Ok(generated) => generated,
+                Err(RuntimeError::Model(ModelAdapterError::InvalidDecision(error))) => {
+                    let feedback = MessageRecord::Llm(LlmMessageRecord {
+                        message_id: MessageId::new(),
+                        timestamp: SystemTime::now(),
+                        content: invalid_main_decision_feedback(&error, phase, &subagent_registry),
+                    });
+                    all_messages.push(feedback.clone());
+                    push_prompt_message_for_phase(
+                        phase,
+                        &mut planning_prompt_messages,
+                        &mut execution_prompt_messages,
+                        feedback.clone(),
+                    );
+
+                    let step = StepRecord {
+                        step_id: step_id.clone(),
+                        step_number,
+                        started_at: step_started_at,
+                        ended_at: SystemTime::now(),
+                        prompt,
+                        decision: None,
+                        messages: vec![feedback],
+                        outcome: StepOutcomeKind::Continue,
+                        usage: UsageSummary::default(),
+                    };
+                    steps.push(step);
+                    sink.record(RuntimeEvent::StepEnded {
+                        turn_id: turn_id.clone(),
+                        step_id: step_id.clone(),
+                        executor: main_executor.clone(),
+                        at: SystemTime::now(),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             usage.add_assign(step_usage);
             info!(
                 turn_id = %turn_id,
@@ -430,6 +469,44 @@ where
                         });
                         continue;
                     };
+
+                    if let Some(feedback_content) =
+                        planning_todo_items_feedback(&outcome, request.require_todos, &todo_path)?
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback_content,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback.clone());
+                        push_prompt_message_for_phase(
+                            phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            feedback,
+                        );
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
 
                     let handoff =
                         materialize_planning_outcome(&outcome, &todo_path, request.require_todos)?;
@@ -1116,6 +1193,7 @@ where
                             &subagent_registry,
                             mcp_session,
                             delegation_phase,
+                            execution_handoff.as_ref(),
                             &resolved_subagent_type,
                             &delegation.target,
                             &delegation.goal,
@@ -1256,6 +1334,7 @@ where
         registry: &SubagentRegistry,
         mcp_session: &mut McpSession,
         phase: TurnPhase,
+        execution_handoff: Option<&ExecutionHandoff>,
         subagent_type: &str,
         target: &DelegationTarget,
         goal: &str,
@@ -1295,6 +1374,7 @@ where
             &request.working_directory,
             &todo_path,
             &turn_policy_context,
+            execution_handoff,
             &subagent_context_messages,
         )?;
         let model_config = configured
@@ -1309,7 +1389,7 @@ where
         let mut executed_action_count = 0u32;
         let mut total_mcp_error_count = 0u32;
         let mut total_local_tool_error_count = 0u32;
-        let mut seen_mcp_actions = HashSet::new();
+        let mut mcp_action_counts = HashMap::<String, u32>::new();
         let mut last_tool_mask_plan =
             crate::policy::ToolMaskPlan::terminal_only("no delegated tools evaluated yet");
 
@@ -1552,6 +1632,7 @@ where
                             result
                         }
                         Err(error) => {
+                            total_mcp_error_count += 1;
                             let validation = SanitizedMcpArguments::rejected(error.clone());
                             emit_mcp_argument_validation_debug(
                                 sink,
@@ -1570,7 +1651,27 @@ where
                                     result_summary: error.clone(),
                                     error: Some(error),
                                 });
+                            trace_messages.push(validation_message.clone());
                             subagent_messages.push(validation_message);
+                            if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
+                                return Ok((
+                                    subagent_result_message(
+                                        subagent_type,
+                                        "partial",
+                                        executed_action_count,
+                                        repeated_invalid_mcp_argument_detail(
+                                            &call_target,
+                                            executed_action_count,
+                                            total_mcp_error_count,
+                                        ),
+                                        Some(tool_mask_plan),
+                                    ),
+                                    DelegatedExecutionOutcome {
+                                        usage,
+                                        trace_messages,
+                                    },
+                                ));
+                            }
                             continue;
                         }
                     };
@@ -1582,22 +1683,38 @@ where
                         call_target.capability_id,
                         canonicalize_action_arguments(&sanitized_arguments)
                     );
-                    if !seen_mcp_actions.insert(action_signature) {
-                        return Ok((
-                            subagent_policy_result(
-                                subagent_type,
-                                executed_action_count,
-                                format!(
-                                    "duplicate MCP tool call `{}` on server `{}` was blocked; choose a different next action or terminate",
-                                    call_target.capability_id, call_target.server_name
+                    let action_count = mcp_action_counts
+                        .entry(action_signature)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    if *action_count > request.limits.max_duplicate_mcp_calls_per_invocation {
+                        let duplicate_message = duplicate_mcp_action_feedback_message(
+                            &call_target,
+                            "tool call",
+                            request.limits.max_duplicate_mcp_calls_per_invocation,
+                        );
+                        total_mcp_error_count += 1;
+                        trace_messages.push(duplicate_message.clone());
+                        subagent_messages.push(duplicate_message);
+                        if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    format!(
+                                        "repeated duplicate MCP tool calls were blocked on server `{}` capability `{}`; use earlier results or choose a different next action",
+                                        call_target.server_name, call_target.capability_id
+                                    ),
+                                    Some(tool_mask_plan),
                                 ),
-                                Some(tool_mask_plan),
-                            ),
-                            DelegatedExecutionOutcome {
-                                usage,
-                                trace_messages,
-                            },
-                        ));
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                        continue;
                     }
 
                     let call_message = MessageRecord::McpCall(McpCallMessageRecord {
@@ -1757,22 +1874,38 @@ where
                         "resource::{}::{}",
                         call_target.server_name, call_target.capability_id
                     );
-                    if !seen_mcp_actions.insert(action_signature) {
-                        return Ok((
-                            subagent_policy_result(
-                                subagent_type,
-                                executed_action_count,
-                                format!(
-                                    "duplicate MCP resource read `{}` on server `{}` was blocked; choose a different next action or terminate",
-                                    call_target.capability_id, call_target.server_name
+                    let action_count = mcp_action_counts
+                        .entry(action_signature)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    if *action_count > request.limits.max_duplicate_mcp_calls_per_invocation {
+                        let duplicate_message = duplicate_mcp_action_feedback_message(
+                            &call_target,
+                            "resource read",
+                            request.limits.max_duplicate_mcp_calls_per_invocation,
+                        );
+                        total_mcp_error_count += 1;
+                        trace_messages.push(duplicate_message.clone());
+                        subagent_messages.push(duplicate_message);
+                        if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
+                            return Ok((
+                                subagent_result_message(
+                                    subagent_type,
+                                    "partial",
+                                    executed_action_count,
+                                    format!(
+                                        "repeated duplicate MCP resource reads were blocked on server `{}` capability `{}`; use earlier results or choose a different next action",
+                                        call_target.server_name, call_target.capability_id
+                                    ),
+                                    Some(tool_mask_plan),
                                 ),
-                                Some(tool_mask_plan),
-                            ),
-                            DelegatedExecutionOutcome {
-                                usage,
-                                trace_messages,
-                            },
-                        ));
+                                DelegatedExecutionOutcome {
+                                    usage,
+                                    trace_messages,
+                                },
+                            ));
+                        }
+                        continue;
                     }
 
                     let call_message = MessageRecord::McpCall(McpCallMessageRecord {
@@ -2244,6 +2377,28 @@ fn normalize_planning_outcome(
     Ok(Some(outcome))
 }
 
+fn planning_todo_items_feedback(
+    outcome: &PlanningOutcome,
+    force_todo_file: bool,
+    todo_path: &Path,
+) -> Result<Option<String>, RuntimeError> {
+    let todo_required = outcome.todo_required || force_todo_file || todo_path.exists();
+    if !todo_required || todo_path.exists() {
+        return Ok(None);
+    }
+    match TodoList::initialize(&outcome.todo_items) {
+        Ok(_) => Ok(None),
+        Err(TodoError::Validation(message)) if message.contains("executor hint") => {
+            Ok(Some(format!(
+                "The `planning_complete.todo_items` are invalid: {message}. Re-emit `planning_complete` with every todo item prefixed by exactly one semantic executor hint: `[mcp-executor]` for MCP/database/API-backed discovery and queries, `[tool-executor]` for local scripts, charts, HTML generation, and path printing, or `[main-agent]` for synthesis/final-answer steps. Do not guess from keywords at runtime; choose the executor from the actual work location."
+            )))
+        }
+        Err(error) => Ok(Some(format!(
+            "The `planning_complete.todo_items` are invalid: {error}. Re-emit `planning_complete` with a valid concrete ordered todo plan."
+        ))),
+    }
+}
+
 fn materialize_planning_outcome(
     outcome: &PlanningOutcome,
     todo_path: &Path,
@@ -2453,9 +2608,18 @@ fn load_todo_prompt_context(todo_path: &Path) -> Result<Option<TodoPromptContext
     Ok(Some(TodoPromptContext {
         todo_path: todo_path.to_path_buf(),
         todo_contents: todo_list.render(),
-        next_actionable: todo_list
-            .next_actionable()
-            .map(|(index, item)| format!("{index}. [{}] {}", item.status.as_str(), item.text)),
+        next_actionable: todo_list.next_actionable().map(|(index, item)| {
+            if let Some(executor_hint) = item.executor_hint {
+                format!(
+                    "{index}. [{}] [{}] {}",
+                    item.status.as_str(),
+                    executor_hint,
+                    item.text
+                )
+            } else {
+                format!("{index}. [{}] {}", item.status.as_str(), item.text)
+            }
+        }),
     }))
 }
 
@@ -2471,7 +2635,7 @@ fn generic_starter_replan_feedback(todo_path: &Path) -> Result<Option<String>, R
         return Ok(None);
     }
     Ok(Some(
-        "The current todo plan is still the generic starter scaffold. Before substantive work or a final answer, delegate `tool-executor` with local tools scope and use `write_todos` `replan_pending_suffix` to replace it with concrete ordered todos that match this turn. That delegation is planning-only: once the todo plan is rewritten, return control immediately instead of starting execution.".to_owned(),
+        "The current todo plan is still the generic starter scaffold. Before substantive work or a final answer, delegate `tool-executor` with local tools scope and use `write_todos` `replan_pending_suffix` to replace it with concrete ordered todos that match this turn. Prefix every new todo with `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`. That delegation is planning-only: once the todo plan is rewritten, return control immediately instead of starting execution.".to_owned(),
     ))
 }
 
@@ -2556,9 +2720,9 @@ fn mcp_collection_feedback_for_delegation(
     let Some((item_index, item)) = todo_list.next_actionable() else {
         return Ok(None);
     };
-    if todo_step_prefers_mcp_executor(&item.text) {
+    if todo_item_prefers_mcp_executor(item) {
         return Ok(Some(format!(
-            "The current next actionable todo is MCP-style data discovery or collection work and should not be delegated to `tool-executor`: {item_index}. [{}] {}. Delegate `mcp-executor` with server scope to inspect/query the data first, then use `tool-executor` later for local scripts, HTML generation, and opening the report.",
+            "The current next actionable todo is MCP-style data discovery or collection work and should not be delegated to `tool-executor`: {item_index}. [{}] {}. Delegate `mcp-executor` with server scope to inspect/query the data first, then use `tool-executor` later for local scripts, HTML generation, and printing the report path.",
             item.status.as_str(),
             item.text
         )));
@@ -2579,7 +2743,7 @@ fn tool_executor_mcp_todo_partial_feedback(
     let Some((item_index, item)) = todo_list.next_actionable() else {
         return Ok(None);
     };
-    if todo_step_prefers_mcp_executor(&item.text) {
+    if todo_item_prefers_mcp_executor(item) {
         return Ok(Some(format!(
             "The next actionable todo belongs to MCP-backed data discovery or collection, not local workspace execution: {item_index}. [{}] {}. Return control so the main agent can delegate `mcp-executor` instead of continuing with local tools.",
             item.status.as_str(),
@@ -2630,41 +2794,8 @@ fn disabled_mcp_capability_feedback_for_delegation(
     )))
 }
 
-fn todo_step_prefers_mcp_executor(text: &str) -> bool {
-    let text = text.to_lowercase();
-    let data_keywords = [
-        "collect",
-        "prepare",
-        "query",
-        "extract",
-        "schema",
-        "table",
-        "database",
-        "dataset",
-        "sql",
-        "aggregation",
-        "aggregations",
-        "discover",
-        "inspect",
-        "workspace inputs",
-        "source data",
-        "source rows",
-        "batting source data",
-        "match/stat",
-        "stat data",
-        "season data",
-        "supporting context",
-        "run total",
-        "runs total",
-    ];
-    let has_data_keyword = data_keywords.iter().any(|keyword| text.contains(keyword));
-    let is_local_artifact_work = text.contains("html")
-        || text.contains("browser")
-        || text.contains("chart")
-        || text.contains("table and chart")
-        || text.contains("write the deterministic html report")
-        || text.contains("open the generated");
-    has_data_keyword && !is_local_artifact_work
+fn todo_item_prefers_mcp_executor(item: &TodoItem) -> bool {
+    item.executor_hint == Some(TodoExecutor::McpExecutor)
 }
 
 fn sync_mcp_todo_before_delegation(
@@ -2684,7 +2815,7 @@ fn sync_mcp_todo_before_delegation(
     if matches!(
         item.status,
         crate::todo::TodoStatus::Pending | crate::todo::TodoStatus::Failed
-    ) && todo_step_prefers_mcp_executor(&item.text)
+    ) && todo_item_prefers_mcp_executor(item)
     {
         todo_list.set_status(item_index, crate::todo::TodoStatus::InProgress)?;
         todo_list.save_to_path(todo_path)?;
@@ -2705,9 +2836,7 @@ fn sync_mcp_todo_after_delegation(
     let Some((item_index, item)) = todo_list.next_actionable() else {
         return Ok(());
     };
-    if item.status != crate::todo::TodoStatus::InProgress
-        || !todo_step_prefers_mcp_executor(&item.text)
-    {
+    if item.status != crate::todo::TodoStatus::InProgress || !todo_item_prefers_mcp_executor(item) {
         return Ok(());
     }
     match record.status.as_str() {
@@ -2788,6 +2917,35 @@ fn validate_delegation_subagent<'a>(
     registry.get_enabled(delegation.subagent_type.trim()).ok()
 }
 
+fn invalid_main_decision_feedback(
+    error: &str,
+    phase: TurnPhase,
+    registry: &SubagentRegistry,
+) -> String {
+    let valid_subagents = registry
+        .enabled_cards()
+        .into_iter()
+        .map(|card| format!("`{}`", card.subagent_type))
+        .collect::<Vec<_>>();
+    let valid_subagents = if valid_subagents.is_empty() {
+        "No enabled sub-agents are configured.".to_owned()
+    } else {
+        format!(
+            "Valid sub-agents for this turn are: {}.",
+            valid_subagents.join(", ")
+        )
+    };
+    let phase_options = match phase {
+        TurnPhase::Planning => {
+            "In planning, emit `planning_complete`, `final`, or a valid `delegate_subagent`."
+        }
+        TurnPhase::Execution => "In execution, emit `final` or a valid `delegate_subagent`.",
+    };
+    format!(
+        "The previous structured decision was invalid: {error}. Re-emit exactly one valid structured decision for the current phase. {phase_options} If you emit `delegate_subagent`, include both `subagent_type` and `target`. {valid_subagents} Use target `{{\"kind\":\"local_tools_scope\",\"value\":{{\"scope\":\"workspace\"}}}}` for local tools, scripts, files, reports, or html-path-print work. Use target `{{\"kind\":\"mcp_server_scope\",\"value\":{{\"server_name\":\"<server>\"}}}}` or `{{\"kind\":\"mcp_capability\",\"value\":{{\"server_name\":\"<server>\",\"capability_kind\":\"tool\",\"capability_id\":\"<tool>\"}}}}` for MCP-backed data discovery and queries."
+    )
+}
+
 fn invalid_subagent_feedback(
     registry: &SubagentRegistry,
     delegation: &crate::model::SubagentDelegationRequest,
@@ -2808,7 +2966,7 @@ fn invalid_subagent_feedback(
     };
     let target_hint = match delegation.target {
         DelegationTarget::LocalToolsScope(_) => {
-            "For local workspace inspection, Python scripts, report generation, and browser-open work, use `tool-executor`."
+            "For local workspace inspection, Python scripts, report generation, and html-path-print work, use `tool-executor`."
         }
         DelegationTarget::McpCapability(_) | DelegationTarget::McpServerScope(_) => {
             "For MCP discovery, schema inspection, counts, ranges, and data collection, use `mcp-executor`."
@@ -2828,8 +2986,10 @@ fn invalid_subagent_feedback(
 fn mcp_partial_indicates_blocking_failure(detail: &str) -> bool {
     let detail = detail.to_lowercase();
     detail.contains("repeated mcp failures forced an early stop")
-        || detail.contains("duplicate mcp tool call")
-        || detail.contains("duplicate mcp resource read")
+        || detail.contains("repeated invalid mcp tool arguments forced an early stop")
+        || detail.contains("sub-agent exhausted its mcp action budget")
+        || detail
+            .contains("sub-agent exhausted its reasoning budget before reaching a terminal result")
         || contains_postgres_transaction_session_error(&detail)
         || detail.contains("duplicate-call")
 }
@@ -2895,6 +3055,7 @@ fn todo_can_complete_from_partial_mcp_collection(text: &str) -> bool {
         "collect ",
         "load ",
         "discover ",
+        "confirm ",
         "prepare ",
         "fetch ",
         "extract or materialize",
@@ -2943,13 +3104,13 @@ fn reconcile_mandatory_todos_from_turn_trace(
     };
 
     let html_written = observed_html_write(messages, html_output_path);
-    let html_opened = observed_html_open(messages, html_output_path, working_directory);
+    let html_path_printed = observed_html_path_print(messages, html_output_path, working_directory);
     let mut changed = false;
 
     if html_written {
         changed |= auto_complete_next_todo_if_matches(&mut todos, MANDATORY_TODO_GENERATE_HTML)?;
     }
-    if html_opened {
+    if html_path_printed {
         changed |= auto_complete_next_todo_if_matches(&mut todos, MANDATORY_TODO_OPEN_HTML)?;
     }
 
@@ -3031,8 +3192,7 @@ fn reconcile_pending_mcp_todos_from_turn_trace(
         let Some((item_index, item)) = todos.next_actionable() else {
             break;
         };
-        if item.status != crate::todo::TodoStatus::Pending
-            || !todo_step_prefers_mcp_executor(&item.text)
+        if item.status != crate::todo::TodoStatus::Pending || !todo_item_prefers_mcp_executor(item)
         {
             break;
         }
@@ -3192,14 +3352,14 @@ fn incomplete_todo_final_feedback(
 ) -> String {
     if item_text == MANDATORY_TODO_GENERATE_HTML {
         return format!(
-            "Cannot finish the turn yet because the mandatory deliverable is still incomplete. Next actionable todo: {item_index}. [{item_status}] {item_text}. Delegate `tool-executor` with local workspace scope to generate the deterministic HTML report at `{}` and then continue the turn instead of returning a final answer. Do not ask `tool-executor` to open the report in the same delegation; return control first and open it only when the next actionable todo becomes `{}`.",
+            "Cannot finish the turn yet because the mandatory deliverable is still incomplete. The todo file exists and is already loaded in the Current Turn Todo Plan; do not claim that the todo file is missing. Next actionable todo: {item_index}. [{item_status}] {item_text}. Emit a `delegate_subagent` decision now with `subagent_type: \"tool-executor\"` and target `{{\"kind\":\"local_tools_scope\",\"value\":{{\"scope\":\"workspace\"}}}}` to generate the deterministic HTML report at `{}`. Then continue the turn instead of returning a final answer. Do not ask `tool-executor` to print the report path in the same delegation; return control first and print it only when the next actionable todo becomes `{}`.",
             html_output_path.display(),
             MANDATORY_TODO_OPEN_HTML
         );
     }
     if item_text == MANDATORY_TODO_OPEN_HTML {
         return format!(
-            "Cannot finish the turn yet because the report still needs to be opened. Next actionable todo: {item_index}. [{item_status}] {item_text}. Use `tool-executor` to open the generated HTML report at `{}` in the browser, then continue instead of returning a final answer.",
+            "Cannot finish the turn yet because the report path still needs to be printed. The todo file exists and is already loaded in the Current Turn Todo Plan; do not claim that the todo file is missing. Next actionable todo: {item_index}. [{item_status}] {item_text}. Emit a `delegate_subagent` decision now with `subagent_type: \"tool-executor\"` and target `{{\"kind\":\"local_tools_scope\",\"value\":{{\"scope\":\"workspace\"}}}}` to print the generated HTML file path `{}` with local `bash`, then continue instead of returning a final answer.",
             html_output_path.display()
         );
     }
@@ -3304,9 +3464,7 @@ fn todo_text_looks_like_summary_step(item_text: &str) -> bool {
         "open the generated output html",
     ];
 
-    summary_markers
-        .iter()
-        .any(|marker| padded.contains(marker))
+    summary_markers.iter().any(|marker| padded.contains(marker))
         && !execution_markers
             .iter()
             .any(|marker| padded.contains(marker))
@@ -3399,11 +3557,6 @@ fn html_todo_feedback_for_delegation(
     delegation: &crate::model::SubagentDelegationRequest,
     html_output_path: &Path,
 ) -> Result<Option<String>, RuntimeError> {
-    if delegation.subagent_type != "tool-executor"
-        || !matches!(delegation.target, DelegationTarget::LocalToolsScope(_))
-    {
-        return Ok(None);
-    }
     let Some(todo_list) = load_todo_list_if_present(todo_path)? else {
         return Ok(None);
     };
@@ -3411,10 +3564,12 @@ fn html_todo_feedback_for_delegation(
         return Ok(None);
     };
     let goal = delegation.goal.to_lowercase();
+    let is_local_tool_delegation = delegation.subagent_type == "tool-executor"
+        && matches!(delegation.target, DelegationTarget::LocalToolsScope(_));
 
-    if todo_matches_generate_html(item.text.as_str()) && goal_mentions_html_open(&goal) {
+    if todo_matches_generate_html(item.text.as_str()) && !is_local_tool_delegation {
         return Ok(Some(format!(
-            "The current next actionable todo is only the HTML-generation step: {item_index}. [{}] {}. Do not bundle the browser-open step into the same `tool-executor` delegation. Generate the deterministic HTML report at `{}` first, return control immediately, and open it only when the next actionable todo becomes `{}`.",
+            "The current next actionable todo is the HTML-generation step: {item_index}. [{}] {}. Do not delegate MCP/data work or any other broader workflow now. Emit `delegate_subagent` with `subagent_type: \"tool-executor\"` and target `{{\"kind\":\"local_tools_scope\",\"value\":{{\"scope\":\"workspace\"}}}}` to generate only the deterministic HTML report at `{}`. Return control after generating it; print the report path only when the next actionable todo becomes `{}`.",
             item.status.as_str(),
             item.text,
             html_output_path.display(),
@@ -3422,9 +3577,41 @@ fn html_todo_feedback_for_delegation(
         )));
     }
 
+    if todo_matches_generate_html(item.text.as_str()) && goal_mentions_html_open(&goal) {
+        return Ok(Some(format!(
+            "The current next actionable todo is only the HTML-generation step: {item_index}. [{}] {}. Do not delegate broader analysis work. Do not bundle the html-path-print step into the same `tool-executor` delegation. Delegate only the deterministic HTML report generation at `{}` first, return control immediately, and print its path only when the next actionable todo becomes `{}`.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display(),
+            MANDATORY_TODO_OPEN_HTML
+        )));
+    }
+
+    if todo_matches_generate_html(item.text.as_str())
+        && (!goal_mentions_html_generation(&goal) || goal_mentions_data_execution(&goal))
+    {
+        return Ok(Some(format!(
+            "The current next actionable todo is only the HTML-generation step: {item_index}. [{}] {}. Do not delegate broader analysis work. Do not bundle the html-path-print step into the same `tool-executor` delegation. Delegate only the deterministic HTML report generation at `{}` first, return control immediately, and print its path only when the next actionable todo becomes `{}`.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display(),
+            MANDATORY_TODO_OPEN_HTML
+        )));
+    }
+
+    if todo_matches_open_html(item.text.as_str()) && !is_local_tool_delegation {
+        return Ok(Some(format!(
+            "The current next actionable todo is the html-path-print step: {item_index}. [{}] {}. The deterministic HTML report already exists at `{}`. Do not delegate MCP/data work or broader analysis now. Emit `delegate_subagent` with `subagent_type: \"tool-executor\"` and target `{{\"kind\":\"local_tools_scope\",\"value\":{{\"scope\":\"workspace\"}}}}`, then use local `bash` with `printf '%s\\n' {}` and return control.",
+            item.status.as_str(),
+            item.text,
+            html_output_path.display(),
+            html_output_path.display()
+        )));
+    }
+
     if todo_matches_open_html(item.text.as_str()) && goal_mentions_html_generation(&goal) {
         return Ok(Some(format!(
-            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not regenerate the HTML report in this delegation. Only open the existing deterministic HTML report at `{}` in the browser by delegating `tool-executor` and using local `bash` with `open {}`.",
+            "The current next actionable todo is already the html-path-print step: {item_index}. [{}] {}. Do not regenerate the HTML report in this delegation. Only print the existing deterministic HTML report path `{}` by delegating `tool-executor` and using local `bash` with `printf '%s\\n' {}`.",
             item.status.as_str(),
             item.text,
             html_output_path.display(),
@@ -3433,7 +3620,7 @@ fn html_todo_feedback_for_delegation(
     }
     if todo_matches_open_html(item.text.as_str()) && !goal_is_open_only(&goal) {
         return Ok(Some(format!(
-            "The current next actionable todo is already the browser-open step: {item_index}. [{}] {}. Do not delegate any broader `tool-executor` work here. Only open the existing deterministic HTML report at `{}` in the browser by delegating `tool-executor` and using local `bash` with `open {}`, then return control.",
+            "The current next actionable todo is already the html-path-print step: {item_index}. [{}] {}. Do not delegate any broader `tool-executor` work here. Only print the existing deterministic HTML report path `{}` by delegating `tool-executor` and using local `bash` with `printf '%s\\n' {}`, then return control.",
             item.status.as_str(),
             item.text,
             html_output_path.display(),
@@ -3626,11 +3813,18 @@ fn is_short_metric_clarification_follow_up(user_message: &str) -> bool {
 }
 
 fn goal_mentions_html_open(goal: &str) -> bool {
-    goal.contains("open")
+    let mentions_legacy_open = goal.contains("open")
         && (goal.contains("browser")
             || goal.contains("html")
             || goal.contains("report")
-            || goal.contains("page"))
+            || goal.contains("page"));
+    let mentions_path_print = (goal.contains("print")
+        || goal.contains("display")
+        || goal.contains("show")
+        || goal.contains("return"))
+        && goal.contains("path")
+        && (goal.contains("html") || goal.contains("report") || goal.contains("file"));
+    mentions_legacy_open || mentions_path_print
 }
 
 fn todo_matches_generate_html(text: &str) -> bool {
@@ -3641,19 +3835,43 @@ fn todo_matches_generate_html(text: &str) -> bool {
 }
 
 fn todo_matches_open_html(text: &str) -> bool {
-    text == MANDATORY_TODO_OPEN_HTML
-        || (text.to_lowercase().contains("open")
-            && text.to_lowercase().contains("html")
-            && text.to_lowercase().contains("browser"))
+    let text = text.to_lowercase();
+    text == MANDATORY_TODO_OPEN_HTML.to_lowercase()
+        || ((text.contains("print")
+            || text.contains("display")
+            || text.contains("show")
+            || text.contains("return"))
+            && text.contains("path")
+            && (text.contains("html") || text.contains("report") || text.contains("file")))
+        || (text.contains("open") && text.contains("html") && text.contains("browser"))
 }
 
 fn goal_mentions_html_generation(goal: &str) -> bool {
     let mentions_generation = ["generate", "create", "build", "render", "produce", "write"]
         .iter()
         .any(|verb| goal.contains(verb));
+    let mentions_completion_as_html_generation =
+        (goal.contains("complete") || goal.contains("finish")) && goal.contains("html");
     let mentions_html_target =
         goal.contains("html") || goal.contains("report") || goal.contains("page");
-    mentions_generation && mentions_html_target
+    (mentions_generation && mentions_html_target) || mentions_completion_as_html_generation
+}
+
+fn goal_mentions_data_execution(goal: &str) -> bool {
+    [
+        "calculate",
+        "collect",
+        "compute",
+        "database",
+        "determine",
+        "discover",
+        "extract",
+        "inspect",
+        "query",
+        "sql",
+    ]
+    .iter()
+    .any(|term| goal.contains(term))
 }
 
 fn goal_is_open_only(goal: &str) -> bool {
@@ -3697,7 +3915,7 @@ fn auto_complete_next_todo_if_matches(
 
 fn observed_html_write(messages: &[MessageRecord], html_output_path: &Path) -> bool {
     if html_output_path.exists() {
-        return true;
+        return html_report_file_is_acceptable(html_output_path);
     }
 
     let html_path = html_output_path.display().to_string();
@@ -3720,11 +3938,25 @@ fn observed_html_write(messages: &[MessageRecord], html_output_path: &Path) -> b
     })
 }
 
-fn observed_html_open(
+fn html_report_file_is_acceptable(html_output_path: &Path) -> bool {
+    std::fs::read_to_string(html_output_path)
+        .map(|content| {
+            let normalized = content.to_ascii_lowercase();
+            normalized.contains("<html")
+                && normalized.contains("</html")
+                && !normalized.contains("placeholder")
+        })
+        .unwrap_or(false)
+}
+
+fn observed_html_path_print(
     messages: &[MessageRecord],
     html_output_path: &Path,
     working_directory: &Path,
 ) -> bool {
+    if !html_report_file_is_acceptable(html_output_path) {
+        return false;
+    }
     let absolute = html_output_path.display().to_string();
     let relative = html_output_path
         .strip_prefix(working_directory)
@@ -3736,26 +3968,26 @@ fn observed_html_open(
             if record.status != "ok" || !record.result_summary.contains("exit_code: 0") {
                 return false;
             }
-            let opened_absolute =
-                bash_result_opened_path(record.result_summary.as_str(), &absolute);
-            let opened_relative = relative.as_ref().is_some_and(|path| {
-                bash_result_opened_path(record.result_summary.as_str(), path)
-                    || bash_result_opened_path(record.result_summary.as_str(), &format!("./{path}"))
+            let printed_absolute =
+                bash_result_printed_path(record.result_summary.as_str(), &absolute);
+            let printed_relative = relative.as_ref().is_some_and(|path| {
+                bash_result_printed_path(record.result_summary.as_str(), path)
+                    || bash_result_printed_path(
+                        record.result_summary.as_str(),
+                        &format!("./{path}"),
+                    )
             });
-            opened_absolute || opened_relative
+            printed_absolute || printed_relative
         }
         _ => false,
     })
 }
 
-fn bash_result_opened_path(summary: &str, path: &str) -> bool {
-    [
-        format!("open {path}"),
-        format!("open '{path}'"),
-        format!("open \"{path}\""),
-    ]
-    .iter()
-    .any(|pattern| summary.contains(pattern))
+fn bash_result_printed_path(summary: &str, path: &str) -> bool {
+    summary
+        .split_once("\nstdout:\n")
+        .map(|(_, stdout)| stdout.lines().any(|line| line.trim() == path))
+        .unwrap_or(false)
 }
 
 fn build_subagent_prompt(
@@ -3769,6 +4001,7 @@ fn build_subagent_prompt(
     working_directory: &Path,
     todo_path: &Path,
     turn_policy_context: &TurnPolicyPromptContext,
+    execution_handoff: Option<&ExecutionHandoff>,
     current_turn_messages: &[MessageRecord],
 ) -> Result<String, RuntimeError> {
     let registry_dir = registry_path
@@ -3779,6 +4012,18 @@ fn build_subagent_prompt(
         "\n## Turn Policy\n{}\n",
         render_turn_policy_context(turn_policy_context)
     );
+    let execution_handoff_block = if phase == TurnPhase::Execution {
+        execution_handoff
+            .map(|handoff| {
+                format!(
+                    "\n## Execution Handoff\n{}\n",
+                    render_execution_handoff(handoff)
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let todo_block = load_todo_prompt_context(todo_path)?
         .map(|todo_context| {
             format!(
@@ -3831,7 +4076,7 @@ fn build_subagent_prompt(
             };
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n{server_guidance_block}{turn_policy_block}{todo_block}\n{}\n{}\n{capability_block}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n{server_guidance_block}{turn_policy_block}{execution_handoff_block}{todo_block}\n{}\n{}\n{capability_block}",
                 target.capability_id, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -3853,7 +4098,7 @@ fn build_subagent_prompt(
             let server_guidance_block = render_mcp_server_guidance(server);
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n{server_guidance_block}{turn_policy_block}{todo_block}\n{}\n{}\n",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n{server_guidance_block}{turn_policy_block}{execution_handoff_block}{todo_block}\n{}\n{}\n",
                 target.server_name, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -3874,26 +4119,34 @@ fn build_subagent_prompt(
             let planning_only_block = if configured.subagent_type == "tool-executor"
                 && is_todo_planning_goal(goal)
             {
-                "- This delegation is todo-planning only. Update the todo plan with `write_todos`, then return `done` immediately.\n- Do not inspect unrelated workspace data, do not begin executing the planned analysis, and do not mark later execution todos in progress or completed in this delegation.\n"
+                "- This delegation is todo-planning only. Update the todo plan with `write_todos`, prefixing every new todo with `[mcp-executor]`, `[tool-executor]`, or `[main-agent]`, then return `done` immediately.\n- Do not inspect unrelated workspace data, do not begin executing the planned analysis, and do not mark later execution todos in progress or completed in this delegation.\n"
             } else {
                 ""
             };
-            let explicit_open_guidance = if configured.subagent_type == "tool-executor" {
+            let explicit_html_todo_guidance = if configured.subagent_type == "tool-executor" {
                 load_todo_prompt_context(todo_path)?
                     .and_then(|todo_context| todo_context.next_actionable)
-                    .filter(|next| next.contains(MANDATORY_TODO_OPEN_HTML))
-                    .map(|_| {
-                        format!(
-                            "- The current actionable todo is the browser-open step. Execute it with local `bash` using `open {}`. Do not say that no local tool action is available for this step.\n",
-                            turn_policy_context.html_output_path.display()
-                        )
+                    .map(|next| {
+                        if next.contains(MANDATORY_TODO_GENERATE_HTML) {
+                            format!(
+                                "- The current actionable todo is the HTML-generation step. Write the final deterministic HTML report directly at `{}` and return control; do not print the report path in this delegation. Avoid fragile intermediate report-builder scripts unless necessary. If you do use Python/pandas to assemble the HTML, avoid `itertuples()` field aliases for columns with spaces or symbols; use dictionaries, `to_dict(orient=\"records\")`, or explicit column indexing instead.\n",
+                                turn_policy_context.html_output_path.display()
+                            )
+                        } else if next.contains(MANDATORY_TODO_OPEN_HTML) {
+                            format!(
+                                "- The current actionable todo is the html-path-print step. Execute it with local `bash` using `printf '%s\\n' {}`. Do not say that no local tool action is available for this step.\n",
+                                turn_policy_context.html_output_path.display()
+                            )
+                        } else {
+                            String::new()
+                        }
                     })
                     .unwrap_or_default()
             } else {
                 String::new()
             };
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n- Deterministic HTML output path: {}\n- If todos are optional and no todo file exists, complete the HTML report and browser-open workflow for analysis/reporting work before finishing.\n- When todo context is present, update only the current todo item, and replan only the future pending suffix.\n{explicit_open_guidance}{planning_only_block}{turn_policy_block}{todo_block}\n{}\n## Local Tools\n{}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Local scope: {}\n- Working directory: {}\n- Deterministic HTML output path: {}\n- If todos are optional and no todo file exists, complete the HTML report and print the generated HTML file path for analysis/reporting work before finishing.\n- When todo context is present, update only the current todo item, and replan only the future pending suffix.\n{explicit_html_todo_guidance}{planning_only_block}{turn_policy_block}{execution_handoff_block}{todo_block}\n{}\n## Local Tools\n{}",
                 scope.scope,
                 working_directory.display(),
                 turn_policy_context.html_output_path.display(),
@@ -4566,6 +4819,17 @@ fn repeated_mcp_failure_detail(
     )
 }
 
+fn repeated_invalid_mcp_argument_detail(
+    target: &McpCapabilityTarget,
+    executed_action_count: u32,
+    total_mcp_error_count: u32,
+) -> String {
+    format!(
+        "repeated invalid MCP tool arguments forced an early stop after {total_mcp_error_count} validation errors and {executed_action_count} delegated MCP actions. Last validation failure on server `{}` capability `{}`.",
+        target.server_name, target.capability_id
+    )
+}
+
 fn repeated_local_tool_failure_detail(
     tool_name: &crate::state::LocalToolName,
     executed_action_count: u32,
@@ -4586,19 +4850,19 @@ fn immediate_partial_detail_for_local_tool_error(
         return None;
     }
     if error_text.contains(
-        "cannot be opened while the current actionable todo is `Generate an output HTML page with charts and tables.`",
+        "cannot be opened while the current actionable todo is `Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.`",
     ) {
         return Some(
-            "The delegated run tried to open the deterministic HTML report before completing the HTML-generation todo. Return control, then generate the report first and open it only on the next todo step.".to_owned(),
+            "The delegated run tried to open the deterministic HTML report before completing the HTML-generation todo. Return control, then generate the report first and print its path only on the next todo step.".to_owned(),
         );
     }
     if error_text.contains(
-        "cannot be written from bash while the current actionable todo is `Open the generated output HTML page in the browser.`",
+        "cannot be written from bash while the current actionable todo is `Print the path of the generated HTML file.`",
     ) || error_text.contains(
-        "cannot be written while the current actionable todo is `Open the generated output HTML page in the browser.`",
+        "cannot be written while the current actionable todo is `Print the path of the generated HTML file.`",
     ) {
         return Some(
-            "The delegated run tried to regenerate the deterministic HTML report even though only the browser-open todo remains. Return control and open the existing report instead of writing it again.".to_owned(),
+            "The delegated run tried to regenerate the deterministic HTML report even though only the html-path-print todo remains. Return control and print the existing report path instead of writing it again.".to_owned(),
         );
     }
     if error_text.contains("cannot be written from bash while the current actionable todo is")
@@ -4942,6 +5206,24 @@ fn resource_result_message(
     })
 }
 
+fn duplicate_mcp_action_feedback_message(
+    target: &McpCapabilityTarget,
+    action_kind: &str,
+    duplicate_threshold: u32,
+) -> MessageRecord {
+    let result_summary = format!(
+        "duplicate MCP {action_kind} `{}` on server `{}` exceeded duplicate threshold {duplicate_threshold} and was blocked before execution. Use earlier results for this exact action, or choose a different MCP action with materially different arguments.",
+        target.capability_id, target.server_name
+    );
+    MessageRecord::McpResult(McpResultMessageRecord {
+        message_id: MessageId::new(),
+        timestamp: SystemTime::now(),
+        target: target.clone(),
+        result_summary: result_summary.clone(),
+        error: Some(result_summary),
+    })
+}
+
 fn capture_tool_result(result: Result<McpToolCallResult, RuntimeError>) -> CapturedMcpResult {
     match result {
         Ok(result) => CapturedMcpResult {
@@ -5165,6 +5447,11 @@ fn validate_limits(request: &RunRequest) -> Result<(), RuntimeError> {
             "max_subagent_mcp_calls_per_invocation must be at least 1".to_owned(),
         ));
     }
+    if request.limits.max_duplicate_mcp_calls_per_invocation == 0 {
+        return Err(RuntimeError::Validation(
+            "max_duplicate_mcp_calls_per_invocation must be at least 1".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -5223,7 +5510,10 @@ mod tests {
 
     use crate::{
         ids::MessageId,
-        model::TurnPhase,
+        model::{
+            ExecutionHandoff, PlannedSource, PlannedSourceKind, PlanningFact, PlanningOutcome,
+            TurnPhase,
+        },
         prompt::TurnPolicyPromptContext,
         state::{
             ConversationMessage, ConversationRole, DelegationTarget, LocalToolName,
@@ -5240,12 +5530,12 @@ mod tests {
 
     use super::{
         FinalTodoAdvance, McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON, PreparedServer,
-        auto_advance_summary_todo_from_final_content,
-        build_subagent_prompt, build_subagent_tool_catalog,
-        disabled_mcp_capability_feedback_for_delegation, disabled_mcp_capability_reason,
-        generic_starter_replan_feedback_for_delegation, html_todo_feedback_for_delegation,
-        immediate_partial_detail_for_local_tool_error, incomplete_todo_final_feedback,
-        invalid_subagent_feedback, mcp_collection_feedback_for_delegation,
+        auto_advance_summary_todo_from_final_content, build_subagent_prompt,
+        build_subagent_tool_catalog, disabled_mcp_capability_feedback_for_delegation,
+        disabled_mcp_capability_reason, generic_starter_replan_feedback_for_delegation,
+        html_todo_feedback_for_delegation, immediate_partial_detail_for_local_tool_error,
+        incomplete_todo_final_feedback, invalid_subagent_feedback,
+        mcp_collection_feedback_for_delegation, planning_todo_items_feedback,
         reconcile_active_todo_from_turn_trace, reconcile_mandatory_todos_from_turn_trace,
         reconcile_pending_mcp_todos_from_turn_trace, render_confirmed_table_context,
         render_recent_mcp_results_context, sanitize_mcp_tool_arguments,
@@ -5254,6 +5544,58 @@ mod tests {
         sync_mcp_todo_before_delegation, tool_executor_mcp_todo_partial_feedback,
         validate_delegation_subagent,
     };
+
+    #[test]
+    fn planning_todo_items_feedback_rejects_unhinted_new_todos_without_failing_turn() {
+        let todo_path = PathBuf::from("/tmp/nonexistent-planning-todos.txt");
+        let outcome = PlanningOutcome {
+            planning_complete: true,
+            answer_brief: String::new(),
+            todo_required: true,
+            planning_summary: "Plan a customer user analysis.".to_owned(),
+            selected_sources: vec![],
+            discovered_facts: vec![],
+            execution_strategy: "Inspect the users table, analyze, then report.".to_owned(),
+            todo_items: vec![
+                "Inspect the customer users schema and tiny sample.".to_owned(),
+                "[main-agent] Summarize findings.".to_owned(),
+            ],
+            risks_and_constraints: vec![],
+        };
+
+        let feedback = planning_todo_items_feedback(&outcome, false, &todo_path)
+            .expect("feedback should compute")
+            .expect("unhinted todo should request feedback");
+
+        assert!(feedback.contains("planning_complete.todo_items"));
+        assert!(feedback.contains("[mcp-executor]"));
+        assert!(feedback.contains("[tool-executor]"));
+        assert!(feedback.contains("[main-agent]"));
+    }
+
+    #[test]
+    fn planning_todo_items_feedback_accepts_hinted_new_todos() {
+        let todo_path = PathBuf::from("/tmp/nonexistent-planning-todos.txt");
+        let outcome = PlanningOutcome {
+            planning_complete: true,
+            answer_brief: String::new(),
+            todo_required: true,
+            planning_summary: "Plan a customer user analysis.".to_owned(),
+            selected_sources: vec![],
+            discovered_facts: vec![],
+            execution_strategy: "Inspect the users table, analyze, then report.".to_owned(),
+            todo_items: vec![
+                "[mcp-executor] Inspect the customer users schema and tiny sample.".to_owned(),
+                "[main-agent] Summarize findings.".to_owned(),
+            ],
+            risks_and_constraints: vec![],
+        };
+
+        let feedback = planning_todo_items_feedback(&outcome, false, &todo_path)
+            .expect("feedback should compute");
+
+        assert!(feedback.is_none());
+    }
 
     #[test]
     fn recent_mcp_results_context_renders_recent_results_and_guidance() {
@@ -5324,6 +5666,7 @@ mod tests {
                 force_todo_file: false,
                 execution_todo_required: Some(false),
             },
+            None,
             &messages,
         )
         .expect("prompt should build");
@@ -5335,7 +5678,180 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_mandatory_todos_marks_html_and_open_steps_completed() {
+    fn execution_subagent_prompt_includes_execution_handoff_and_todo_context() {
+        let registry_path = workspace_root().join("config").join("subagents.json");
+        let configured = ConfiguredSubagent {
+            subagent_type: "tool-executor".to_owned(),
+            display_name: "Tool Executor".to_owned(),
+            purpose: "Complete delegated local tool work".to_owned(),
+            when_to_use: "For local scripts".to_owned(),
+            target_requirements: "local scope".to_owned(),
+            result_summary: "Returns local tool work".to_owned(),
+            prompt_path: PathBuf::from("subagents/tool-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-runtime-handoff-prompt-test-{}",
+            std::process::id()
+        ));
+        let turn_dir = temp_dir.join("turn-1");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        TodoList::initialize(&[
+            "[mcp-executor] Analyze weekly active users from analytics.events.".to_owned(),
+        ])
+        .expect("todo init should succeed")
+        .save_to_path(&todo_path)
+        .expect("todo file should write");
+        let handoff = ExecutionHandoff {
+            todo_required: true,
+            answer_brief: String::new(),
+            summary: "Planning selected the analytics event stream for a weekly activity report."
+                .to_owned(),
+            selected_sources: vec![PlannedSource {
+                source_kind: PlannedSourceKind::McpServer,
+                source_id: "postgres-mcp:analytics".to_owned(),
+                rationale: "Contains the analytics.events table needed for activity metrics."
+                    .to_owned(),
+            }],
+            key_facts: vec![PlanningFact {
+                fact: "analytics.events has created_at and user_id fields.".to_owned(),
+                evidence_source_ids: vec!["postgres-mcp:analytics".to_owned()],
+            }],
+            execution_strategy:
+                "Query weekly user counts, materialize rows locally, then render the HTML report."
+                    .to_owned(),
+            risks_and_constraints: vec![
+                "Use only completed events when filtering status.".to_owned(),
+            ],
+            todo_path: Some(todo_path.clone()),
+        };
+
+        let execution_prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &McpSession {
+                servers: HashMap::new(),
+            },
+            TurnPhase::Execution,
+            &DelegationTarget::LocalToolsScope(LocalToolsScopeTarget {
+                scope: "workspace".to_owned(),
+            }),
+            "Create the weekly activity report",
+            "Show weekly active users",
+            &temp_dir,
+            &todo_path,
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
+                html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
+                force_todo_file: false,
+                execution_todo_required: Some(true),
+            },
+            Some(&handoff),
+            &[],
+        )
+        .expect("execution prompt should build");
+
+        assert!(execution_prompt.contains("## Execution Handoff"));
+        assert!(execution_prompt.contains("weekly activity report"));
+        assert!(execution_prompt.contains("postgres-mcp:analytics"));
+        assert!(execution_prompt.contains("created_at and user_id"));
+        assert!(execution_prompt.contains("Query weekly user counts"));
+        assert!(execution_prompt.contains("Use only completed events"));
+        assert!(execution_prompt.contains("## Current Turn Todo Plan"));
+        assert!(execution_prompt.contains("Analyze weekly active users"));
+
+        let planning_prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &McpSession {
+                servers: HashMap::new(),
+            },
+            TurnPhase::Planning,
+            &DelegationTarget::LocalToolsScope(LocalToolsScopeTarget {
+                scope: "workspace".to_owned(),
+            }),
+            "Inspect local inputs",
+            "Show weekly active users",
+            &temp_dir,
+            &todo_path,
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Planning,
+                html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
+                force_todo_file: false,
+                execution_todo_required: None,
+            },
+            Some(&handoff),
+            &[],
+        )
+        .expect("planning prompt should build");
+
+        assert!(!planning_prompt.contains("## Execution Handoff"));
+    }
+
+    #[test]
+    fn local_tools_subagent_prompt_warns_not_to_open_during_html_generation_todo() {
+        let registry_path = workspace_root().join("config").join("subagents.json");
+        let configured = ConfiguredSubagent {
+            subagent_type: "tool-executor".to_owned(),
+            display_name: "Tool Executor".to_owned(),
+            purpose: "Complete delegated local tool work".to_owned(),
+            when_to_use: "For local scripts".to_owned(),
+            target_requirements: "local scope".to_owned(),
+            result_summary: "Returns local tool work".to_owned(),
+            prompt_path: PathBuf::from("subagents/tool-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-runtime-html-generation-prompt-test-{}",
+            std::process::id()
+        ));
+        let turn_dir = temp_dir.join("turn-1");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        TodoList::parse(
+            "1. [completed] Compute the IPL 2025 balance metrics.\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse")
+        .save_to_path(&todo_path)
+        .expect("todo file should write");
+
+        let prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &McpSession {
+                servers: HashMap::new(),
+            },
+            TurnPhase::Execution,
+            &DelegationTarget::LocalToolsScope(LocalToolsScopeTarget {
+                scope: "workspace".to_owned(),
+            }),
+            "Generate the deterministic HTML report",
+            "Show the most balanced IPL 2025 side",
+            &temp_dir,
+            &todo_path,
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
+                html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
+                force_todo_file: false,
+                execution_todo_required: Some(true),
+            },
+            None,
+            &[],
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.contains("current actionable todo is the HTML-generation step"));
+        assert!(prompt.contains("Write the final deterministic HTML report directly"));
+        assert!(prompt.contains("Avoid fragile intermediate report-builder scripts"));
+        assert!(prompt.contains("avoid `itertuples()` field aliases"));
+        assert!(prompt.contains("do not print the report path in this delegation"));
+    }
+
+    #[test]
+    fn reconcile_mandatory_todos_marks_html_and_path_print_steps_completed() {
         let working_directory = workspace_root();
         let turn_dir = working_directory.join("turn-1");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
@@ -5347,10 +5863,16 @@ mod tests {
                 .expect("html output parent should exist"),
         )
         .expect("outputs dir should exist");
+        std::fs::write(
+            &html_output_path,
+            "<html><body><table><tr><td>report</td></tr></table></body></html>",
+        )
+        .expect("html report should exist");
 
-        let mut todos =
-            TodoList::initialize(&["Determine Virat Kohli's IPL 2025 runs.".to_owned()])
-                .expect("todo init should succeed");
+        let mut todos = TodoList::initialize(&[
+            "[mcp-executor] Determine Virat Kohli's IPL 2025 runs.".to_owned(),
+        ])
+        .expect("todo init should succeed");
         todos
             .set_status(1, crate::todo::TodoStatus::InProgress)
             .expect("item 1 should enter in_progress");
@@ -5375,7 +5897,7 @@ mod tests {
                 timestamp: SystemTime::now(),
                 tool_name: LocalToolName::new("bash").expect("valid tool"),
                 status: "ok".to_owned(),
-                result_summary: "command: open outputs/turn-1-report.html\nexit_code: 0".to_owned(),
+                result_summary: "command: printf '%s\\n' outputs/turn-1-report.html\nexit_code: 0\nstdout:\noutputs/turn-1-report.html\n".to_owned(),
                 error: None,
             }),
         ];
@@ -5402,7 +5924,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_mandatory_todos_marks_open_completed_for_quoted_bash_open() {
+    fn reconcile_mandatory_todos_marks_path_print_completed_for_absolute_bash_stdout() {
         let working_directory = workspace_root();
         let turn_dir = working_directory.join("turn-quoted-open-reconcile");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
@@ -5416,8 +5938,13 @@ mod tests {
                 .expect("html output parent should exist"),
         )
         .expect("outputs dir should exist");
+        std::fs::write(
+            &html_output_path,
+            "<html><body><table><tr><td>report</td></tr></table></body></html>",
+        )
+        .expect("html report should exist");
 
-        let mut todos = TodoList::initialize(&["Prepare the report.".to_owned()])
+        let mut todos = TodoList::initialize(&["[main-agent] Prepare the report.".to_owned()])
             .expect("todo init should succeed");
         todos
             .set_status(1, crate::todo::TodoStatus::InProgress)
@@ -5442,7 +5969,8 @@ mod tests {
                 tool_name: LocalToolName::new("bash").expect("valid tool"),
                 status: "ok".to_owned(),
                 result_summary: format!(
-                    "command: open '{}'\nexit_code: 0",
+                    "command: printf '%s\\n' '{}'\nexit_code: 0\nstdout:\n{}\n",
+                    html_output_path.display(),
                     html_output_path.display()
                 ),
                 error: None,
@@ -5483,8 +6011,9 @@ mod tests {
         std::fs::write(&html_output_path, "<html><body>report</body></html>")
             .expect("html report should exist");
 
-        let mut todos = TodoList::initialize(&["Determine Dhoni's IPL 2025 runs.".to_owned()])
-            .expect("todo init should succeed");
+        let mut todos =
+            TodoList::initialize(&["[mcp-executor] Determine Dhoni's IPL 2025 runs.".to_owned()])
+                .expect("todo init should succeed");
         todos
             .set_status(1, crate::todo::TodoStatus::InProgress)
             .expect("item 1 should enter in_progress");
@@ -5512,8 +6041,9 @@ mod tests {
                 timestamp: SystemTime::now(),
                 tool_name: LocalToolName::new("bash").expect("valid tool"),
                 status: "ok".to_owned(),
-                result_summary: "command: open outputs/turn-1-bash-html-report.html\nexit_code: 0"
-                    .to_owned(),
+                result_summary:
+                    "command: printf '%s\\n' outputs/turn-1-bash-html-report.html\nexit_code: 0\nstdout:\noutputs/turn-1-bash-html-report.html\n"
+                        .to_owned(),
                 error: None,
             }),
         ];
@@ -5547,7 +6077,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5583,7 +6113,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5621,7 +6151,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5656,7 +6186,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [completed] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.\n2. [pending] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.\n3. [pending] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.\n4. [pending] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.\n5. [pending] Generate an output HTML page with charts and tables.\n6. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [mcp-executor] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.\n2. [pending] [mcp-executor] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.\n3. [pending] [mcp-executor] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.\n4. [pending] [main-agent] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.\n5. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5752,6 +6282,76 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_pending_mcp_todos_advances_season_encoding_confirmation() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-trace-season-confirm");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+
+        let todos = TodoList::parse(
+            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [main-agent] Rank all sides by the chosen balance metric and identify the top side.\n5. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let server_name = ServerName::new("ipl").expect("valid server");
+        let messages = vec![
+            MessageRecord::SubAgentCall(SubAgentCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                goal: "Confirm how IPL 2025 is encoded in the matches data and whether any season/date filters are needed.".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: server_name.clone(),
+                }),
+            }),
+            MessageRecord::McpCall(McpCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                arguments: serde_json::json!({
+                    "sql": "select season, count(*) as matches, min(match_date) as first_date, max(match_date) as last_date from matches where season = '2025' group by season;"
+                }),
+            }),
+            MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "query".to_owned(),
+                },
+                result_summary:
+                    "Confirmed IPL season 2025 is encoded as season='2025' with 74 matches from 2025-03-22 through 2025-06-03."
+                        .to_owned(),
+                error: None,
+            }),
+            MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 1,
+                detail: "Confirmed season/date filter for IPL 2025.".to_owned(),
+                tool_mask: None,
+            }),
+        ];
+
+        reconcile_pending_mcp_todos_from_turn_trace(&todo_path, &messages)
+            .expect("reconciliation should succeed");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[1].status, TodoStatus::Completed);
+        assert_eq!(reconciled.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
     fn incomplete_todo_final_feedback_is_specific_for_html_tail_steps() {
         let html_output_path = PathBuf::from("/tmp/arka-session/outputs/turn-1-report.html");
 
@@ -5762,12 +6362,14 @@ mod tests {
             &html_output_path,
         );
         assert!(html_feedback.contains("mandatory deliverable is still incomplete"));
-        assert!(html_feedback.contains("Delegate `tool-executor`"));
+        assert!(html_feedback.contains("todo file exists and is already loaded"));
+        assert!(html_feedback.contains("subagent_type: \"tool-executor\""));
+        assert!(html_feedback.contains("Emit a `delegate_subagent` decision now"));
+        assert!(html_feedback.contains("\"scope\":\"workspace\""));
         assert!(html_feedback.contains("/tmp/arka-session/outputs/turn-1-report.html"));
-        assert!(
-            html_feedback
-                .contains("Do not ask `tool-executor` to open the report in the same delegation")
-        );
+        assert!(html_feedback.contains(
+            "Do not ask `tool-executor` to print the report path in the same delegation"
+        ));
 
         let open_feedback = incomplete_todo_final_feedback(
             4,
@@ -5775,8 +6377,10 @@ mod tests {
             MANDATORY_TODO_OPEN_HTML,
             &html_output_path,
         );
-        assert!(open_feedback.contains("report still needs to be opened"));
-        assert!(open_feedback.contains("open the generated HTML report"));
+        assert!(open_feedback.contains("report path still needs to be printed"));
+        assert!(open_feedback.contains("todo file exists and is already loaded"));
+        assert!(open_feedback.contains("Emit a `delegate_subagent` decision now"));
+        assert!(open_feedback.contains("print the generated HTML file path"));
     }
 
     #[test]
@@ -5788,7 +6392,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Inspect schema\n2. [completed] Compute captaincy record\n3. [pending] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Inspect schema\n2. [completed] Compute captaincy record\n3. [pending] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.\n4. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5855,7 +6459,7 @@ mod tests {
     fn immediate_partial_detail_is_generated_for_out_of_order_html_open() {
         let detail = immediate_partial_detail_for_local_tool_error(
             &LocalToolName::new("bash").expect("valid tool"),
-            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be opened while the current actionable todo is `Generate an output HTML page with charts and tables.`; finish todos in order",
+            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be opened while the current actionable todo is `Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.`; finish todos in order",
         )
         .expect("detail should be returned");
         assert!(detail.contains("generate the report first"));
@@ -5866,11 +6470,11 @@ mod tests {
     fn immediate_partial_detail_is_specific_for_html_rewrite_during_open_step() {
         let detail = immediate_partial_detail_for_local_tool_error(
             &LocalToolName::new("bash").expect("valid tool"),
-            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be written from bash while the current actionable todo is `Open the generated output HTML page in the browser.`; finish todos in order",
+            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be written from bash while the current actionable todo is `Print the path of the generated HTML file.`; finish todos in order",
         )
         .expect("detail should be returned");
-        assert!(detail.contains("browser-open todo remains"));
-        assert!(detail.contains("open the existing report instead of writing it again"));
+        assert!(detail.contains("html-path-print todo remains"));
+        assert!(detail.contains("print the existing report path instead of writing it again"));
     }
 
     #[test]
@@ -5882,7 +6486,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Fetch the answer\n2. [in_progress] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Fetch the answer\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5896,7 +6500,43 @@ mod tests {
                 target: DelegationTarget::LocalToolsScope(
                     LocalToolsScopeTarget::working_directory(),
                 ),
-                goal: "Generate the deterministic HTML report and open it in the browser."
+                goal:
+                    "Generate the deterministic HTML report and print the generated HTML file path."
+                        .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("Do not bundle the html-path-print step"));
+        assert!(feedback.contains("Print the path of the generated HTML file."));
+    }
+
+    #[test]
+    fn html_todo_feedback_blocks_broad_workflow_goal_during_html_generation() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-html-broad-goal");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute IPL 2025 balance metrics\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Determine the most balanced IPL 2025 side using grounded database analysis and complete the required report workflow."
                     .to_owned(),
             },
             &html_output_path,
@@ -5904,8 +6544,143 @@ mod tests {
         .expect("feedback should compute");
 
         let feedback = feedback.expect("feedback should be present");
-        assert!(feedback.contains("Do not bundle the browser-open step"));
-        assert!(feedback.contains("Open the generated output HTML page in the browser."));
+        assert!(feedback.contains("only the HTML-generation step"));
+        assert!(feedback.contains("Do not delegate broader analysis work"));
+        assert!(feedback.contains("Delegate only the deterministic HTML report generation"));
+    }
+
+    #[test]
+    fn html_todo_feedback_allows_report_goal_about_existing_analysis() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-html-report-analysis");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Generate the required HTML report for the users-only customer analysis."
+                    .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        assert_eq!(feedback, None);
+    }
+
+    #[test]
+    fn html_todo_feedback_allows_report_goal_about_users_table_analysis() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-html-users-table-analysis");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Create the required HTML report for the customer users-table analysis."
+                    .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        assert_eq!(feedback, None);
+    }
+
+    #[test]
+    fn html_todo_feedback_allows_complete_html_deliverable_goal() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-html-complete-deliverable");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute users-table metrics\n2. [pending] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal:
+                    "Complete the required HTML deliverable for the customer users-only analysis."
+                        .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        assert_eq!(feedback, None);
+    }
+
+    #[test]
+    fn html_todo_feedback_blocks_query_goal_during_html_generation() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-html-query-goal");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(
+                    LocalToolsScopeTarget::working_directory(),
+                ),
+                goal: "Query users again and create the HTML report.".to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("Do not delegate broader analysis work"));
+        assert!(feedback.contains("Delegate only the deterministic HTML report generation"));
     }
 
     #[test]
@@ -5917,7 +6692,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Fetch the answer\n2. [completed] Generate an output HTML page with charts and tables.\n3. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] Fetch the answer\n2. [completed] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -5937,9 +6712,46 @@ mod tests {
         .expect("feedback should compute");
 
         let feedback = feedback.expect("feedback should be present");
-        assert!(feedback.contains("Only open the existing deterministic HTML report"));
+        assert!(feedback.contains("Only print the existing deterministic HTML report path"));
         assert!(feedback.contains("Do not delegate any broader `tool-executor` work"));
-        assert!(feedback.contains("using local `bash` with `open"));
+        assert!(feedback.contains("using local `bash` with `printf"));
+    }
+
+    #[test]
+    fn html_todo_feedback_blocks_mcp_delegation_when_open_todo_is_active() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-active-open-mcp-block");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
+
+        let todos = TodoList::parse(
+            "1. [completed] Fetch the answer\n2. [completed] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = html_todo_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("ipl").expect("valid server"),
+                }),
+                goal: "Complete the IPL 2025 balance analysis and required HTML report delivery."
+                    .to_owned(),
+            },
+            &html_output_path,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("html-path-print step"));
+        assert!(feedback.contains("Do not delegate MCP/data work"));
+        assert!(feedback.contains("subagent_type: \"tool-executor\""));
+        assert!(feedback.contains("printf"));
     }
 
     #[test]
@@ -6072,7 +6884,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Compute insights\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Compute insights\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6105,7 +6917,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Clarify the user ask\n2. [pending] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Clarify the user ask\n2. [pending] [mcp-executor] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6129,6 +6941,38 @@ mod tests {
         let feedback = feedback.expect("feedback should be present");
         assert!(feedback.contains("should not be delegated to `tool-executor`"));
         assert!(feedback.contains("Delegate `mcp-executor` with server scope"));
+    }
+
+    #[test]
+    fn mcp_collection_feedback_blocks_tool_executor_for_team_level_compute_todo() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-routing-team-compute");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] [mcp-executor] Discover IPL schemas\n2. [completed] [mcp-executor] Sample IPL 2025 rows\n3. [completed] [main-agent] Choose a concrete balance metric\n4. [in_progress] [mcp-executor] Run the full IPL 2025 team-level computation using the chosen metric.\n5. [pending] [main-agent] Prepare a concise business-style answer naming the most balanced side and explaining the metric used.\n6. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n7. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        let feedback = mcp_collection_feedback_for_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "tool-executor".to_owned(),
+                target: DelegationTarget::LocalToolsScope(LocalToolsScopeTarget::working_directory()),
+                goal: "Determine the most balanced IPL 2025 side using a defensible team-level metric.".to_owned(),
+            },
+            "tool-executor",
+            true,
+        )
+        .expect("feedback should compute");
+
+        let feedback = feedback.expect("feedback should be present");
+        assert!(feedback.contains("should not be delegated to `tool-executor`"));
+        assert!(feedback.contains("Delegate `mcp-executor` with server scope"));
+        assert!(feedback.contains("Run the full IPL 2025 team-level computation"));
     }
 
     #[test]
@@ -6162,7 +7006,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [pending] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6187,7 +7031,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [pending] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] Perform analysis\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6229,13 +7073,112 @@ mod tests {
     }
 
     #[test]
+    fn sync_mcp_todo_updates_season_encoding_confirmation_todo() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-season-confirm");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        sync_mcp_todo_before_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("ipl").expect("valid server"),
+                }),
+                goal: "Confirm how IPL 2025 is encoded in the matches data.".to_owned(),
+            },
+            "mcp-executor",
+        )
+        .expect("pre-sync should succeed");
+
+        let in_progress = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(in_progress.items[1].status, TodoStatus::InProgress);
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 1,
+                detail: "Confirmed season 2025 has 74 matches from 2025-03-22 to 2025-06-03."
+                    .to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+        assert_eq!(completed.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn sync_mcp_todo_retries_failed_timestamp_trend_todo() {
+        let working_directory = workspace_root();
+        let turn_dir = working_directory.join("turn-mcp-sync-timestamp-trend");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let todos = TodoList::parse(
+            "1. [completed] [mcp-executor] Inspect the customer users table fields.\n2. [failed] [mcp-executor] Check signup or activity timestamps in the users table for simple trends if those fields exist.\n3. [pending] [main-agent] Prepare a concise business-language summary.\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        sync_mcp_todo_before_delegation(
+            &todo_path,
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("analytics").expect("valid server"),
+                }),
+                goal: "Check signup and activity timestamp trends in the users table.".to_owned(),
+            },
+            "mcp-executor",
+        )
+        .expect("pre-sync should succeed");
+
+        let in_progress = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(in_progress.items[1].status, TodoStatus::InProgress);
+
+        sync_mcp_todo_after_delegation(
+            &todo_path,
+            &SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "completed".to_owned(),
+                executed_action_count: 1,
+                detail: "Computed signup trend rows from created_at.".to_owned(),
+                tool_mask: None,
+            },
+        )
+        .expect("post-sync should succeed");
+
+        let completed = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(completed.items[1].status, TodoStatus::Completed);
+        assert_eq!(completed.items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
     fn sync_mcp_todo_marks_collection_step_completed_after_partial_result() {
         let working_directory = workspace_root();
         let turn_dir = working_directory.join("turn-mcp-sync-partial");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Understand the requirements\n2. [in_progress] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] Generate an output HTML page with charts and tables.\n5. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Understand the requirements\n2. [in_progress] [mcp-executor] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] [main-agent] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6269,7 +7212,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Confirm the IPL 2025 season scope.\n2. [in_progress] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [mcp-executor] Confirm the IPL 2025 season scope.\n2. [in_progress] [mcp-executor] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.\n3. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6341,7 +7284,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] [mcp-executor] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6374,7 +7317,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] Generate an output HTML page with charts and tables.\n4. [pending] Open the generated output HTML page in the browser.\n",
+            "1. [completed] [main-agent] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] [mcp-executor] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] [tool-executor] Generate a well written, readable and engaging story with charts and tables by doing deep analysis to gather insights using python, pandas and numpy.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6657,6 +7600,7 @@ mod tests {
                 force_todo_file: false,
                 execution_todo_required: Some(false),
             },
+            None,
             &[],
         )
         .expect("prompt should build");
@@ -6684,7 +7628,7 @@ mod tests {
                         capability_id: "run_query".to_owned(),
                     },
                     arguments: serde_json::json!({
-                        "query": "SELECT count(*) FROM volonte.users"
+                        "query": "SELECT count(*) FROM analytics_db.users"
                     }),
                 }),
                 MessageRecord::McpResult(McpResultMessageRecord {
@@ -6702,7 +7646,7 @@ mod tests {
             &server_name,
         );
 
-        assert!(rendered.contains("volonte.users"));
+        assert!(rendered.contains("analytics_db.users"));
     }
 
     #[test]
@@ -6794,7 +7738,7 @@ mod tests {
             },
             &serde_json::json!({
                 "query": "select 1",
-                "database": "volonte"
+                "database": "analytics_db"
             }),
         )
         .expect("arguments should sanitize");

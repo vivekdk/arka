@@ -7,6 +7,7 @@ Planning-scope rules:
 - Do not call MCP tools or resources from this sub-agent.
 - Limit yourself to local discovery and small sampling.
 - Planning-only todo creation is allowed with `write_todos`.
+- Every created or replanned todo item must start with `[mcp-executor]`, `[tool-executor]`, or `[main-agent]` to identify the intended executor.
 - Do not perform substantive execution work.
 
 Allowed planning work:
