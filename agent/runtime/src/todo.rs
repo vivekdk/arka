@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const MANDATORY_TODO_GENERATE_HTML: &str = "Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.";
+pub const MANDATORY_TODO_GENERATE_HTML: &str = "Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.";
 pub const MANDATORY_TODO_OPEN_HTML: &str = "Print the path of the generated HTML file.";
 pub const GENERIC_STARTER_TODO: &str = "Understand and complete the user request.";
 
@@ -576,14 +576,14 @@ mod tests {
         assert!(rendered.contains("1. [pending] [mcp-executor] Inspect the data"));
         assert!(rendered.contains("2. [pending] [main-agent] Summarize findings"));
         assert!(rendered.contains(
-            "3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights."
+            "3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout."
         ));
     }
 
     #[test]
     fn parse_accepts_legacy_unhinted_todo_files() {
         let todos = TodoList::parse(
-            "1. [pending] Inspect\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [pending] Inspect\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("legacy todo file should parse");
 
@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn replan_rewrites_only_pending_suffix() {
         let mut todos = TodoList::parse(
-            "1. [completed] Inspect\n2. [failed] Analyze\n3. [pending] Summarize\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Inspect\n2. [failed] Analyze\n3. [pending] Summarize\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn replan_replaces_generic_starter_when_it_is_current_actionable() {
         let mut todos = TodoList::parse(
-            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn replan_strips_rendered_prefixes_and_drops_preserved_duplicates() {
         let mut todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [failed] Collect data\n3. [pending] Analyze\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Define scope\n2. [failed] Collect data\n3. [pending] Analyze\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn replan_rejects_concrete_plan_without_failed_todo() {
         let mut todos = TodoList::parse(
-            "1. [completed] Define scope\n2. [pending] Collect data\n3. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Define scope\n2. [pending] Collect data\n3. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
 

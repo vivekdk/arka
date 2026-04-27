@@ -2,5 +2,5 @@
 2. [completed] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.
 3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.
 4. [pending] [main-agent] Rank all sides by the chosen balance metric and identify the top side.
-5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
+5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.
 6. [pending] [tool-executor] Print the path of the generated HTML file.

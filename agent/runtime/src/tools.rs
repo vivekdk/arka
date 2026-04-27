@@ -1424,7 +1424,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1450,7 +1450,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Compute the ranked batter impact metric.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1476,7 +1476,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n2. [pending] Print the path of the generated HTML file.\n",
+            "1. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n2. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1502,7 +1502,7 @@ mod tests {
         std::fs::create_dir_all(temp_dir.join("outputs")).expect("outputs dir");
         std::fs::write(
             &context.todo_path,
-            "1. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n2. [pending] Print the path of the generated HTML file.\n",
+            "1. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n2. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todo file");
 
@@ -1535,7 +1535,7 @@ mod tests {
         let raw = std::fs::read_to_string(&context.todo_path).expect("todo file should exist");
         assert!(raw.contains("[pending] [mcp-executor] Inspect source data"));
         assert!(raw.contains(
-            "[pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights."
+            "[pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout."
         ));
         assert_eq!(
             result.payload["next_actionable"]["executor_hint"].as_str(),

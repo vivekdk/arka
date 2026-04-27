@@ -1,4 +1,4 @@
 1. [completed] [main-agent] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.
 2. [completed] [mcp-executor] Compute or extract the relevant bowling performance metrics for the 2025 season.
-3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
+3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.
 4. [pending] [tool-executor] Print the path of the generated HTML file.

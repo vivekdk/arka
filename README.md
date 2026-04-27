@@ -78,6 +78,29 @@ At a high level, one request moves through Arka like this:
 
 Typical outputs include concise answers, reproducible intermediate files, generated charts, and HTML reports under the session workspace `outputs/` directory.
 
+For example, a user can ask:
+
+```text
+Who is the most successful batter in IPL?
+```
+
+Arka can turn that into:
+
+> Virat Kohli is the most successful IPL batter across all seasons when success is measured by total career runs scored. He leads the all-time leaderboard with 8,740 runs.
+
+It then expands that answer into a presentation-quality HTML report with:
+
+- a high-signal summary card with the headline answer, total runs, balls faced, and strike rate
+- a ranked top-10 leaderboard chart showing Kohli ahead of Rohit Sharma, Shikhar Dhawan, and David Warner
+- an accompanying table with runs, balls faced, strike rate, seasons, and runs per season
+- narrative sections that explain why the lead is meaningful, add context from the rest of the top 10, and document the method used
+
+![Arka sample IPL report leaderboard section](assets/screenshots/arka-sample-report-leaderboard.png)
+
+![Arka sample IPL report context section](assets/screenshots/arka-sample-report-context.png)
+
+That is the core operating model: start with a plain-language analytics question, gather evidence through MCP and local tools, run structured analysis, and return a clear answer with presentation-quality visuals.
+
 ## Channel Integrations
 
 Arka currently supports two messaging-channel integrations through the control plane:

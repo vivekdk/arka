@@ -4850,7 +4850,7 @@ fn immediate_partial_detail_for_local_tool_error(
         return None;
     }
     if error_text.contains(
-        "cannot be opened while the current actionable todo is `Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.`",
+        "cannot be opened while the current actionable todo is `Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.`",
     ) {
         return Some(
             "The delegated run tried to open the deterministic HTML report before completing the HTML-generation todo. Return control, then generate the report first and print its path only on the next todo step.".to_owned(),
@@ -5812,7 +5812,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         TodoList::parse(
-            "1. [completed] Compute the IPL 2025 balance metrics.\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute the IPL 2025 balance metrics.\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse")
         .save_to_path(&todo_path)
@@ -6077,7 +6077,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Validate the extracted runs against the available source and prepare a concise summary.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6113,7 +6113,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Understand the user request and inspect available local workspace inputs for the MS Dhoni IPL 2025 breakdown.\n2. [pending] Extract or materialize the relevant IPL 2025/MS Dhoni data into local outputs for reproducible analysis.\n3. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6151,7 +6151,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [in_progress] Understand and complete the user request.\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6186,7 +6186,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.\n2. [pending] [mcp-executor] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.\n3. [pending] [mcp-executor] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.\n4. [pending] [main-agent] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.\n5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.\n2. [pending] [mcp-executor] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.\n3. [pending] [mcp-executor] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.\n4. [pending] [main-agent] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.\n5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6289,7 +6289,7 @@ mod tests {
         let todo_path = turn_dir.join("todos.txt");
 
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [main-agent] Rank all sides by the chosen balance metric and identify the top side.\n5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [main-agent] Rank all sides by the chosen balance metric and identify the top side.\n5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n6. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6392,7 +6392,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Inspect schema\n2. [completed] Compute captaincy record\n3. [pending] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Inspect schema\n2. [completed] Compute captaincy record\n3. [pending] Return the computed record in a concise cricket summary with any caveats if captaincy is inferred from a specific field.\n4. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6459,7 +6459,7 @@ mod tests {
     fn immediate_partial_detail_is_generated_for_out_of_order_html_open() {
         let detail = immediate_partial_detail_for_local_tool_error(
             &LocalToolName::new("bash").expect("valid tool"),
-            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be opened while the current actionable todo is `Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.`; finish todos in order",
+            "the deterministic HTML report `/tmp/arka/turn-report.html` cannot be opened while the current actionable todo is `Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.`; finish todos in order",
         )
         .expect("detail should be returned");
         assert!(detail.contains("generate the report first"));
@@ -6486,7 +6486,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Fetch the answer\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Fetch the answer\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6522,7 +6522,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Compute IPL 2025 balance metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute IPL 2025 balance metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6558,7 +6558,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6591,7 +6591,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6624,7 +6624,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Compute users-table metrics\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute users-table metrics\n2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6658,7 +6658,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Compute users-table metrics\n2. [in_progress] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6692,7 +6692,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Fetch the answer\n2. [completed] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Fetch the answer\n2. [completed] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6726,7 +6726,7 @@ mod tests {
         let html_output_path = turn_dir.join("outputs").join("turn-1-report.html");
 
         let todos = TodoList::parse(
-            "1. [completed] Fetch the answer\n2. [completed] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n3. [pending] Print the path of the generated HTML file.\n",
+            "1. [completed] Fetch the answer\n2. [completed] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6884,7 +6884,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Compute insights\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Compute insights\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6917,7 +6917,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Clarify the user ask\n2. [pending] [mcp-executor] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Clarify the user ask\n2. [pending] [mcp-executor] If needed, search workspace inputs for match/stat data and extract Dhoni's IPL 2025 run total.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -6950,7 +6950,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Discover IPL schemas\n2. [completed] [mcp-executor] Sample IPL 2025 rows\n3. [completed] [main-agent] Choose a concrete balance metric\n4. [in_progress] [mcp-executor] Run the full IPL 2025 team-level computation using the chosen metric.\n5. [pending] [main-agent] Prepare a concise business-style answer naming the most balanced side and explaining the metric used.\n6. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n7. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Discover IPL schemas\n2. [completed] [mcp-executor] Sample IPL 2025 rows\n3. [completed] [main-agent] Choose a concrete balance metric\n4. [in_progress] [mcp-executor] Run the full IPL 2025 team-level computation using the chosen metric.\n5. [pending] [main-agent] Prepare a concise business-style answer naming the most balanced side and explaining the metric used.\n6. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n7. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7007,7 +7007,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Load and inspect the CSK/IPL 2025 datasets, confirming schema, coverage, and quality.\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7032,7 +7032,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Define scope\n2. [pending] [mcp-executor] Collect and prepare CSK IPL 2025 season data and supporting context\n3. [pending] [main-agent] Perform analysis\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7080,7 +7080,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Inspect the IPL schema for matches, match_teams, innings, deliveries, and teams.\n2. [pending] [mcp-executor] Confirm how IPL 2025 is encoded in the matches data and whether there are any season/date filters needed.\n3. [pending] [mcp-executor] Compute a concrete team-balance metric for IPL 2025 from the available data.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7130,7 +7130,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Inspect the customer users table fields.\n2. [failed] [mcp-executor] Check signup or activity timestamps in the users table for simple trends if those fields exist.\n3. [pending] [main-agent] Prepare a concise business-language summary.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Inspect the customer users table fields.\n2. [failed] [mcp-executor] Check signup or activity timestamps in the users table for simple trends if those fields exist.\n3. [pending] [main-agent] Prepare a concise business-language summary.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7179,7 +7179,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Understand the requirements\n2. [in_progress] [mcp-executor] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] [main-agent] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Understand the requirements\n2. [in_progress] [mcp-executor] Query or inspect the IPL 2025 match results needed to compute team net run rate for the full season.\n3. [pending] [main-agent] Compute each team's NRR and identify the highest-NRR team for 2025.\n4. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n5. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7213,7 +7213,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [mcp-executor] Confirm the IPL 2025 season scope.\n2. [in_progress] [mcp-executor] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [mcp-executor] Confirm the IPL 2025 season scope.\n2. [in_progress] [mcp-executor] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7285,7 +7285,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] [mcp-executor] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Determine the evidence and data source needed to answer who was the best bowler in IPL 2025.\n2. [in_progress] [mcp-executor] Compute or extract the relevant bowling performance metrics for the 2025 season.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
@@ -7318,7 +7318,7 @@ mod tests {
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
         let todos = TodoList::parse(
-            "1. [completed] [main-agent] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] [mcp-executor] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
+            "1. [completed] [main-agent] Clarify the IPL 2025 bowling metric and identify the source data available in the workspace.\n2. [failed] [mcp-executor] Compute the leading bowler(s) using the available dataset and derive the ranking table.\n3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n4. [pending] [tool-executor] Print the path of the generated HTML file.\n",
         )
         .expect("seed todos should parse");
         todos
