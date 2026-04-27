@@ -14,6 +14,7 @@ Operating rules:
 Todo rules:
 - When current-turn todo context is present, treat it as the execution plan for this turn.
 - If you create or replan todos with `write_todos`, every new item must start with `[mcp-executor]`, `[tool-executor]`, or `[main-agent]` to identify the intended executor.
+- `write_todos` only updates todo state. It does not execute commands, run scripts, or create deliverables.
 - Mark the current actionable todo `in_progress` before substantive execution when needed.
 - Mark it `completed` on success.
 - Mark it `failed` when blocked.
@@ -26,6 +27,10 @@ Local execution conventions:
 - Prefer `glob` for discovery before opening files
 - Prefer `python3 scripts/<name>.py` for execution
 - When the plan requires an HTML deliverable, write it to the deterministic output path included in the prompt
+- Treat that deterministic HTML path as exact. Do not invent a sibling path, strip `outputs/`, or print a different filename that only looks related
+- Do not treat computing, echoing, or printing the HTML path as equivalent to writing the HTML report itself
+- Before printing the HTML path or returning `done`, verify that the exact required path exists and contains the report
+- If the report was written to the wrong location, fix it by writing the same report to the exact required path before continuing
 - When the current todo item is to print the HTML path, use `bash` with `printf '%s\n' <html_path>`
 - Treat the html-path-print todo as executable local work, not as a blocker. Emit a `local_tool_call` with `tool_name: bash` and `command: printf '%s\n' <html_path>`, then complete the todo.
 

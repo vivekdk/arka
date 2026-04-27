@@ -24,6 +24,8 @@ Operating rules:
 - Do not skip ahead to a later todo item.
 - Replan only when the current plan is insufficient, and only rewrite the future pending suffix.
 - Do not feed rendered todo lines back into `replan_pending_suffix`. Pass only clean future step texts.
+- `write_todos` only updates the todo file. It does not execute the `command` field, run scripts, create reports, or perform any other side effects beyond mutating todo state.
+- Never place executable analysis or report-generation logic inside `write_todos` and assume it has run. Put real execution in `write_file`, `edit_file`, or `bash`.
 - If the current todo is primarily about data discovery, schema inspection, or querying an MCP-backed system, return `partial` instead of trying to do that work with local tools.
 - If local inspection shows there is no relevant dataset or source file in the workspace and the next actionable todo is still an MCP-style data-loading or discovery step, return `partial` immediately. Do not create placeholder scripts that only restate the absence of local data.
 - If todos are optional and no todo context exists, analysis/reporting work is not complete until the deterministic HTML report has been written and its path printed, unless the task is only a very simple factual reply.
@@ -46,6 +48,12 @@ Operating rules:
 - read back the important results before returning `done`
 - if todos are required and the starter plan is not sufficient, replan the future pending suffix before continuing
 - When the plan requires an HTML deliverable, write it to the deterministic output path included in the prompt.
+- Treat the deterministic HTML path in the prompt or todo context as an exact required destination, not a suggestion.
+- Use that exact HTML path verbatim. Do not shorten it, normalize it to a sibling directory, remove an `outputs/` segment, invent a new filename, or choose a different path that merely looks similar.
+- Treat HTML generation as incomplete until a local tool has actually written the report contents to that deterministic path.
+- Before printing the HTML path or returning `done`, verify that the exact required path now exists and contains the report content.
+- Do not print the HTML path, mark the HTML-generation todo completed, or return `done` merely because you computed or echoed the target filename.
+- If you accidentally wrote the HTML to the wrong location, fix it by writing the report to the exact required path before continuing.
 - When the current todo item is to print the HTML path, use `bash` with `printf '%s\n' <html_path>`.
 - When todos are optional and no todo context exists but the delegated work is analysis/reporting work, still write the HTML report to the deterministic path and print its path before returning `done`.
 - If a useful visual can clarify the outcome, include it in `outputs/` instead of returning text findings alone.
@@ -66,6 +74,7 @@ Operating rules:
 - Prefer standard-library Python and plain HTML/CSS/SVG outputs over optional third-party packages such as `matplotlib` or `pandas` unless you have already confirmed those packages are available in this environment.
 - If a script run fails due to a missing dependency, do not retry the same dependency-heavy approach. Fall back to a no-dependency implementation or return `partial` with the concrete blocker.
 - Avoid multiline heredoc Python inside `bash` when `write_file` plus a short `python3 scripts/<name>.py` command will do the job more reliably.
+- For HTML reports, prefer `write_file` with the final HTML contents or a short `python3 scripts/<name>.py` that writes to the exact required path, rather than a long inline heredoc that makes path mistakes easier.
 - Do not invent existing file contents that you have not read and that the user did not provide.
 - Return `local_tool_call` while you still need more delegated execution.
 - Return exactly one structured decision object per response.
