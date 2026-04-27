@@ -1,0 +1,7 @@
+1. [completed] [mcp-executor] Discover IPL schemas
+2. [completed] [mcp-executor] Sample IPL 2025 rows
+3. [completed] [main-agent] Choose a concrete balance metric
+4. [in_progress] [mcp-executor] Run the full IPL 2025 team-level computation using the chosen metric.
+5. [pending] [main-agent] Prepare a concise business-style answer naming the most balanced side and explaining the metric used.
+6. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
+7. [pending] [tool-executor] Print the path of the generated HTML file.

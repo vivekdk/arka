@@ -1,0 +1,3 @@
+1. [completed] Compute users-table metrics
+2. [pending] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
+3. [pending] Print the path of the generated HTML file.

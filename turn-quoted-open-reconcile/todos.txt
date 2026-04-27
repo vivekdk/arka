@@ -1,3 +1,0 @@
-1. [completed] [main-agent] Prepare the report.
-2. [completed] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
-3. [completed] [tool-executor] Print the path of the generated HTML file.

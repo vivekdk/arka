@@ -1,4 +1,0 @@
-1. [completed] [mcp-executor] Confirm the IPL 2025 season scope.
-2. [failed] [mcp-executor] Run targeted SQL aggregations for IPL 2025 team wins and venue distribution.
-3. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
-4. [pending] [tool-executor] Print the path of the generated HTML file.

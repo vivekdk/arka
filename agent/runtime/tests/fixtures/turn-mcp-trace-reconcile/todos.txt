@@ -1,0 +1,6 @@
+1. [completed] [mcp-executor] Inspect the IPL schema for players, deliveries, matches, and innings to identify the exact fields needed for batting analysis.
+2. [completed] [mcp-executor] Confirm Virat Kohli's player identifier/name in the players table and verify whether batting events are recorded in deliveries or innings.
+3. [completed] [mcp-executor] Run a compact set of SQL queries to compute his overall IPL batting summary, season-wise run totals, dismissals, strike rate, and high-level consistency indicators.
+4. [pending] [main-agent] If useful from the data, add a brief comparison against a couple of career milestones or recent-season trends without overextending the scope.
+5. [pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.
+6. [pending] [tool-executor] Print the path of the generated HTML file.

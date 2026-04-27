@@ -5852,7 +5852,7 @@ mod tests {
 
     #[test]
     fn reconcile_mandatory_todos_marks_html_and_path_print_steps_completed() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-1");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -5925,7 +5925,7 @@ mod tests {
 
     #[test]
     fn reconcile_mandatory_todos_marks_path_print_completed_for_absolute_bash_stdout() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-quoted-open-reconcile");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -5995,7 +5995,7 @@ mod tests {
 
     #[test]
     fn reconcile_mandatory_todos_marks_html_completed_when_report_was_written_via_bash() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-1-bash-html");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6071,7 +6071,7 @@ mod tests {
 
     #[test]
     fn reconcile_active_todo_marks_in_progress_item_completed_after_subagent_success() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-reconcile");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6107,7 +6107,7 @@ mod tests {
 
     #[test]
     fn reconcile_active_todo_marks_local_inspection_todo_completed_after_partial_tool_executor() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-partial-inspection");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6145,7 +6145,7 @@ mod tests {
 
     #[test]
     fn reconcile_active_todo_does_not_complete_generic_starter_scaffold() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-generic-starter");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6180,7 +6180,7 @@ mod tests {
 
     #[test]
     fn reconcile_pending_mcp_todos_advances_multiple_grounded_collection_steps() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-trace-reconcile");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6283,7 +6283,7 @@ mod tests {
 
     #[test]
     fn reconcile_pending_mcp_todos_advances_season_encoding_confirmation() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-trace-season-confirm");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6385,7 +6385,7 @@ mod tests {
 
     #[test]
     fn auto_advance_summary_todo_from_final_content_marks_summary_step_completed() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-auto-advance-summary");
         std::fs::create_dir_all(turn_dir.join("outputs")).expect("outputs dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6426,7 +6426,7 @@ mod tests {
 
     #[test]
     fn auto_advance_summary_todo_from_final_content_does_not_advance_compute_step() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-auto-advance-compute");
         std::fs::create_dir_all(turn_dir.join("outputs")).expect("outputs dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6479,7 +6479,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_blocks_bundled_generate_and_open_goal() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-reconcile");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6515,7 +6515,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_blocks_broad_workflow_goal_during_html_generation() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-html-broad-goal");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6551,7 +6551,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_allows_report_goal_about_existing_analysis() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-html-report-analysis");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6584,7 +6584,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_allows_report_goal_about_users_table_analysis() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-html-users-table-analysis");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6617,7 +6617,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_allows_complete_html_deliverable_goal() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-html-complete-deliverable");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6651,7 +6651,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_blocks_query_goal_during_html_generation() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-html-query-goal");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6685,7 +6685,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_blocks_non_open_only_goal_when_open_todo_is_active() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-open-only");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6719,7 +6719,7 @@ mod tests {
 
     #[test]
     fn html_todo_feedback_blocks_mcp_delegation_when_open_todo_is_active() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-active-open-mcp-block");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6813,7 +6813,7 @@ mod tests {
 
     #[test]
     fn generic_starter_replan_blocks_bundled_plan_and_execute_goal() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-generic-starter-bundled-goal");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6879,7 +6879,7 @@ mod tests {
 
     #[test]
     fn mcp_collection_feedback_blocks_tool_executor_for_data_collection_todos() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-routing");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6912,7 +6912,7 @@ mod tests {
 
     #[test]
     fn mcp_collection_feedback_blocks_workspace_input_extraction_todos() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-routing-workspace-inputs");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -6945,7 +6945,7 @@ mod tests {
 
     #[test]
     fn mcp_collection_feedback_blocks_tool_executor_for_team_level_compute_todo() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-routing-team-compute");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7001,7 +7001,7 @@ mod tests {
 
     #[test]
     fn tool_executor_mcp_todo_partial_feedback_blocks_non_todo_tools() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-tool-executor-mcp-gate");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7026,7 +7026,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_before_and_after_delegation_updates_matching_todo() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7074,7 +7074,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_updates_season_encoding_confirmation_todo() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-season-confirm");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7124,7 +7124,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_retries_failed_timestamp_trend_todo() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-timestamp-trend");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7173,7 +7173,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_marks_collection_step_completed_after_partial_result() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-partial");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7207,7 +7207,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_marks_failed_after_blocking_partial_result() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-blocked-partial");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7279,7 +7279,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_marks_hybrid_compute_or_extract_step_completed_after_partial_result() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-hybrid-partial");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7312,7 +7312,7 @@ mod tests {
 
     #[test]
     fn sync_mcp_todo_revives_failed_step_before_successful_retry() {
-        let working_directory = workspace_root();
+        let working_directory = test_fixtures_root();
         let turn_dir = working_directory.join("turn-mcp-sync-retry");
         std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
         let todo_path = turn_dir.join("todos.txt");
@@ -7592,11 +7592,11 @@ mod tests {
             }),
             "Inspect users",
             "How many users are there?",
-            &workspace_root(),
-            &workspace_root().join("turn-1").join("todos.txt"),
+            &test_fixtures_root(),
+            &test_fixtures_root().join("turn-1").join("todos.txt"),
             &TurnPolicyPromptContext {
                 phase: TurnPhase::Execution,
-                html_output_path: workspace_root().join("outputs").join("turn-1-report.html"),
+                html_output_path: test_fixtures_root().join("outputs").join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(false),
             },
@@ -7780,6 +7780,13 @@ mod tests {
             .join("../..")
             .canonicalize()
             .expect("workspace root should resolve")
+    }
+
+    fn test_fixtures_root() -> PathBuf {
+        workspace_root()
+            .join("agent/runtime/tests/fixtures")
+            .canonicalize()
+            .expect("runtime test fixtures root should resolve")
     }
 }
 
