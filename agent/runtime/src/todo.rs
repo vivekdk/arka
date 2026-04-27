@@ -8,8 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const MANDATORY_TODO_GENERATE_HTML: &str =
-    "Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.";
+pub const MANDATORY_TODO_GENERATE_HTML: &str = "Generate a clear, engaging data blog post with narrative writing, charts, and tables, using deep analysis in Python with pandas and numpy to surface insights.";
 pub const MANDATORY_TODO_OPEN_HTML: &str = "Print the path of the generated HTML file.";
 pub const GENERIC_STARTER_TODO: &str = "Understand and complete the user request.";
 
@@ -464,11 +463,10 @@ fn strip_rendered_todo_prefix(value: &str) -> Option<&str> {
 fn canonical_mandatory_todo(value: &str) -> Option<&'static str> {
     let normalized = normalize_for_match(value);
     let generate_verbs = ["generate", "create", "build", "render", "produce", "write"];
-    let mentions_html_report =
-        normalized.contains("html")
-            || normalized.contains("report")
-            || normalized.contains("page")
-            || normalized.contains("story");
+    let mentions_html_report = normalized.contains("html")
+        || normalized.contains("report")
+        || normalized.contains("page")
+        || normalized.contains("story");
     let mentions_visual_payload = normalized.contains("chart")
         || normalized.contains("table")
         || normalized.contains("visual");

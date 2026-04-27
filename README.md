@@ -1,317 +1,151 @@
 ![Arka logo](assets/arka-logo.svg)
 
-# AI Data Analyst
+# Arka
 
-Rust workspace for an agent runtime and channel control plane built around MCP.
+Arka is a data insights harness for turning raw data into deep analysis, clear insights, and easy-to-understand visualizations.
 
-Today the repo contains:
+It is built for teams that want agent-driven data analysis across MCP-connected systems, with structured execution, reproducible artifacts, and channel-friendly outputs.
 
-- an MCP client and JSON registry for local `stdio` and remote Streamable HTTP MCP servers
-- a single-turn agent runtime with typed turn/step/message state
+At a high level, Arka combines:
+
+- MCP for structured access to databases, APIs, and external capability surfaces
+- sub-agent orchestration for separating discovery, computation, and local execution concerns
+- planning and task breakdown through chain-of-thought-guided todo planning
+- an orchestration loop with a Ralph-loop-style execution model at its core
+- local tools for workspace inspection, scripting, file generation, and report delivery
+- context and state management across turns, steps, sessions, and delegated work
+
+The repository combines:
+
+- an MCP registry, client, metadata loader, and inspection CLI
+- a single-turn agent runtime with typed turn, step, and message state
 - an OpenAI-backed model adapter
-- a server-hosted control plane with sessions, approvals, HTTP API, SSE events, and channel adapters
-- a thin CLI that talks to the control-plane API
+- a control plane with sessions, approvals, HTTP API, SSE streams, and channel integrations
+- Slack ingress and threaded outbound delivery through the control plane
+- a local WhatsApp Web bridge sidecar for development and operator workflows
+
+## What This Repo Includes
+
+| Area | Purpose |
+| --- | --- |
+| `mcp/config` | Loads and validates MCP registry configuration |
+| `mcp/client` | Connects to MCP servers and executes MCP capabilities |
+| `mcp/metadata` | Loads and resolves MCP capability metadata for prompting and routing |
+| `mcp/cli` | CLI for inspecting configured MCP servers |
+| `agent/runtime` | Single-turn runtime, delegation loop, local tools, and guardrails |
+| `agent/openai` | OpenAI Responses API adapter for the runtime |
+| `agent/controlplane` | Session orchestration, approvals, API, SSE, and channel handling |
+| `bridges/whatsapp-web` | Optional local WhatsApp Web bridge using Baileys |
 
 ## Architecture
 
-The system is layered deliberately:
+Arka is intentionally split into clear layers:
 
-1. `mcp/*`
-   - `mcp/config`: loads and validates the MCP registry JSON
-   - `mcp/client`: connects to MCP servers, performs handshake, lists tools, and calls tools
-   - `mcp/cli`: small inspection CLI for configured MCP servers
-2. `agent/runtime`
-   - owns the single-turn execution loop
-   - builds prompts from canonical state records
-   - executes MCP actions and local tools
-   - emits typed runtime events
-   - evaluates tool-availability policy and produces per-step tool masks
-3. `agent/openai`
-   - OpenAI Responses API adapter behind the runtime `ModelAdapter` trait
-4. `agent/controlplane`
-   - adds sessions above the single-turn runtime
-   - exposes HTTP endpoints and SSE event streams
-   - normalizes API, CLI, Slack, and WhatsApp traffic into one session model
-   - manages approvals and idempotency
+1. The MCP layer loads registry config, discovers server capabilities, and executes MCP tools or resources.
+2. The runtime layer owns one turn of execution at a time, including prompting, decision validation, delegation, tool execution, and typed event emission.
+3. The model adapter layer isolates provider-specific behavior behind the runtime `ModelAdapter` trait.
+4. The control plane adds session state, approvals, resumability, transport adapters, and API surfaces on top of the single-turn runtime.
 
-## Workspace
+The runtime remains single-turn by design. Multi-turn behavior is handled by the control plane.
+
+## Architectural Model
+
+Arka should be read as a harness rather than a single model wrapper. The main architectural ideas are:
+
+- **MCP-first execution**: external systems are accessed through MCP registry configuration, metadata, capability discovery, and bounded MCP execution instead of ad hoc connector code
+- **Sub-agent orchestration**: the main agent delegates bounded work to purpose-built executors such as `mcp-executor` and `tool-executor`, which keeps discovery, retrieval, local computation, and report generation separated
+- **Planning and task breakdown**: planning is explicit, with todo-driven decomposition and executor-specific task assignment before substantive execution begins
+- **Ralph-loop-style orchestration**: the core loop repeatedly plans, delegates, executes, observes results, updates local state, and continues until the turn is resolved or requires approval
+- **Tool-driven analysis**: local tools are part of the runtime contract, enabling file inspection, edits, shell execution, reproducible scripts, generated outputs, and deterministic report artifacts
+- **Context management**: prompts are assembled from canonical turn state, conversation history, recent session messages, execution handoff data, tool policy context, and MCP metadata rather than from raw transcript text alone
+- **State management**: Arka persists session-level records in the control plane and maintains typed turn, step, message, approval, and artifact state inside the runtime harness
+
+In practice, this means Arka is designed to turn ambiguous data questions into a managed execution workflow: plan the work, route it to the right executor, gather evidence through MCP or tools, materialize artifacts, and return a channel-appropriate result.
+
+The “Ralph-loop-style” phrasing here refers to an iterative plan, delegate, execute, observe, and update loop rather than a single-shot model call.
+
+## How It Works
+
+At a high level, one request moves through Arka like this:
+
+1. A user request enters the control plane through the API, CLI, Slack, or WhatsApp.
+2. The runtime builds planning context from conversation history, session state, available MCP capabilities, and current tool policy.
+3. Planning produces an explicit task breakdown, usually as ordered todos with executor ownership.
+4. The main agent delegates bounded work to `mcp-executor`, `tool-executor`, or keeps synthesis work in the main loop.
+5. MCP-backed discovery and retrieval happen through the MCP layer; local computation, scripts, charts, and report generation happen through local tools.
+6. The runtime updates typed turn, step, message, and artifact state after each action.
+7. The control plane returns a channel-appropriate answer and can attach generated artifacts such as charts or HTML reports.
+
+Typical outputs include concise answers, reproducible intermediate files, generated charts, and HTML reports under the session workspace `outputs/` directory.
+
+## Channel Integrations
+
+Arka currently supports two messaging-channel integrations through the control plane:
+
+- Slack via the Events API, request-signature verification, thread-aware session routing, and outbound replies through the Slack Web API
+- WhatsApp via a normalized gateway flow and an optional local WhatsApp Web bridge for development workflows
+
+Slack is part of the main control-plane surface. The WhatsApp Web bridge is optional.
+
+## Repository Layout
 
 ```text
 .
 |-- Cargo.toml
 |-- .env.example
 |-- config/
-|   `-- mcp_servers.example.json
+|   |-- mcp_servers.example.json
+|   |-- prompt.md
+|   |-- subagents.json
+|   `-- tool_policy.example.json
 |-- agent/
 |   |-- controlplane/
 |   |-- openai/
 |   `-- runtime/
-`-- mcp/
-    |-- cli/
-    |-- client/
-    `-- config/
+|-- mcp/
+|   |-- cli/
+|   |-- client/
+|   |-- config/
+|   `-- metadata/
+`-- bridges/
+    `-- whatsapp-web/
 ```
 
 ## Requirements
 
 - Rust toolchain with `cargo`
-- at least one local MCP server executable available on your machine
-- an OpenAI API key if you want to run the control-plane server against the OpenAI adapter
+- at least one MCP server you can reach locally or over Streamable HTTP
+- an OpenAI API key if you want to run the control plane against the OpenAI adapter
+- Node.js and `npm` only if you want to run the local WhatsApp Web bridge
 
-## Configuration
+## Quick Start
 
-### `.env`
-
-Create a local `.env` by copying `.env.example`.
-
-The control-plane server reads local configuration from `.env` automatically.
-
-Current variables:
-
-```dotenv
-OPENAI_API_KEY=
-MODEL_NAME=gpt-5.4-mini
-SYSTEM_PROMPT=config/prompt.md
-MCP_REGISTRY_PATH=config/mcp_servers.json
-SUBAGENT_REGISTRY_PATH=config/subagents.json
-TOOL_POLICY_PATH=
-SESSION_STORE_DIR=data/sessions
-```
-
-`SYSTEM_PROMPT` is the path to the prompt file. The server re-reads that file at the beginning of every turn, resolves supported dynamic tags, and then uses the rendered contents as the system prompt for that turn.
-
-Supported dynamic tags:
-
-- `<dynamic variable: working_directory>`: renders the session workspace path, which defaults to `<cwd>/.arka/tmp/<session_id>`
-- `<dynamic variable: current_date and time>`: renders the local date only, in `YYYY-MM-DD` format
-- `<dynamic variable: available MCPs>`
-- `<dynamic variable: available sub-agents>`
-- `<dynamic variable: available tools>`: renders a generic runtime-managed tools notice rather than enumerating the tool catalog
-
-Optional variables:
-
-```dotenv
-BIND_ADDR=127.0.0.1:8080
-ENABLED_MCP_SERVERS=sqlite
-AGENT_API_BASE_URL=http://127.0.0.1:8080
-AGENT_REQUEST_TIMEOUT_SECS=240
-SLACK_BOT_TOKEN=
-SLACK_SIGNING_SECRET=
-SLACK_API_BASE_URL=https://slack.com/api
-SLACK_EVENT_QUEUE_CAPACITY=256
-WHATSAPP_GATEWAY_ENABLED=false
-WHATSAPP_LOCAL_WEB_ENABLED=false
-WHATSAPP_ACCOUNT_ID=default
-WHATSAPP_DM_POLICY=allowlist
-WHATSAPP_DM_ALLOW_FROM=
-WHATSAPP_EVENT_QUEUE_CAPACITY=256
-WHATSAPP_BRIDGE_BASE_URL=http://127.0.0.1:8091
-RUNTIME_MAX_STEPS_PER_TURN=8
-RUNTIME_MAX_MCP_CALLS_PER_STEP=4
-RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=25
-RUNTIME_MAX_SUBAGENT_MCP_CALLS_PER_INVOCATION=4
-RUNTIME_TURN_TIMEOUT_SECS=420
-RUNTIME_MCP_CALL_TIMEOUT_SECS=10
-RUNTIME_REQUIRE_TODOS=true
-```
-
-Environment variables exported by your shell still override `.env`.
-
-`AGENT_REQUEST_TIMEOUT_SECS` controls how long the CLI waits for a message-send
-response from the control-plane API. Raise it if your turn budget or MCP work
-regularly exceeds the default.
-
-### MCP registry
-
-The default MCP registry path is `config/mcp_servers.json`.
-Create it by copying `config/mcp_servers.example.json`.
-
-Current schema:
-
-```json
-{
-  "servers": [
-    {
-      "name": "sqlite",
-      "transport": {
-        "type": "stdio",
-        "command": "uvx",
-        "args": ["mcp-server-sqlite"]
-      }
-    }
-  ]
-}
-```
-
-For remote MCP servers, use Streamable HTTP:
-
-```json
-{
-  "servers": [
-    {
-      "name": "remote-crm",
-      "transport": {
-        "type": "streamable_http",
-        "url": "https://example.com/mcp",
-        "headers": {
-          "Authorization": "Bearer ${TOKEN}"
-        }
-      }
-    }
-  ]
-}
-```
-
-For OAuth-backed remote MCP servers from stdio-only hosts, wrap the remote
-server with `mcp-remote` and keep the registry entry in stdio form:
-
-```json
-{
-  "servers": [
-    {
-      "name": "kite",
-      "transport": {
-        "type": "stdio",
-        "command": "npx",
-        "args": [
-          "-y",
-          "mcp-remote",
-          "https://mcp.kite.trade/mcp",
-          "--debug"
-        ]
-      },
-      "description": "Remote Kite MCP via mcp-remote; OAuth handled by the wrapper."
-    }
-  ]
-}
-```
-
-Notes for `mcp-remote` in Arka:
-
-- Arka treats it as a normal stdio MCP server
-- the wrapper owns browser/callback OAuth and token storage
-- use extra args such as `--resource`, `--auth-timeout`, `--host`, `--header`, or `--static-oauth-client-info` by appending them after the remote URL
-- if startup is flaky, prefer `npx -y`, add `--debug`, and inspect `~/.mcp-auth/*_debug.log`
-
-Backwards compatibility: the legacy stdio-only shape using top-level `command`, `args`, and `env` is still accepted.
-
-Validation rules enforced by `mcp-config`:
-
-- `name` must be non-empty
-- `name` must be unique across the registry
-- stdio `command` must be non-empty
-- Streamable HTTP `transport.url` must be a non-empty `http://` or `https://` URL
-- `args` defaults to `[]`
-
-### Runtime state
-
-`SESSION_STORE_DIR` defaults to `data/sessions`. That directory contains generated
-session state, message transcripts, and channel metadata and should remain local
-runtime data, not committed source. Generated analysis scripts and outputs live
-separately under `.arka/tmp/<session_id>/`.
-
-### Sub-agents
-
-The default sub-agent registry is `config/subagents.json`.
-
-Current built-in executors:
-
-- `mcp-executor`: delegated MCP tool/resource execution
-- `tool-executor`: delegated local tool execution inside the session working directory
-
-Current built-in local tools:
-
-- `glob`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `bash`
-
-### Tool policy
-
-`TOOL_POLICY_PATH` is optional. When set, it should point to a JSON overlay file
-that adjusts the default Rust tool policy rules without changing the static tool
-catalog in the prompt.
-
-Start from `config/tool_policy.example.json` if you want an overlay.
-The default policy denies `file_write` and `command_exec` tools for WhatsApp delegated execution.
-
-## Running It
-
-### 1. Inspect an MCP server
+### 1. Create local config
 
 ```bash
-cargo run -p mcp-cli -- inspect --server sqlite
+cp .env.example .env
+cp config/mcp_servers.example.json config/mcp_servers.json
 ```
 
-Use a custom config path:
+Set `OPENAI_API_KEY` in `.env`, then update `config/mcp_servers.json` for the MCP servers you actually want to use.
+
+### 2. Inspect an MCP server
 
 ```bash
-cargo run -p mcp-cli -- inspect --server sqlite --config /path/to/mcp_servers.json
+cargo run -p mcp-cli -- inspect --server sqlite-local
 ```
 
-### 2. Start the control-plane server
+Use `--config /path/to/mcp_servers.json` if you want a non-default registry path.
 
-Create a local `.env` first. A minimal setup is:
-
-```dotenv
-OPENAI_API_KEY=...
-MODEL_NAME=gpt-5.4-mini
-SYSTEM_PROMPT=config/prompt.md
-MCP_REGISTRY_PATH=config/mcp_servers.json
-SUBAGENT_REGISTRY_PATH=config/subagents.json
-SESSION_STORE_DIR=data/sessions
-```
-
-Optional policy overlay:
-
-```dotenv
-TOOL_POLICY_PATH=config/tool_policy.json
-```
-
-If you use a policy overlay, create it from `config/tool_policy.example.json`.
+### 3. Start the control-plane server
 
 ```bash
 cargo run -p agent-controlplane --bin server
 ```
 
-By default it binds to `127.0.0.1:8080`.
+By default, the server binds to `127.0.0.1:8080`.
 
-The server:
-
-1. loads `.env` if present
-2. creates an OpenAI model adapter
-3. creates the single-turn runtime
-4. wraps it with the session control plane
-5. serves the HTTP API and SSE event stream
-
-### 2a. Start the local WhatsApp Web bridge
-
-```bash
-npm install
-npm run whatsapp-web
-```
-
-Optional bridge variables:
-
-```dotenv
-ARKA_WHATSAPP_BRIDGE_PORT=8091
-ARKA_WHATSAPP_CONTROLPLANE_BASE_URL=http://127.0.0.1:8080
-ARKA_WHATSAPP_ACCOUNT_ID=default
-ARKA_WHATSAPP_AUTH_DIR=data/whatsapp-web/auth
-```
-
-To let the control-plane server use the local WhatsApp Web bridge, enable:
-
-```dotenv
-WHATSAPP_GATEWAY_ENABLED=true
-WHATSAPP_LOCAL_WEB_ENABLED=true
-WHATSAPP_BRIDGE_BASE_URL=http://127.0.0.1:8091
-```
-
-### 3. Use the CLI client
-
-Start a session:
+### 4. Start a CLI session
 
 ```bash
 cargo run -p agent-controlplane --bin cli -- session start
@@ -323,13 +157,189 @@ Send a message:
 cargo run -p agent-controlplane --bin cli -- message send <session_id> "Analyze this dataset"
 ```
 
-Watch SSE events for a session:
+Watch session events:
 
 ```bash
 cargo run -p agent-controlplane --bin cli -- session watch <session_id>
 ```
 
-Run a simple interactive loop:
+## Configuration
+
+### Environment
+
+The control-plane server loads `.env` automatically when present. Shell-exported variables still take precedence.
+
+Key variables from `.env.example`:
+
+```dotenv
+OPENAI_API_KEY=
+MODEL_NAME=gpt-5.4-mini
+
+SYSTEM_PROMPT=config/prompt.md
+MCP_REGISTRY_PATH=config/mcp_servers.json
+SUBAGENT_REGISTRY_PATH=config/subagents.json
+TOOL_POLICY_PATH=
+SESSION_STORE_DIR=data/sessions
+
+RUNTIME_DEBUG_POSTGRES_ENABLED=false
+RUNTIME_DEBUG_POSTGRES_DSN=postgresql://USERNAME:PASSWORD@HOST:5432/arka
+
+SLACK_BOT_TOKEN=
+SLACK_SIGNING_SECRET=
+
+BIND_ADDR=127.0.0.1:8080
+AGENT_API_BASE_URL=http://127.0.0.1:8080
+AGENT_REQUEST_TIMEOUT_SECS=240
+
+RUNTIME_MAX_STEPS_PER_TURN=20
+RUNTIME_MAX_MCP_CALLS_PER_STEP=20
+RUNTIME_MAX_SUBAGENT_STEPS_PER_INVOCATION=25
+RUNTIME_MAX_SUBAGENT_MCP_CALLS_PER_INVOCATION=20
+RUNTIME_MAX_DUPLICATE_MCP_CALLS_PER_INVOCATION=3
+RUNTIME_TURN_TIMEOUT_SECS=420
+RUNTIME_REQUIRE_TODOS=true
+```
+
+`SESSION_STORE_DIR` holds local control-plane state. Session workspaces and generated artifacts live under `.arka/tmp/<session_id>/`.
+
+`RUNTIME_DEBUG_POSTGRES_DSN` is the optional Postgres connection string used for persisted runtime debug history and tracing views.
+
+For Slack, configure:
+
+- `SLACK_BOT_TOKEN` for outbound delivery
+- `SLACK_SIGNING_SECRET` for inbound request verification
+
+Minimal Slack setup:
+
+- expose `POST /channels/slack/events` to Slack Events API
+- configure Slack to send app mentions or thread replies to that route
+- expect replies to remain thread-scoped and user-scoped inside Arka’s session model
+
+### Prompt templates
+
+`SYSTEM_PROMPT` points to the base prompt file. The server reloads that file at the start of each turn and resolves supported dynamic tags.
+
+Supported dynamic tags:
+
+- `<dynamic variable: working_directory>`
+- `<dynamic variable: current_date and time>`
+- `<dynamic variable: available MCPs>`
+- `<dynamic variable: available sub-agents>`
+- `<dynamic variable: available tools>`
+
+### MCP registry
+
+The default registry path is `config/mcp_servers.json`. Start from `config/mcp_servers.example.json`.
+
+Example stdio server:
+
+```json
+{
+  "servers": [
+    {
+      "name": "sqlite-local",
+      "transport": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["mcp-server-sqlite", "--db-path", "/absolute/path/to/local.db"]
+      }
+    }
+  ]
+}
+```
+
+Example Streamable HTTP server:
+
+```json
+{
+  "servers": [
+    {
+      "name": "posthog",
+      "transport": {
+        "type": "streamable_http",
+        "url": "https://posthog.example.com/mcp",
+        "headers": {
+          "Authorization": "Bearer replace-me"
+        }
+      }
+    }
+  ]
+}
+```
+
+Example `mcp-remote` wrapper for OAuth-backed remote servers:
+
+```json
+{
+  "servers": [
+    {
+      "name": "kite-remote",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "mcp-remote", "https://mcp.kite.trade/mcp", "--debug"]
+      }
+    }
+  ]
+}
+```
+
+Validation enforced by `mcp-config` includes:
+
+- unique non-empty server names
+- non-empty stdio commands
+- valid `http://` or `https://` URLs for Streamable HTTP transports
+- `args` defaulting to `[]` when omitted
+
+### Sub-agents
+
+The default sub-agent registry is `config/subagents.json`.
+
+Built-in executors:
+
+- `mcp-executor` for delegated MCP work against the selected server or capability scope
+- `tool-executor` for delegated local tool work inside the session working directory
+
+### Tool policy overlay
+
+`TOOL_POLICY_PATH` is optional. When set, it points to a JSON overlay that adjusts the default tool policy without changing the prompt-visible catalog. Start from `config/tool_policy.example.json`.
+
+## Local WhatsApp Web Bridge
+
+The local bridge is optional and is only needed when running WhatsApp flows through a local Baileys-based sidecar.
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the bridge:
+
+```bash
+npm run whatsapp-web
+```
+
+Relevant bridge variables:
+
+```dotenv
+ARKA_WHATSAPP_BRIDGE_PORT=8091
+ARKA_WHATSAPP_CONTROLPLANE_BASE_URL=http://127.0.0.1:8080
+ARKA_WHATSAPP_ACCOUNT_ID=default
+ARKA_WHATSAPP_AUTH_DIR=data/whatsapp-web/auth
+```
+
+To enable the control plane to use the bridge:
+
+```dotenv
+WHATSAPP_GATEWAY_ENABLED=true
+WHATSAPP_LOCAL_WEB_ENABLED=true
+WHATSAPP_BRIDGE_BASE_URL=http://127.0.0.1:8091
+```
+
+## CLI Commands
+
+Start an interactive loop:
 
 ```bash
 cargo run -p agent-controlplane --bin cli -- repl
@@ -341,7 +351,7 @@ Submit an approval:
 cargo run -p agent-controlplane --bin cli -- approve <session_id> <approval_id> approve
 ```
 
-Inspect WhatsApp bridge status:
+Inspect WhatsApp status:
 
 ```bash
 cargo run -p agent-controlplane --bin cli -- whatsapp status
@@ -353,7 +363,7 @@ Start WhatsApp QR login:
 cargo run -p agent-controlplane --bin cli -- whatsapp login
 ```
 
-Complete login after scanning the QR shown by the bridge:
+Complete login after scanning the QR:
 
 ```bash
 cargo run -p agent-controlplane --bin cli -- whatsapp complete-login <login_session_id>
@@ -361,7 +371,7 @@ cargo run -p agent-controlplane --bin cli -- whatsapp complete-login <login_sess
 
 ## HTTP API
 
-Current routes:
+Primary routes:
 
 - `POST /sessions`
 - `GET /sessions/{session_id}`
@@ -379,69 +389,56 @@ Current routes:
 
 Notes:
 
-- session events are exposed over SSE from `/sessions/{session_id}/events`
-- Slack uses the HTTP Events API route at `/channels/slack/events`, verifies request signatures, queues valid events, and posts replies back with the Slack Web API
-- WhatsApp can now run in a stateful gateway mode with login state, DM access policy, background outbound delivery, and a normalized `/channels/whatsapp/inbound` route
-- when `WHATSAPP_LOCAL_WEB_ENABLED=true`, Arka talks to a local Baileys-based WhatsApp Web bridge instead of a business API provider
-- `/channels/whatsapp/webhook` remains as a compatibility alias for normalized legacy inbound payloads
-- Slack replies are thread-scoped and user-scoped: one internal session is keyed by workspace, channel, thread, and user
+- session event streaming is exposed over SSE at `/sessions/{session_id}/events`
+- Slack uses the Events API, verifies signatures, queues valid events, and replies back through the Slack Web API
+- WhatsApp supports both a normalized gateway flow and a local WhatsApp Web bridge flow
+- Slack sessions are keyed by workspace, channel, thread, and user
 
-## Runtime Model
+## Safety and Approvals
 
-`agent/runtime` is intentionally single-turn.
+Arka is designed as a managed execution harness, not a free-form tool runner.
 
-For each user turn it:
+- tool availability is enforced by the runtime harness and policy engine, not only by prompt instructions
+- delegated work is bounded by executor type, selected scope, and per-turn runtime limits
+- approvals are part of the control-plane model and can gate sensitive or policy-restricted actions
+- session work is isolated into per-session workspaces under `.arka/tmp/`
+- typed state and ordered todos help prevent out-of-order execution and make partial progress explicit
 
-1. builds a prompt from typed conversation and turn records
-2. calls the model through the `ModelAdapter` trait
+## Runtime Behavior
+
+For each turn, `agent/runtime`:
+
+1. builds a prompt from typed conversation and turn state
+2. calls the model through `ModelAdapter`
 3. validates the model decision
-4. delegates to `mcp-executor` or `tool-executor` when requested
-5. executes MCP calls or local tools through the delegated executor
+4. delegates to `mcp-executor` or `tool-executor` when needed
+5. executes MCP calls or local tools within runtime guardrails
 6. evaluates tool policy and emits per-step tool masks
 7. records typed messages and runtime events
-7. returns a `TurnOutcome`
+8. returns a `TurnOutcome`
 
-Important design points:
+Local tool execution is workspace-scoped. The prompt-visible tool catalog stays stable while the harness enforces actual per-step availability.
 
-- MCP calls are active
-- local runtime tools such as `glob`, `read_file`, `edit_file`, `write_file`, and `bash` are active and workspace-scoped
-- the prompt-visible tool catalog stays static while per-step tool availability is enforced by the harness
-- observability is exposed as typed events collected in memory and returned to callers
+## Observability
 
-## Current State
+Arka exposes execution state and diagnostics through several layers:
 
-Implemented:
+- typed runtime events for turns, steps, tool calls, MCP calls, and delegated execution
+- SSE session streams from the control plane for live turn progress
+- persisted local session records under `SESSION_STORE_DIR`
+- optional Postgres-backed debug history for deeper runtime inspection
 
-- MCP registry loading and validation
-- MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`
-- single-turn runtime with guardrails and typed state
-- delegated `mcp-executor` and `tool-executor` flows
-- local `glob`, `read_file`, `write_file`, `edit_file`, and `bash` execution
-- tool policy evaluation with optional JSON overlay config
-- OpenAI adapter
-- in-memory control-plane session orchestration
-- API routes, SSE events, approvals, idempotency
-- CLI client
-- Slack ingress verification, async event processing, and outbound threaded delivery
-- WhatsApp gateway status/login APIs, DM allowlist policy, normalized inbound routing, async outbound delivery worker, and a local WhatsApp Web bridge sidecar
-
-Not implemented yet:
-
-- persistent storage beyond the in-memory control-plane store
-- authentication and authorization
-- end-to-end automated tests against a real WhatsApp account; the local WhatsApp Web bridge is implemented, but live pairing still needs manual verification
-- additional local tools beyond the current built-in workspace tool set
-- long-running job queue or distributed workers
+This makes it possible to trace what the system planned, what it delegated, what it executed, and what artifacts were produced.
 
 ## Development
 
-Run the full test suite:
+Run the full workspace test suite:
 
 ```bash
 cargo test --workspace
 ```
 
-Run a narrower package test suite:
+Run package-specific tests:
 
 ```bash
 cargo test -p agent-runtime
@@ -449,9 +446,51 @@ cargo test -p agent-controlplane
 cargo test -p mcp-client
 ```
 
-## Repo Notes
+## Status and Limitations
 
-- `.env` is ignored by git
-- `.env.example` is reserved if you want to add a committed template later
-- the control-plane server persists resumable session state under `SESSION_STORE_DIR` as JSON/JSONL files
-- debug history remains a separate optional Postgres-backed observability path
+Implemented today:
+
+- MCP registry loading and validation
+- MCP capability discovery and execution
+- single-turn runtime with typed state and delegation
+- local tools: `glob`, `read_file`, `write_file`, `edit_file`, and `bash`
+- optional tool policy overlays
+- OpenAI-backed model adapter
+- session-aware control plane with approvals and SSE
+- CLI client
+- Slack integration
+- WhatsApp gateway APIs and local WhatsApp Web bridge
+
+Not yet addressed:
+
+- durable primary storage beyond the local session store
+- authn/authz for multi-user deployment
+- long-running job orchestration or distributed workers
+- broader local tool inventory beyond the current workspace-scoped set
+- full end-to-end automation against a live WhatsApp account
+
+## Deployment Notes
+
+Today, Arka is best understood as a serious internal-platform or operator-facing system rather than a turnkey multi-tenant SaaS product.
+
+- local session persistence exists and is usable for development and internal workflows
+- the control plane and runtime are structured for production-oriented behavior, but authn/authz and broader deployment hardening are still incomplete
+- Slack support is integrated into the main control plane; WhatsApp support is available but has more operational caveats, especially for live-account automation
+
+## Repository Notes
+
+- `.env`, session data, generated `outputs/`, and local workspace artifacts are not committed
+- control-plane session state is stored under `SESSION_STORE_DIR` as local JSON and JSONL files
+- optional Postgres-backed runtime debug history exists separately from the local session store
+
+## Development Workflow
+
+For contributors and maintainers:
+
+- run `cargo test --workspace` before merging substantial runtime or control-plane changes
+- keep config examples in sync with `.env.example`, `config/mcp_servers.example.json`, and `config/subagents.json`
+- treat prompt changes, policy changes, and runtime loop changes as architectural changes and document them in the README when they affect how Arka is operated
+
+## License
+
+This repository is licensed under the `0BSD` license. See [LICENSE](/Users/vivek/Documents/ai/ai-data-analyst/LICENSE).

@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(512);
-    let runtime_debug_postgres_dsn = env::var("RUNTIME_DEBUG_POSTGRES_DSN").ok();
+    let runtime_debug_postgres_dsn = read_env_string("RUNTIME_DEBUG_POSTGRES_DSN");
     let runtime_debug_postgres_enabled = env::var("RUNTIME_DEBUG_POSTGRES_ENABLED")
         .ok()
         .map(|value| value == "true")
@@ -290,6 +290,17 @@ fn read_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn read_env_string(name: &str) -> Option<String> {
+    normalize_optional_env(env::var(name).ok())
+}
+
+fn normalize_optional_env(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -298,7 +309,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{prepare_runtime_workspace_root_at, runtime_workspace_root_path};
+    use super::{
+        normalize_optional_env, prepare_runtime_workspace_root_at, runtime_workspace_root_path,
+    };
 
     #[test]
     fn runtime_workspace_root_path_uses_arka_tmp() {
@@ -331,5 +344,22 @@ mod tests {
         assert!(prepared.is_dir());
 
         fs::remove_dir_all(&sandbox_root).expect("temp directory should be removable");
+    }
+
+    #[test]
+    fn normalize_optional_env_rejects_blank_values() {
+        assert_eq!(normalize_optional_env(None), None);
+        assert_eq!(normalize_optional_env(Some(String::new())), None);
+        assert_eq!(normalize_optional_env(Some("   ".to_owned())), None);
+    }
+
+    #[test]
+    fn normalize_optional_env_trims_non_empty_values() {
+        assert_eq!(
+            normalize_optional_env(Some(
+                "  postgresql://user:pass@localhost:5432/arka  ".to_owned()
+            )),
+            Some("postgresql://user:pass@localhost:5432/arka".to_owned())
+        );
     }
 }

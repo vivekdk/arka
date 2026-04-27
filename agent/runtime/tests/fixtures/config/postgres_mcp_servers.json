@@ -1,0 +1,20 @@
+{
+  "servers": [
+    {
+      "name": "ipl",
+      "transport": {
+        "type": "stdio",
+        "command": "uv",
+        "args": [
+          "run",
+          "--with",
+          "postgres-mcp-server",
+          "python",
+          "scripts/postgres_mcp_server_wrapper.py",
+          "postgresql://test-user@localhost:5432/ipl"
+        ]
+      },
+      "description": "Test-only Postgres MCP fixture for runtime unit tests."
+    }
+  ]
+}

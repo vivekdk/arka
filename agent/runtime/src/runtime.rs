@@ -5500,7 +5500,7 @@ mod tests {
         time::SystemTime,
     };
 
-    use mcp_config::McpServerConfig;
+    use mcp_config::{McpRegistry, McpServerConfig, McpTransportConfig};
     use mcp_metadata::CapabilityKind;
     use mcp_metadata::{
         CURRENT_SCHEMA_VERSION, FullResourceMetadata, FullToolMetadata, McpCapabilityFamilies,
@@ -6978,6 +6978,7 @@ mod tests {
     #[test]
     fn disabled_postgres_schema_resource_feedback_redirects_to_server_scope() {
         let server_name = ServerName::new("ipl").expect("valid server");
+        let schema_uri = test_postgres_schema_resource_uri(&server_name);
         let feedback = disabled_mcp_capability_feedback_for_delegation(
             &fake_postgres_mcp_session(&server_name),
             &crate::model::SubagentDelegationRequest {
@@ -6985,7 +6986,7 @@ mod tests {
                 target: DelegationTarget::McpCapability(McpCapabilityTarget {
                     server_name: server_name.clone(),
                     capability_kind: CapabilityKind::Resource,
-                    capability_id: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                    capability_id: schema_uri,
                 }),
                 goal: "Inspect IPL matches schema and analyze RCB's 2025 performance.".to_owned(),
             },
@@ -7486,18 +7487,13 @@ mod tests {
     }
 
     fn fake_postgres_mcp_session(server_name: &ServerName) -> McpSession {
+        let config = test_postgres_server_config(server_name);
+        let schema_uri = test_postgres_schema_resource_uri(server_name);
         McpSession {
             servers: HashMap::from([(
                 server_name.clone(),
                 PreparedServer {
-                    config: McpServerConfig {
-                        name: server_name.to_string(),
-                        transport: None,
-                        command: String::new(),
-                        args: Vec::new(),
-                        env: HashMap::new(),
-                        description: None,
-                    },
+                    config,
                     minimal_catalog: McpMinimalCatalog {
                         schema_version: CURRENT_SCHEMA_VERSION,
                         server: McpServerMetadata {
@@ -7520,7 +7516,7 @@ mod tests {
                             ..Default::default()
                         }],
                         resources: vec![MinimalResourceMetadata {
-                            uri: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                            uri: schema_uri.clone(),
                             ..Default::default()
                         }],
                     },
@@ -7553,13 +7549,14 @@ mod tests {
                             ..Default::default()
                         }],
                         resources: vec![FullResourceMetadata {
-                            uri: "postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                            uri: schema_uri.clone(),
                             ..Default::default()
                         }],
                         extensions: serde_json::Value::Null,
                     },
-                    full_catalog_markdown:
-                        "# MCP Full: ipl\n\n- tool: query\n- resource: postgres://vivek@localhost:5432/ipl/matches/schema".to_owned(),
+                    full_catalog_markdown: format!(
+                        "# MCP Full: {server_name}\n\n- tool: query\n- resource: {schema_uri}"
+                    ),
                     connection: None,
                 },
             )]),
@@ -7596,7 +7593,9 @@ mod tests {
             &test_fixtures_root().join("turn-1").join("todos.txt"),
             &TurnPolicyPromptContext {
                 phase: TurnPhase::Execution,
-                html_output_path: test_fixtures_root().join("outputs").join("turn-1-report.html"),
+                html_output_path: test_fixtures_root()
+                    .join("outputs")
+                    .join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(false),
             },
@@ -7682,6 +7681,7 @@ mod tests {
     #[test]
     fn postgres_mcp_server_scope_catalog_filters_schema_resources() {
         let server_name = ServerName::new("ipl").expect("valid server");
+        let schema_uri = test_postgres_schema_resource_uri(&server_name);
         let tools = build_subagent_tool_catalog(
             &fake_postgres_mcp_session(&server_name),
             &DelegationTarget::McpServerScope(McpServerScopeTarget { server_name }),
@@ -7690,27 +7690,21 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "query");
-        assert!(
-            !tools
-                .iter()
-                .any(|tool| tool.name == "postgres://vivek@localhost:5432/ipl/matches/schema")
-        );
+        assert!(!tools.iter().any(|tool| tool.name == schema_uri));
     }
 
     #[test]
     fn postgres_mcp_schema_resources_are_marked_disabled() {
         let server_name = ServerName::new("ipl").expect("valid server");
+        let schema_uri = test_postgres_schema_resource_uri(&server_name);
         let session = fake_postgres_mcp_session(&server_name);
         let server = session
             .servers
             .get(&server_name)
             .expect("server should exist");
 
-        let reason = disabled_mcp_capability_reason(
-            server,
-            &CapabilityKind::Resource,
-            "postgres://vivek@localhost:5432/ipl/matches/schema",
-        );
+        let reason =
+            disabled_mcp_capability_reason(server, &CapabilityKind::Resource, schema_uri.as_str());
 
         assert_eq!(
             reason.as_deref(),
@@ -7787,6 +7781,43 @@ mod tests {
             .join("agent/runtime/tests/fixtures")
             .canonicalize()
             .expect("runtime test fixtures root should resolve")
+    }
+
+    fn test_postgres_registry() -> McpRegistry {
+        McpRegistry::load_from_path(
+            test_fixtures_root()
+                .join("config")
+                .join("postgres_mcp_servers.json"),
+        )
+        .expect("postgres test registry should load")
+    }
+
+    fn test_postgres_server_config(server_name: &ServerName) -> McpServerConfig {
+        test_postgres_registry()
+            .get(server_name.as_str())
+            .expect("postgres test server should exist")
+            .clone()
+    }
+
+    fn test_postgres_schema_resource_uri(server_name: &ServerName) -> String {
+        let config = test_postgres_server_config(server_name);
+        let connection_uri = postgres_connection_uri_from_config(&config)
+            .expect("postgres test server config should include a connection URI");
+        let base_uri = connection_uri
+            .strip_prefix("postgresql://")
+            .map(|rest| format!("postgres://{rest}"))
+            .unwrap_or(connection_uri);
+        format!("{}/matches/schema", base_uri.trim_end_matches('/'))
+    }
+
+    fn postgres_connection_uri_from_config(config: &McpServerConfig) -> Option<String> {
+        match config.resolved_transport() {
+            McpTransportConfig::Stdio { args, .. } => args
+                .into_iter()
+                .rev()
+                .find(|arg| arg.starts_with("postgresql://") || arg.starts_with("postgres://")),
+            McpTransportConfig::StreamableHttp { .. } => None,
+        }
     }
 }
 
