@@ -33,9 +33,9 @@ pub use runtime::{AgentRuntime, McpSession, RuntimeError};
 pub use state::{
     CapabilityPlaceholders, ConversationMessage, ConversationRole, LocalToolName,
     LocalToolsScopeTarget, McpCapability, McpCapabilityTarget, McpServerScopeTarget, MessageRecord,
-    ModelConfig, PromptSection, PromptSnapshot, ResponseClient, ResponseFormat, ResponseTarget,
-    RunRequest, RuntimeLimits, ServerName, StepOutcomeKind, StepRecord, TerminationReason,
-    TurnOutcome, TurnRecord, UsageSummary,
+    ModelConfig, PendingUserAction, PromptSection, PromptSnapshot, ResponseClient, ResponseFormat,
+    ResponseTarget, RunRequest, RuntimeLimits, ServerName, StepOutcomeKind, StepRecord,
+    TerminationReason, TurnOutcome, TurnRecord, UsageSummary,
 };
 pub use todo::{
     MANDATORY_TODO_GENERATE_HTML, MANDATORY_TODO_OPEN_HTML, TodoError, TodoExecutor, TodoItem,

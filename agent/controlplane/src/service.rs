@@ -14,8 +14,8 @@ use std::{
 };
 
 use agent_runtime::{
-    ConversationMessage, ConversationRole, MessageRecord, ResponseClient, ResponseFormat,
-    ResponseTarget, TurnRecord,
+    ConversationMessage, ConversationRole, MessageRecord, PendingUserAction, ResponseClient,
+    ResponseFormat, ResponseTarget, TurnRecord,
 };
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -98,6 +98,13 @@ pub trait ConversationStore: Send + Sync {
         session_id: &SessionId,
         status: SessionStatus,
         last_turn: Option<TurnRecordSummary>,
+    ) -> Result<Option<SessionRecord>, ConversationStoreError>;
+
+    /// Updates the active external user-action blocker for a session.
+    async fn update_pending_user_action(
+        &self,
+        session_id: &SessionId,
+        pending_user_action: Option<PendingUserAction>,
     ) -> Result<Option<SessionRecord>, ConversationStoreError>;
 
     /// Records one idempotency key if unseen.
@@ -190,6 +197,7 @@ impl ConversationStore for InMemoryConversationStore {
             status: SessionStatus::Idle,
             bindings: bindings.clone(),
             last_turn: None,
+            pending_user_action: None,
         };
         for binding in bindings {
             inner.bindings.insert(binding, session.session_id.clone());
@@ -318,6 +326,20 @@ impl ConversationStore for InMemoryConversationStore {
         if last_turn.is_some() {
             session.last_turn = last_turn;
         }
+        Ok(Some(session.clone()))
+    }
+
+    async fn update_pending_user_action(
+        &self,
+        session_id: &SessionId,
+        pending_user_action: Option<PendingUserAction>,
+    ) -> Result<Option<SessionRecord>, ConversationStoreError> {
+        let mut inner = self.inner.lock().await;
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return Ok(None);
+        };
+        session.pending_user_action = pending_user_action;
+        session.updated_at = SystemTime::now();
         Ok(Some(session.clone()))
     }
 
@@ -566,6 +588,7 @@ impl ConversationStore for JsonlConversationStore {
             status: SessionStatus::Idle,
             bindings: bindings.clone(),
             last_turn: None,
+            pending_user_action: None,
         };
 
         create_dir_all(self.session_dir(&session.session_id).as_path())?;
@@ -744,6 +767,22 @@ impl ConversationStore for JsonlConversationStore {
         if last_turn.is_some() {
             session.last_turn = last_turn;
         }
+        write_json_file(self.session_snapshot_path(session_id).as_path(), session)?;
+        Ok(Some(session.clone()))
+    }
+
+    async fn update_pending_user_action(
+        &self,
+        session_id: &SessionId,
+        pending_user_action: Option<PendingUserAction>,
+    ) -> Result<Option<SessionRecord>, ConversationStoreError> {
+        let mut inner = self.inner.lock().await;
+        self.ensure_session_loaded(&mut inner, session_id)?;
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return Ok(None);
+        };
+        session.pending_user_action = pending_user_action;
+        session.updated_at = SystemTime::now();
         write_json_file(self.session_snapshot_path(session_id).as_path(), session)?;
         Ok(Some(session.clone()))
     }
@@ -935,7 +974,14 @@ fn append_jsonl_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Convers
 fn computed_results_from_turn(turn: &TurnRecord) -> Vec<MessageRecord> {
     turn.messages
         .iter()
-        .filter(|message| matches!(message, MessageRecord::McpResult(_)))
+        .filter(|message| {
+            matches!(
+                message,
+                MessageRecord::McpResult(_)
+                    | MessageRecord::SubAgentCall(_)
+                    | MessageRecord::SubAgentResult(_)
+            )
+        })
         .cloned()
         .collect()
 }
@@ -1529,6 +1575,7 @@ where
                 usage,
                 events: _events,
                 turn,
+                pending_user_action,
                 generated_artifacts,
             }) => {
                 self.store.append_turn_trace(&session_id, &turn).await?;
@@ -1551,8 +1598,11 @@ where
                     termination: termination.clone(),
                     usage,
                     completed_at: SystemTime::now(),
+                    pending_user_action: pending_user_action.clone(),
                 };
-                let new_status = if matches!(termination, agent_runtime::TerminationReason::Final) {
+                let new_status = if pending_user_action.is_some() {
+                    SessionStatus::WaitingForUserAction
+                } else if matches!(termination, agent_runtime::TerminationReason::Final) {
                     SessionStatus::Completed
                 } else {
                     SessionStatus::Failed
@@ -1580,6 +1630,11 @@ where
                     .update_session(&session_id, new_status, Some(summary.clone()))
                     .await?
                     .ok_or(ControlPlaneError::SessionNotFound)?;
+                let session = self
+                    .store
+                    .update_pending_user_action(&session_id, pending_user_action)
+                    .await?
+                    .unwrap_or(session);
                 self.emit(SessionEvent::TurnCompleted {
                     session_id: session_id.clone(),
                     summary,
@@ -1740,14 +1795,17 @@ mod tests {
 
     use agent_runtime::{
         MessageId, StepRecord, TerminationReason, TurnId, UsageSummary,
-        state::{McpCapabilityTarget, McpResultMessageRecord, UserMessageRecord},
+        state::{
+            DelegationTarget, McpCapabilityTarget, McpResultMessageRecord,
+            SubAgentCallMessageRecord, SubAgentResultMessageRecord, UserMessageRecord,
+        },
     };
     use mcp_metadata::CapabilityKind;
 
     use super::*;
 
     #[test]
-    fn computed_results_from_turn_keeps_only_mcp_results() {
+    fn computed_results_from_turn_keeps_mcp_and_subagent_resume_trace() {
         let turn = TurnRecord {
             turn_id: TurnId::new(),
             started_at: SystemTime::now(),
@@ -1771,6 +1829,25 @@ mod tests {
                     result_summary: "{\"rows\":[[\"2026-04-05\",8]]}".to_owned(),
                     error: None,
                 }),
+                MessageRecord::SubAgentCall(SubAgentCallMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    goal: "Fetch account holdings".to_owned(),
+                    target: DelegationTarget::McpServerScope(agent_runtime::McpServerScopeTarget {
+                        server_name: agent_runtime::ServerName::new("broker")
+                            .expect("valid server"),
+                    }),
+                }),
+                MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+                    message_id: MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    status: "needs_user_action".to_owned(),
+                    executed_action_count: 1,
+                    detail: "Open the login link to authenticate.".to_owned(),
+                    tool_mask: None,
+                }),
             ],
             final_text: Some("done".to_owned()),
             termination: TerminationReason::Final,
@@ -1779,8 +1856,10 @@ mod tests {
 
         let computed = computed_results_from_turn(&turn);
 
-        assert_eq!(computed.len(), 1);
+        assert_eq!(computed.len(), 3);
         assert!(matches!(computed[0], MessageRecord::McpResult(_)));
+        assert!(matches!(computed[1], MessageRecord::SubAgentCall(_)));
+        assert!(matches!(computed[2], MessageRecord::SubAgentResult(_)));
     }
 
     #[tokio::test]

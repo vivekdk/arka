@@ -1889,7 +1889,7 @@ where
                         &mut mcp_session.servers,
                         &call_target.server_name,
                         &tool_name,
-                        sanitized_arguments,
+                        sanitized_arguments.clone(),
                         request.limits.mcp_call_timeout,
                     )
                     .await;
@@ -1938,9 +1938,12 @@ where
                     trace_messages.push(result_message.clone());
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
-                    if let Some(feedback) =
-                        discovery_commit_feedback_for_mcp_result(&call_target, &captured)
-                    {
+                    if let Some(feedback) = discovery_commit_feedback_for_mcp_result(
+                        &registered_tools,
+                        &call_target,
+                        &sanitized_arguments,
+                        &captured,
+                    ) {
                         let feedback = MessageRecord::Llm(LlmMessageRecord {
                             message_id: MessageId::new(),
                             timestamp: SystemTime::now(),
@@ -4768,6 +4771,18 @@ fn collect_confirmed_tables(messages: &[MessageRecord], server_name: &ServerName
             MessageRecord::McpResult(record)
                 if record.target.server_name == *server_name
                     && record.target.capability_kind == CapabilityKind::Tool
+                    && record.target.capability_id == "list_tables"
+                    && record.error.is_none() =>
+            {
+                for table in extract_tables_from_list_tables_result(&record.result_summary) {
+                    if !confirmed.iter().any(|existing| existing == &table) {
+                        confirmed.push(table);
+                    }
+                }
+            }
+            MessageRecord::McpResult(record)
+                if record.target.server_name == *server_name
+                    && record.target.capability_kind == CapabilityKind::Tool
                     && record.target.capability_id == "run_query"
                     && record.error.is_none() =>
             {
@@ -4811,7 +4826,9 @@ fn extract_table_references(query: &str) -> Vec<String> {
 }
 
 fn discovery_commit_feedback_for_mcp_result(
+    registered_tools: &[ToolDescriptor],
     call_target: &McpCapabilityTarget,
+    arguments: &serde_json::Value,
     captured: &CapturedMcpResult,
 ) -> Option<String> {
     if captured.was_error
@@ -4827,43 +4844,206 @@ fn discovery_commit_feedback_for_mcp_result(
         .and_then(|value| value.get("tables"))
         .and_then(serde_json::Value::as_array)?;
 
-    let candidate = tables.iter().find_map(|table| {
-        let name = table.get("name").and_then(serde_json::Value::as_str)?;
-        if name != "users" {
-            return None;
-        }
-
-        let database = table
-            .get("database")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let columns = table
-            .get("columns")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let time_field = columns.iter().find_map(|column| {
-            let name = column.get("name").and_then(serde_json::Value::as_str)?;
-            let normalized = name.to_ascii_lowercase();
-            if normalized == "created_at"
-                || normalized.ends_with("_created_at")
-                || normalized.ends_with("_at")
-                || normalized.contains("timestamp")
-                || normalized == "date"
-            {
-                Some(name.to_owned())
-            } else {
-                None
-            }
-        })?;
-
-        Some((database.to_owned(), name.to_owned(), time_field))
-    })?;
+    let like_tokens = arguments
+        .get("like")
+        .and_then(serde_json::Value::as_str)
+        .map(like_pattern_tokens)
+        .unwrap_or_default();
+    let candidates = tables
+        .iter()
+        .filter_map(|table| discovered_table_candidate(table, &like_tokens))
+        .collect::<Vec<_>>();
+    let candidate = candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.score)?;
+    let required_arguments = required_argument_list_for_mcp_tool(
+        registered_tools,
+        &McpCapabilityTarget {
+            server_name: call_target.server_name.clone(),
+            capability_kind: CapabilityKind::Tool,
+            capability_id: "run_query".to_owned(),
+        },
+    );
 
     Some(format!(
-        "Discovery already confirmed a plausible source table `{}`.`{}` with time field `{}`. Do not call `list_tables` again for the same goal unless this table is contradictory. Use `run_query` next with only the required `database` and `query` arguments.",
-        candidate.0, candidate.1, candidate.2
+        "Discovery already confirmed a plausible source table `{}`.`{}` with time field `{}`. Do not call `list_tables` again for the same goal unless this table is contradictory. Use `run_query` next with only the required {}.",
+        candidate.database, candidate.table, candidate.time_field, required_arguments
     ))
+}
+
+fn required_argument_list_for_mcp_tool(
+    registered_tools: &[ToolDescriptor],
+    target: &McpCapabilityTarget,
+) -> String {
+    let required = registered_tools
+        .iter()
+        .find(|tool| {
+            tool.family == crate::tools::ToolFamily::McpTool
+                && tool.server_name.as_ref() == Some(&target.server_name)
+                && tool.name == target.capability_id
+        })
+        .and_then(|tool| {
+            tool.input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>();
+
+    match required.as_slice() {
+        [] => "arguments required by that tool schema".to_owned(),
+        [single] => format!("{single} argument"),
+        _ => format!("{} arguments", required.join(" and ")),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredTableCandidate {
+    database: String,
+    table: String,
+    time_field: String,
+    score: i32,
+}
+
+fn discovered_table_candidate(
+    table: &serde_json::Value,
+    like_tokens: &[String],
+) -> Option<DiscoveredTableCandidate> {
+    let name = table.get("name").and_then(serde_json::Value::as_str)?;
+    let database = table
+        .get("database")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if database.is_empty() {
+        return None;
+    }
+
+    let name_lower = name.to_ascii_lowercase();
+    if !like_tokens.is_empty()
+        && !like_tokens
+            .iter()
+            .any(|token| name_lower.contains(token.as_str()))
+    {
+        return None;
+    }
+
+    let time_field = preferred_time_field(table)?;
+    let mut score = time_field_score(&time_field);
+    if !name.contains('_') {
+        score += 20;
+    }
+    if like_tokens
+        .iter()
+        .any(|token| name_lower == token.as_str() || name_lower == format!("{token}s"))
+    {
+        score += 30;
+    }
+    Some(DiscoveredTableCandidate {
+        database: database.to_owned(),
+        table: name.to_owned(),
+        time_field,
+        score,
+    })
+}
+
+fn like_pattern_tokens(pattern: &str) -> Vec<String> {
+    let normalized = pattern
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>();
+    normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn preferred_time_field(table: &serde_json::Value) -> Option<String> {
+    let mut names = table
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|column| column.get("name").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if names.is_empty() {
+        names = extract_column_names_from_create_table(
+            table
+                .get("create_table_query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        );
+    }
+
+    names
+        .into_iter()
+        .filter(|name| is_time_field_name(name))
+        .max_by_key(|name| time_field_score(name))
+}
+
+fn extract_column_names_from_create_table(create_table_query: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut parts = create_table_query.split('`').skip(1);
+    while let Some(name) = parts.next() {
+        names.push(name.to_owned());
+        let _ = parts.next();
+    }
+    names
+}
+
+fn is_time_field_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized == "created_at"
+        || normalized == "updated_at"
+        || normalized == "_source_modified_at"
+        || normalized == "_extracted_at"
+        || normalized.ends_with("_created_at")
+        || normalized.ends_with("_updated_at")
+        || normalized.ends_with("_at")
+        || normalized.contains("timestamp")
+        || normalized == "date"
+}
+
+fn time_field_score(name: &str) -> i32 {
+    match name.to_ascii_lowercase().as_str() {
+        "updated_at" => 50,
+        "_source_modified_at" => 45,
+        "created_at" => 40,
+        "_extracted_at" => 35,
+        other if other.ends_with("_updated_at") => 30,
+        other if other.ends_with("_created_at") => 25,
+        other if other.ends_with("_at") => 20,
+        other if other.contains("timestamp") => 15,
+        "date" => 10,
+        _ => 0,
+    }
+}
+
+fn extract_tables_from_list_tables_result(result_summary: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result_summary) else {
+        return Vec::new();
+    };
+    value
+        .get("tables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|table| {
+            let database = table.get("database").and_then(serde_json::Value::as_str)?;
+            let name = table.get("name").and_then(serde_json::Value::as_str)?;
+            if database.is_empty() || name.is_empty() {
+                None
+            } else {
+                Some(format!("{database}.{name}"))
+            }
+        })
+        .collect()
 }
 
 fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
@@ -5843,10 +6023,23 @@ fn summarize_resource_result(result: &McpResourceReadResult) -> String {
 }
 
 fn user_action_final_text(messages: &[MessageRecord]) -> Option<String> {
+    pending_user_action_from_messages(messages)
+        .map(|metadata| format_user_action_detail(&metadata.message, metadata.url.as_deref()))
+}
+
+fn pending_user_action_from_messages(
+    messages: &[MessageRecord],
+) -> Option<crate::state::PendingUserAction> {
     for message in messages.iter().rev() {
         if let MessageRecord::SubAgentResult(record) = message {
             if record.status == "needs_user_action" {
-                return Some(record.detail.clone());
+                return Some(crate::state::PendingUserAction {
+                    kind: "external_user_step".to_owned(),
+                    message: user_action_message_from_detail(&record.detail)
+                        .unwrap_or_else(|| record.detail.clone()),
+                    url: extract_user_action_url(&record.detail),
+                    blocked_goal: blocked_goal_for_result(messages, record.message_id.as_uuid()),
+                });
             }
         }
     }
@@ -5854,19 +6047,19 @@ fn user_action_final_text(messages: &[MessageRecord]) -> Option<String> {
     for message in messages.iter().rev() {
         match message {
             MessageRecord::McpResult(record) => {
-                if let Some(final_text) = user_action_final_text_from_texts(&[
+                if let Some(metadata) = pending_user_action_from_texts(&[
                     &record.result_summary,
                     record.error.as_deref().unwrap_or(""),
                 ]) {
-                    return Some(final_text);
+                    return Some(metadata);
                 }
             }
             MessageRecord::LocalToolResult(record) => {
-                if let Some(final_text) = user_action_final_text_from_texts(&[
+                if let Some(metadata) = pending_user_action_from_texts(&[
                     &record.result_summary,
                     record.error.as_deref().unwrap_or(""),
                 ]) {
-                    return Some(final_text);
+                    return Some(metadata);
                 }
             }
             _ => {}
@@ -5876,7 +6069,54 @@ fn user_action_final_text(messages: &[MessageRecord]) -> Option<String> {
     None
 }
 
-fn user_action_final_text_from_texts(texts: &[&str]) -> Option<String> {
+fn pending_user_action_from_messages_with_blocking_results(
+    messages: &[MessageRecord],
+) -> Option<crate::state::PendingUserAction> {
+    if let Some(metadata) = pending_user_action_from_messages(messages) {
+        return Some(metadata);
+    }
+
+    for message in messages.iter().rev() {
+        if let MessageRecord::SubAgentResult(record) = message {
+            if matches!(record.status.as_str(), "cannot_execute" | "partial") {
+                if let Some(mut metadata) = pending_user_action_from_texts(&[&record.detail]) {
+                    metadata.blocked_goal =
+                        blocked_goal_for_result(messages, record.message_id.as_uuid());
+                    return Some(metadata);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn blocked_goal_for_result(messages: &[MessageRecord], result_id: uuid::Uuid) -> Option<String> {
+    let result_index = messages.iter().position(|message| {
+        matches!(message, MessageRecord::SubAgentResult(record) if record.message_id.as_uuid() == result_id)
+    })?;
+    messages[..result_index]
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            MessageRecord::SubAgentCall(record) => Some(record.goal.clone()),
+            _ => None,
+        })
+}
+
+fn user_action_message_from_detail(detail: &str) -> Option<String> {
+    detail
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with("Open this link to continue:")
+                && !line.starts_with("After that,")
+        })
+        .map(str::to_owned)
+}
+
+fn pending_user_action_from_texts(texts: &[&str]) -> Option<crate::state::PendingUserAction> {
     let mut action_url = None;
     let mut action_message = None;
     let mut saw_signal = false;
@@ -5900,12 +6140,14 @@ fn user_action_final_text_from_texts(texts: &[&str]) -> Option<String> {
         return None;
     }
 
-    Some(format_user_action_detail(
-        action_message
-            .as_deref()
-            .unwrap_or("A required user action is needed before I can continue."),
-        action_url.as_deref(),
-    ))
+    Some(crate::state::PendingUserAction {
+        kind: "external_user_step".to_owned(),
+        message: action_message.unwrap_or_else(|| {
+            "A required user action is needed before I can continue.".to_owned()
+        }),
+        url: action_url,
+        blocked_goal: None,
+    })
 }
 
 fn user_action_required_text(text: &str) -> bool {
@@ -5978,6 +6220,7 @@ fn text_has_user_action_phrase(text: &str) -> bool {
         "login first",
         "log in first",
         "login required",
+        "authentication is still required",
         "authentication required",
         "requires login",
         "sign in first",
@@ -6073,7 +6316,7 @@ fn extract_user_action_url_from_value(value: &Value) -> Option<String> {
                         .as_str()
                         .is_some_and(|candidate| candidate.starts_with("http"))
                 {
-                    return value.as_str().map(str::to_owned);
+                    return value.as_str().and_then(sanitize_user_action_url);
                 }
                 if let Some(url) = extract_user_action_url_from_value(value) {
                     return Some(url);
@@ -6092,11 +6335,34 @@ fn extract_url_from_text(text: &str) -> Option<String> {
         let candidate = token
             .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | '.' | ')' | ']' | '}' | '>'));
         if candidate.starts_with("http://") || candidate.starts_with("https://") {
-            Some(candidate.to_owned())
+            sanitize_user_action_url(candidate)
         } else {
             None
         }
     })
+}
+
+fn sanitize_user_action_url(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | '.' | ')' | ']' | '}' | '>'));
+    let end = trimmed
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if ch.is_whitespace() || ch == '\\' {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(trimmed.len());
+    let url = trimmed[..end]
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | '.' | ')' | ']' | '}' | '>'));
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_owned())
+    } else {
+        None
+    }
 }
 
 fn format_user_action_detail(message: &str, url: Option<&str>) -> String {
@@ -6156,6 +6422,9 @@ fn finish_turn(
     Ok(TurnOutcome {
         final_text,
         display_text,
+        pending_user_action: pending_user_action_from_messages_with_blocking_results(
+            &turn.messages,
+        ),
         turn,
         events: Vec::new(),
         usage,
@@ -6360,15 +6629,15 @@ mod tests {
         html_todo_feedback_for_delegation, immediate_partial_detail_for_local_tool_error,
         incomplete_todo_final_feedback, invalid_subagent_feedback,
         mcp_collection_feedback_for_delegation, mcp_partial_indicates_blocking_failure,
-        message_looks_like_user_action_resume, planning_todo_items_feedback,
-        reconcile_active_todo_from_turn_trace, reconcile_mandatory_todos_from_turn_trace,
-        reconcile_pending_mcp_todos_from_turn_trace, remove_resolved_user_action_wait_todos,
-        render_confirmed_table_context, render_recent_mcp_results_context,
-        sanitize_mcp_tool_arguments, should_cycle_mcp_connection_after_success,
-        should_require_todos_for_turn, should_retry_postgres_query_session_error,
-        sync_mcp_todo_after_delegation, sync_mcp_todo_before_delegation,
-        tool_executor_mcp_todo_partial_feedback, user_action_final_text,
-        validate_delegation_subagent,
+        message_looks_like_user_action_resume, pending_user_action_from_messages,
+        planning_todo_items_feedback, reconcile_active_todo_from_turn_trace,
+        reconcile_mandatory_todos_from_turn_trace, reconcile_pending_mcp_todos_from_turn_trace,
+        remove_resolved_user_action_wait_todos, render_confirmed_table_context,
+        render_recent_mcp_results_context, sanitize_mcp_tool_arguments,
+        should_cycle_mcp_connection_after_success, should_require_todos_for_turn,
+        should_retry_postgres_query_session_error, sync_mcp_todo_after_delegation,
+        sync_mcp_todo_before_delegation, tool_executor_mcp_todo_partial_feedback,
+        user_action_final_text, validate_delegation_subagent,
     };
 
     #[test]
@@ -6483,6 +6752,65 @@ mod tests {
             normalized.contains("authorize")
                 || normalized.contains("open this link")
                 || normalized.contains("required user action")
+        );
+    }
+
+    #[test]
+    fn pending_user_action_metadata_captures_url_and_blocked_goal() {
+        let messages = vec![
+            MessageRecord::SubAgentCall(SubAgentCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                goal: "Fetch portfolio holdings".to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("kite").expect("valid server"),
+                }),
+            }),
+            MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "needs_user_action".to_owned(),
+                executed_action_count: 1,
+                detail: "Authorize this app\nOpen this link to continue: https://kite.trade/connect/login\nAfter that, send the request again.".to_owned(),
+                tool_mask: None,
+            }),
+        ];
+
+        let pending = pending_user_action_from_messages(&messages)
+            .expect("pending metadata should be derived");
+
+        assert_eq!(pending.kind, "external_user_step");
+        assert_eq!(pending.message, "Authorize this app");
+        assert_eq!(
+            pending.url.as_deref(),
+            Some("https://kite.trade/connect/login")
+        );
+        assert_eq!(
+            pending.blocked_goal.as_deref(),
+            Some("Fetch portfolio holdings")
+        );
+    }
+
+    #[test]
+    fn pending_user_action_metadata_sanitizes_escaped_newline_after_url() {
+        let messages = vec![MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            subagent_type: "mcp-executor".to_owned(),
+            status: "needs_user_action".to_owned(),
+            executed_action_count: 1,
+            detail: "Open this link to continue: https://kite.zerodha.com/connect/login?api_key=kitemcp&v=3\\n\\nAfter that, send the request again.".to_owned(),
+            tool_mask: None,
+        })];
+
+        let pending = pending_user_action_from_messages(&messages)
+            .expect("pending metadata should be derived");
+
+        assert_eq!(
+            pending.url.as_deref(),
+            Some("https://kite.zerodha.com/connect/login?api_key=kitemcp&v=3")
         );
     }
 
@@ -8740,13 +9068,58 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_table_context_uses_successful_list_tables_discovery() {
+        let server_name = ServerName::new("vol").expect("valid server");
+        let rendered = render_confirmed_table_context(
+            &[MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: server_name.clone(),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "list_tables".to_owned(),
+                },
+                result_summary: serde_json::json!({
+                    "tables": [
+                        {
+                            "database": "volonte",
+                            "name": "futureflows"
+                        }
+                    ]
+                })
+                .to_string(),
+                error: None,
+            })],
+            &server_name,
+        );
+
+        assert!(rendered.contains("volonte.futureflows"));
+    }
+
+    #[test]
     fn discovery_commit_feedback_triggers_for_users_table_with_time_field() {
+        let server_name = ServerName::new("vol").expect("valid server");
+        let tools = vec![crate::tools::ToolDescriptor::mcp_tool(
+            &server_name,
+            "run_query",
+            None,
+            None,
+            serde_json::json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" }
+                }
+            }),
+        )];
         let feedback = discovery_commit_feedback_for_mcp_result(
+            &tools,
             &McpCapabilityTarget {
-                server_name: ServerName::new("vol").expect("valid server"),
+                server_name,
                 capability_kind: CapabilityKind::Tool,
                 capability_id: "list_tables".to_owned(),
             },
+            &serde_json::json!({"database": "volonte", "like": "users"}),
             &CapturedMcpResult {
                 result_summary: String::new(),
                 error: None,
@@ -8773,6 +9146,63 @@ mod tests {
         assert!(feedback.contains("volonte`.`users"));
         assert!(feedback.contains("created_at"));
         assert!(feedback.contains("Use `run_query` next"));
+        assert!(feedback.contains("required `query` argument"));
+        assert!(!feedback.contains("`database` and `query`"));
+    }
+
+    #[test]
+    fn discovery_commit_feedback_triggers_for_futureflows_table_from_create_statement() {
+        let server_name = ServerName::new("vol").expect("valid server");
+        let tools = vec![crate::tools::ToolDescriptor::mcp_tool(
+            &server_name,
+            "run_query",
+            None,
+            None,
+            serde_json::json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" }
+                }
+            }),
+        )];
+        let feedback = discovery_commit_feedback_for_mcp_result(
+            &tools,
+            &McpCapabilityTarget {
+                server_name,
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "list_tables".to_owned(),
+            },
+            &serde_json::json!({"database": "volonte", "like": "%futureflow%"}),
+            &CapturedMcpResult {
+                result_summary: String::new(),
+                error: None,
+                response_payload: serde_json::json!({
+                    "structuredContent": {
+                        "tables": [
+                            {
+                                "database": "volonte",
+                                "name": "futureflow_steps",
+                                "columns": [],
+                                "create_table_query": "CREATE TABLE volonte.futureflow_steps (`futureflow_id` String, `step_order` UInt32) ENGINE = MergeTree ORDER BY (futureflow_id, step_order)"
+                            },
+                            {
+                                "database": "volonte",
+                                "name": "futureflows",
+                                "columns": [],
+                                "create_table_query": "CREATE TABLE volonte.futureflows (`_id` String, `created_at` Nullable(DateTime64(3)), `_extracted_at` DateTime64(3), `id` UInt32, `_source_modified_at` Nullable(DateTime64(3)), `updated_at` Nullable(DateTime64(3)), `name` Nullable(String)) ENGINE = MergeTree ORDER BY (_collection_name, _extracted_at)"
+                            }
+                        ]
+                    }
+                }),
+                was_error: false,
+            },
+        )
+        .expect("feedback should be generated");
+
+        assert!(feedback.contains("volonte`.`futureflows"));
+        assert!(feedback.contains("updated_at"));
+        assert!(feedback.contains("required `query` argument"));
     }
 
     #[test]

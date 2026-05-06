@@ -4,8 +4,7 @@
 //! subcommands for session management, SSE watching, and registry editing.
 
 use std::{
-    env,
-    fs,
+    env, fs,
     future::Future,
     io::{self, BufRead, IsTerminal, Write},
     path::PathBuf,
@@ -20,7 +19,9 @@ use agent_controlplane::{
     SessionEvent, SessionId, SessionRecord, SessionStatus, StartWhatsAppLoginResponse,
     SubmitApprovalRequest, TurnRecordSummary, WhatsAppGatewayStatus,
 };
-use agent_runtime::{RuntimeEvent, TerminationReason, TodoItem, TodoList, TodoStatus};
+use agent_runtime::{
+    PendingUserAction, RuntimeEvent, TerminationReason, TodoItem, TodoList, TodoStatus,
+};
 use futures_util::StreamExt;
 use mcp_client::{
     ClientInfo, McpClient, McpClientError, McpInitializeResult, McpResourceDescriptor,
@@ -47,6 +48,7 @@ const APP_NAME: &str = "Arka";
 const APP_TAGLINE: &str = "Data analyst assistant";
 const USER_LABEL: &str = "You";
 const TURN_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+const LIVE_TURN_SPINNER_INTERVAL_MS: u64 = 120;
 const MCP_REMOTE_PACKAGE_PREFIX: &str = "mcp-remote";
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -190,15 +192,6 @@ async fn run_chat_mode(
     let theme = CliTheme::detect();
     let session = create_cli_session(session_client, base_url).await?;
     println!("{}", render_welcome_banner(&theme, &session, base_url));
-    println!(
-        "{}",
-        render_notice(
-            &theme,
-            NoticeTone::Info,
-            "session",
-            &format!("started {}", session.session_id),
-        )
-    );
     println!(
         "{}",
         render_notice(
@@ -406,6 +399,21 @@ async fn handle_chat_input(
             print_repl_help(theme);
         }
         ChatCommand::SendMessage(text) => {
+            if let Some(shortcut) = parse_numbered_shortcut(&text) {
+                if handle_contextual_shortcut(
+                    theme,
+                    session_client,
+                    request_client,
+                    stream_client,
+                    base_url,
+                    session,
+                    shortcut,
+                )
+                .await?
+                {
+                    return Ok(ChatLoopAction::Continue);
+                }
+            }
             if echo_user_message {
                 print_user_message(theme, &text);
             }
@@ -419,6 +427,7 @@ async fn handle_chat_input(
                 text,
             )
             .await?;
+            *session = response.response.result.session.clone();
             if !response.rendered_live {
                 print_chat_response(theme, &response.response);
             }
@@ -426,6 +435,107 @@ async fn handle_chat_input(
     }
 
     Ok(ChatLoopAction::Continue)
+}
+
+async fn handle_contextual_shortcut(
+    theme: &CliTheme,
+    session_client: &reqwest::Client,
+    request_client: &reqwest::Client,
+    stream_client: &reqwest::Client,
+    base_url: &str,
+    session: &mut SessionRecord,
+    shortcut: usize,
+) -> CliResult<bool> {
+    let actions = contextual_actions(session);
+    let Some(action) = actions.get(shortcut.saturating_sub(1)).cloned() else {
+        return Ok(false);
+    };
+
+    match action.kind {
+        ContextualActionKind::NewChat => {
+            *session = create_cli_session(session_client, base_url).await?;
+            println!(
+                "{}",
+                render_notice(theme, NoticeTone::Info, "session", "started new chat")
+            );
+        }
+        ContextualActionKind::Status => {
+            let session_record =
+                fetch_session(request_client, base_url, &session.session_id).await?;
+            *session = session_record;
+            print_status(theme, session);
+        }
+        ContextualActionKind::Watch => {
+            stream_session_events(
+                stream_client,
+                base_url,
+                &session.session_id.to_string(),
+                false,
+            )
+            .await?;
+        }
+        ContextualActionKind::Resume => {
+            let response = send_message_with_feedback(
+                theme,
+                request_client,
+                stream_client,
+                base_url,
+                &session.session_id.to_string(),
+                "done".to_owned(),
+            )
+            .await?;
+            *session = response.response.result.session.clone();
+            if !response.rendered_live {
+                print_chat_response(theme, &response.response);
+            }
+        }
+        ContextualActionKind::OpenLink { url } => match open_url_best_effort(&url) {
+            Ok(()) => println!(
+                "{}",
+                render_notice(theme, NoticeTone::Success, "open", "opened link")
+            ),
+            Err(error) => {
+                println!(
+                    "{}",
+                    render_notice(
+                        theme,
+                        NoticeTone::Warning,
+                        "open",
+                        &format!("could not open automatically ({error})")
+                    )
+                );
+                println!("{}", render_copyable_url(theme, &url));
+            }
+        },
+    }
+    Ok(true)
+}
+
+fn parse_numbered_shortcut(input: &str) -> Option<usize> {
+    let trimmed = input.trim();
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        trimmed.parse::<usize>().ok().filter(|value| *value > 0)
+    } else {
+        None
+    }
+}
+
+fn open_url_best_effort(url: &str) -> CliResult<()> {
+    let status = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).status()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).status()
+    }?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("open command exited with {status}").into())
+    }
 }
 
 fn build_http_client(
@@ -516,6 +626,7 @@ async fn send_message_with_feedback(
 ) -> Result<SendFeedbackResult, Box<dyn std::error::Error + Send + Sync>> {
     if theme.interactive() {
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let watcher_client = stream_client.clone();
         let watcher_base_url = base_url.to_owned();
         let watcher_session_id = session_id.to_owned();
@@ -527,10 +638,12 @@ async fn send_message_with_feedback(
                 &watcher_session_id,
                 &watcher_theme,
                 stop_rx,
+                Some(ready_tx),
             )
             .await
         });
 
+        let _ = tokio::time::timeout(Duration::from_secs(2), ready_rx).await;
         let response = send_message(client, base_url, session_id, text).await;
         let _ = stop_tx.send(());
         let rendered_live = match tokio::time::timeout(Duration::from_secs(2), watcher).await {
@@ -705,21 +818,34 @@ async fn stream_session_events(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let theme = CliTheme::detect();
-    let mut render_state = SessionEventRenderState::default();
+    let mut render_state = SessionEventRenderState::debug();
+    let mut spinner_interval =
+        tokio::time::interval(Duration::from_millis(LIVE_TURN_SPINNER_INTERVAL_MS));
+    spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+    loop {
+        tokio::select! {
+            _ = spinner_interval.tick(), if !raw => {
+                tick_live_turn_spinner(&theme, &mut render_state)?;
+            }
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let chunk = chunk?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        while let Some((frame, rest)) = split_sse_frame(&buffer) {
-            let frame = frame.to_owned();
-            let rest = rest.to_owned();
-            buffer = rest;
-            if let Some(data) = parse_sse_data(&frame) {
-                if raw {
-                    println!("{data}");
-                } else if let Ok(event) = serde_json::from_str::<SessionEvent>(data) {
-                    emit_session_event(&theme, &mut render_state, &event)?;
+                while let Some((frame, rest)) = split_sse_frame(&buffer) {
+                    let frame = frame.to_owned();
+                    let rest = rest.to_owned();
+                    buffer = rest;
+                    if let Some(data) = parse_sse_data(&frame) {
+                        if raw {
+                            println!("{data}");
+                        } else if let Ok(event) = serde_json::from_str::<SessionEvent>(data) {
+                            emit_session_event(&theme, &mut render_state, &event)?;
+                        }
+                    }
                 }
             }
         }
@@ -734,6 +860,7 @@ async fn stream_session_events_until_turn_end(
     session_id: &str,
     theme: &CliTheme,
     mut stop_rx: oneshot::Receiver<()>,
+    ready_tx: Option<oneshot::Sender<()>>,
 ) -> Result<LiveTurnRenderOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let response = send_with_retry(base_url, || async {
         client
@@ -747,10 +874,19 @@ async fn stream_session_events_until_turn_end(
     let mut buffer = String::new();
     let mut render_state = SessionEventRenderState::default();
     let mut rendered_turn_completion = false;
+    let mut spinner_interval =
+        tokio::time::interval(Duration::from_millis(LIVE_TURN_SPINNER_INTERVAL_MS));
+    spinner_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
+    }
 
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
+            _ = spinner_interval.tick() => {
+                tick_live_turn_spinner(theme, &mut render_state)?;
+            }
             chunk = stream.next() => {
                 let Some(chunk) = chunk else {
                     break;
@@ -854,6 +990,7 @@ fn parse_sse_data(frame: &str) -> Option<&str> {
 
 #[derive(Default)]
 struct SessionEventRenderState {
+    debug_view: bool,
     turn_open: bool,
     session_id: Option<SessionId>,
     current_turn_id: Option<String>,
@@ -864,6 +1001,16 @@ struct SessionEventRenderState {
     live_todo_card: Option<String>,
     live_event_lines: Vec<String>,
     live_region_height: usize,
+    live_spinner_frame: usize,
+}
+
+impl SessionEventRenderState {
+    fn debug() -> Self {
+        Self {
+            debug_view: true,
+            ..Self::default()
+        }
+    }
 }
 
 struct LiveTurnRenderOutcome {
@@ -901,7 +1048,11 @@ fn render_session_event_with_theme(
             state.live_todo_card = None;
             state.live_event_lines.clear();
             state.live_region_height = 0;
-            Some(vec![render_group_header(theme, "Live Turn", "executing")])
+            state.live_spinner_frame = 0;
+            Some(vec![render_live_turn_header(
+                theme,
+                state.live_spinner_frame,
+            )])
         }
         SessionEvent::TurnCompleted {
             session_id,
@@ -912,12 +1063,16 @@ fn render_session_event_with_theme(
             state.current_turn_id = None;
             state.workspace_root = None;
             state.last_todo_signature = None;
-            Some(vec![render_turn_summary(
-                theme,
-                APP_NAME,
-                &summary.final_text,
-                Some(summary),
-            )])
+            if let Some(pending) = summary.pending_user_action.as_ref() {
+                Some(render_pending_user_action_lines(theme, pending))
+            } else {
+                Some(vec![render_turn_summary(
+                    theme,
+                    APP_NAME,
+                    &summary.final_text,
+                    Some(summary),
+                )])
+            }
         }
         SessionEvent::ApprovalRequested {
             session_id,
@@ -933,13 +1088,7 @@ fn render_session_event_with_theme(
                     "decision required",
                 ));
             }
-            lines.push(render_card(
-                theme,
-                CardTone::Warning,
-                "Approval",
-                Some(&format!("{} pending", approval.approval_id)),
-                &[approval.prompt.clone()],
-            ));
+            lines.extend(render_approval_required_lines(theme, approval));
             Some(lines)
         }
         SessionEvent::ApprovalResolved {
@@ -951,7 +1100,7 @@ fn render_session_event_with_theme(
         }
         SessionEvent::RuntimeEvent { event, .. } => {
             state.current_turn_id = runtime_event_turn_id(event);
-            render_runtime_event_with_theme(theme, state.turn_open, event)
+            render_runtime_event_with_theme(theme, state.turn_open, state.debug_view, event)
         }
         SessionEvent::ChannelDeliveryAttempted {
             session_id, status, ..
@@ -1032,7 +1181,18 @@ fn emit_session_event(
             }
         }
         _ => {
-            reset_live_turn_region(state);
+            let retained_todo_card = match event {
+                SessionEvent::TurnCompleted { summary, .. }
+                    if summary.pending_user_action.is_none() =>
+                {
+                    state.live_todo_card.clone()
+                }
+                _ => None,
+            };
+            clear_live_turn_region(state)?;
+            if let Some(todo_card) = retained_todo_card {
+                print_rendered_lines(&[todo_card])?;
+            }
             if let Some(lines) = lines {
                 print_rendered_lines(&lines)?;
             }
@@ -1056,6 +1216,12 @@ fn render_todo_progress_from_workspace(
     render_todo_progress_from_workspace_root(theme, state, &workspace_root)
 }
 
+fn clear_live_turn_region(state: &mut SessionEventRenderState) -> io::Result<()> {
+    clear_rendered_region(state.live_region_height)?;
+    reset_live_turn_region(state);
+    io::stdout().flush()
+}
+
 fn reset_live_turn_region(state: &mut SessionEventRenderState) {
     state.live_header = None;
     state.live_todo_card = None;
@@ -1063,13 +1229,20 @@ fn reset_live_turn_region(state: &mut SessionEventRenderState) {
     state.live_region_height = 0;
 }
 
+fn tick_live_turn_spinner(theme: &CliTheme, state: &mut SessionEventRenderState) -> io::Result<()> {
+    if !state.turn_open || !theme.interactive() {
+        return Ok(());
+    }
+
+    state.live_spinner_frame = (state.live_spinner_frame + 1) % TURN_SPINNER_FRAMES.len();
+    state.live_header = Some(render_live_turn_header(theme, state.live_spinner_frame));
+    redraw_live_turn_region(state)
+}
+
 fn consume_todo_card_for_turn(
     state: &mut SessionEventRenderState,
     todo_card: String,
 ) -> Option<String> {
-    if state.todo_card_emitted {
-        return None;
-    }
     state.todo_card_emitted = true;
     Some(todo_card)
 }
@@ -1188,6 +1361,7 @@ fn resolve_runtime_todo_path(
         if todo_path.exists() {
             return Some(todo_path);
         }
+        return None;
     }
 
     latest_runtime_workspace_todo_path(workspace_root, session_id)
@@ -1224,8 +1398,36 @@ fn latest_runtime_workspace_todo_path(
 fn render_runtime_event_with_theme(
     theme: &CliTheme,
     grouped: bool,
+    debug_view: bool,
     event: &RuntimeEvent,
 ) -> Option<Vec<String>> {
+    if !debug_view
+        && matches!(
+            event,
+            RuntimeEvent::LocalToolResponded { tool_name, .. } if tool_name == "write_todos"
+        )
+    {
+        return None;
+    }
+
+    if !debug_view
+        && !matches!(
+            event,
+            RuntimeEvent::TurnEnded { .. }
+                | RuntimeEvent::AnswerRenderFailed { .. }
+                | RuntimeEvent::LocalToolResponded {
+                    was_error: true,
+                    ..
+                }
+                | RuntimeEvent::McpResponded {
+                    was_error: true,
+                    ..
+                }
+        )
+    {
+        return None;
+    }
+
     match event {
         RuntimeEvent::HandoffToSubagent { subagent_type, .. } => Some(vec![render_event_line(
             theme,
@@ -1365,6 +1567,10 @@ fn event_ends_live_turn(event: &SessionEvent) -> bool {
 }
 
 fn print_chat_response(theme: &CliTheme, response: &SendSessionMessageResponse) {
+    if let Some(pending) = response.result.session.pending_user_action.as_ref() {
+        print_rendered_lines(&render_pending_user_action_lines(theme, pending)).ok();
+        return;
+    }
     if let Some(outbound) = response.result.outbound.first() {
         if let Some(summary) = response.result.session.last_turn.as_ref() {
             println!(
@@ -1414,6 +1620,17 @@ fn print_status(theme: &CliTheme, session: &SessionRecord) {
         ));
     } else {
         lines.push(format_kv(theme, "Turn", "0"));
+    }
+    if let Some(pending) = session.pending_user_action.as_ref() {
+        lines.push(format_kv(theme, "Action", &pending.kind));
+        lines.push(format_kv(
+            theme,
+            "Blocked Goal",
+            pending.blocked_goal.as_deref().unwrap_or("unknown"),
+        ));
+        if let Some(url) = pending.url.as_ref() {
+            lines.push(format_kv(theme, "URL", url));
+        }
     }
     println!(
         "{}",
@@ -2541,12 +2758,6 @@ impl CliTheme {
         self.presentation.metadata_density
     }
 
-    fn transcript_width(&self) -> usize {
-        self.presentation
-            .transcript_width_override
-            .unwrap_or_else(|| default_card_width(156))
-    }
-
     fn card_width(&self) -> usize {
         self.presentation
             .transcript_width_override
@@ -2675,7 +2886,7 @@ fn render_turn_summary(
     body: &str,
     summary: Option<&TurnRecordSummary>,
 ) -> String {
-    let width = theme.transcript_width().saturating_sub(4);
+    let width = theme.card_width().saturating_sub(4);
     let meta = summary.map(|summary| match theme.metadata_density() {
         MetadataDensity::Compact | MetadataDensity::Balanced => {
             format!(
@@ -2721,25 +2932,182 @@ fn render_approval_resolution(theme: &CliTheme, approval: &ApprovalRequestRecord
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextualAction {
+    label: String,
+    kind: ContextualActionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContextualActionKind {
+    NewChat,
+    Status,
+    Watch,
+    Resume,
+    OpenLink { url: String },
+}
+
+fn contextual_actions(session: &SessionRecord) -> Vec<ContextualAction> {
+    if let Some(pending) = session.pending_user_action.as_ref() {
+        let mut actions = Vec::new();
+        if let Some(url) = pending.url.as_ref() {
+            let url = sanitize_display_url(url);
+            actions.push(ContextualAction {
+                label: "Open link".to_owned(),
+                kind: ContextualActionKind::OpenLink { url },
+            });
+        } else {
+            actions.push(ContextualAction {
+                label: "Continue after completing the action".to_owned(),
+                kind: ContextualActionKind::Resume,
+            });
+        }
+        actions.push(ContextualAction {
+            label: "Show status".to_owned(),
+            kind: ContextualActionKind::Status,
+        });
+        return actions;
+    }
+
+    match session.status {
+        SessionStatus::Running => vec![
+            ContextualAction {
+                label: "Watch detailed progress".to_owned(),
+                kind: ContextualActionKind::Watch,
+            },
+            ContextualAction {
+                label: "Show status".to_owned(),
+                kind: ContextualActionKind::Status,
+            },
+        ],
+        SessionStatus::WaitingForApproval => vec![
+            ContextualAction {
+                label: "Show status".to_owned(),
+                kind: ContextualActionKind::Status,
+            },
+            ContextualAction {
+                label: "Watch detailed events".to_owned(),
+                kind: ContextualActionKind::Watch,
+            },
+        ],
+        SessionStatus::Completed => vec![
+            ContextualAction {
+                label: "Start a new chat".to_owned(),
+                kind: ContextualActionKind::NewChat,
+            },
+            ContextualAction {
+                label: "Review status".to_owned(),
+                kind: ContextualActionKind::Status,
+            },
+        ],
+        _ => vec![
+            ContextualAction {
+                label: "Start a new chat".to_owned(),
+                kind: ContextualActionKind::NewChat,
+            },
+            ContextualAction {
+                label: "Show status".to_owned(),
+                kind: ContextualActionKind::Status,
+            },
+        ],
+    }
+}
+
+fn render_pending_user_action_lines(theme: &CliTheme, pending: &PendingUserAction) -> Vec<String> {
+    let mut lines = vec![
+        pending.message.clone(),
+        format!(
+            "Blocked goal: {}",
+            pending.blocked_goal.as_deref().unwrap_or("current request")
+        ),
+        if pending.url.is_some() {
+            "After logging in, reply `done` to continue.".to_owned()
+        } else {
+            "After completing the action, reply `done` or choose Continue.".to_owned()
+        },
+    ];
+    for (index, action) in pending_action_suggestions(pending).iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, action.label));
+    }
+
+    let mut rendered = vec![render_card(
+        theme,
+        CardTone::Warning,
+        "Action Required",
+        Some(&pending.kind),
+        &lines,
+    )];
+    if let Some(url) = pending.url.as_ref() {
+        rendered.push(render_copyable_url(theme, &sanitize_display_url(url)));
+    }
+    rendered
+}
+
+fn pending_action_suggestions(pending: &PendingUserAction) -> Vec<ContextualAction> {
+    let synthetic_session = SessionRecord {
+        session_id: SessionId::new(),
+        created_at: std::time::SystemTime::now(),
+        updated_at: std::time::SystemTime::now(),
+        status: SessionStatus::WaitingForUserAction,
+        bindings: Vec::new(),
+        last_turn: None,
+        pending_user_action: Some(pending.clone()),
+    };
+    contextual_actions(&synthetic_session)
+}
+
+fn render_approval_required_lines(
+    theme: &CliTheme,
+    approval: &ApprovalRequestRecord,
+) -> Vec<String> {
+    vec![render_card(
+        theme,
+        CardTone::Warning,
+        "Action Required",
+        Some(&format!("approval {}", approval.approval_id)),
+        &[
+            approval.prompt.clone(),
+            format!("1. Approve: /approve {} approve", approval.approval_id),
+            format!("2. Reject: /approve {} reject", approval.approval_id),
+        ],
+    )]
+}
+
+fn render_copyable_url(theme: &CliTheme, url: &str) -> String {
+    format!("{} {}", theme.bold("URL:"), url)
+}
+
+fn sanitize_display_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if ch.is_whitespace() || ch == '\\' {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(trimmed.len());
+    trimmed[..end]
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | '.' | ')' | ']' | '}' | '>'))
+        .to_owned()
+}
+
 fn render_welcome_banner(theme: &CliTheme, session: &SessionRecord, base_url: &str) -> String {
+    let _ = base_url;
     let lines = vec![
         APP_TAGLINE.to_owned(),
         format!("Session: {}", session.session_id),
-        format!("API: {base_url}"),
-        "Type a message or run /help".to_owned(),
-        "Quick actions: /new  /status  /watch  /mcp  /exit".to_owned(),
+        "Type a message to start. Run /help for commands.".to_owned(),
+        "1. Start a new chat".to_owned(),
+        "2. Show status".to_owned(),
     ];
-    render_card(
-        theme,
-        CardTone::Status,
-        APP_NAME,
-        Some("Interactive CLI"),
-        &lines,
-    )
+    render_card(theme, CardTone::Status, APP_NAME, Some("Chat"), &lines)
 }
 
 fn render_user_message(theme: &CliTheme, text: &str) -> String {
-    let width = theme.transcript_width().saturating_sub(4);
+    let width = theme.card_width().saturating_sub(4);
     let lines = render_markdownish_text(theme, text, width);
     render_card(theme, CardTone::User, USER_LABEL, None, &lines)
 }
@@ -2819,12 +3187,12 @@ fn render_card(
     rendered.join("\n")
 }
 
-fn render_group_header(theme: &CliTheme, title: &str, status: &str) -> String {
+fn render_live_turn_header(theme: &CliTheme, frame_index: usize) -> String {
     format!(
         "{} {} {}",
-        theme.accent("●"),
-        theme.strong(title),
-        theme.muted(status)
+        theme.accent(TURN_SPINNER_FRAMES[frame_index % TURN_SPINNER_FRAMES.len()]),
+        theme.strong("Live Turn"),
+        theme.muted("executing")
     )
 }
 
@@ -2925,6 +3293,7 @@ fn format_status(status: SessionStatus) -> String {
         SessionStatus::Idle => "Idle",
         SessionStatus::Running => "Running",
         SessionStatus::WaitingForApproval => "Waiting for approval",
+        SessionStatus::WaitingForUserAction => "Waiting for user action",
         SessionStatus::Interrupted => "Interrupted",
         SessionStatus::Failed => "Failed",
         SessionStatus::Completed => "Completed",
@@ -3383,26 +3752,28 @@ fn usage(bin: &str) -> String {
 mod tests {
     use agent_controlplane::{
         ApprovalDecision, ApprovalId, ApprovalRequestRecord, DeliveryStatus, SessionEvent,
-        SessionStatus, TurnRecordSummary,
+        SessionRecord, SessionStatus, TurnRecordSummary,
     };
     use agent_runtime::{
-        RuntimeEvent, RuntimeExecutor, StepId, TerminationReason, TodoItem, TodoStatus, TurnId,
-        UsageSummary,
+        PendingUserAction, RuntimeEvent, RuntimeExecutor, StepId, TerminationReason, TodoItem,
+        TodoStatus, TurnId, UsageSummary,
     };
     use mcp_client::McpInitializeResult;
     use mcp_config::McpServerConfig;
     use serde_json::json;
 
     use super::{
-        CONNECT_RETRY_COUNT, ChatCommand, CliTheme, INITIAL_BACKOFF_MS, McpCommand,
+        APP_NAME, CONNECT_RETRY_COUNT, ChatCommand, CliTheme, INITIAL_BACKOFF_MS, McpCommand,
         SessionEventRenderState, build_metadata_catalogs, consume_todo_card_for_turn,
         format_mcp_remote_refresh_error, format_turn_meta_line, is_mcp_remote_stdio,
         live_turn_region_components, mcp_remote_defaults, parse_chat_command, parse_sse_data,
-        prompt_text, render_markdownish_text, render_runtime_event_with_theme,
+        prompt_text, render_live_turn_header, render_markdownish_text,
+        render_pending_user_action_lines, render_runtime_event_with_theme,
         render_session_event_with_theme, render_todo_progress_card,
-        render_todo_progress_from_workspace_root, render_user_message,
-        resolve_runtime_workspace_root, resolve_runtime_todo_path, runtime_workspace_todo_path,
-        send_with_retry, server_supports_capability, should_retry_request, split_sse_frame,
+        render_todo_progress_from_workspace_root, render_turn_summary, render_user_message,
+        render_welcome_banner, resolve_runtime_todo_path, resolve_runtime_workspace_root,
+        runtime_workspace_todo_path, send_with_retry, server_supports_capability,
+        should_retry_request, split_sse_frame,
     };
 
     #[test]
@@ -3664,7 +4035,7 @@ mod tests {
             executor: RuntimeExecutor::main_agent(),
             at: std::time::SystemTime::now(),
         };
-        let runtime_line = render_runtime_event_with_theme(&theme, false, &runtime)
+        let runtime_line = render_runtime_event_with_theme(&theme, false, true, &runtime)
             .expect("runtime should render");
         let runtime_text = runtime_line.join("\n");
         assert!(runtime_text.contains("mcp"));
@@ -3692,6 +4063,7 @@ mod tests {
                     total_tokens: 2,
                 },
                 completed_at: std::time::SystemTime::now(),
+                pending_user_action: None,
             },
         };
         let session_card = render_session_event_with_theme(&theme, &mut state, &session_event)
@@ -3717,7 +4089,7 @@ mod tests {
             render_session_event_with_theme(&theme, &mut state, &approval)
                 .expect("approval should render")
                 .iter()
-                .any(|line| line.contains("Approval"))
+                .any(|line| line.contains("Action Required"))
         );
 
         let delivery = SessionEvent::ChannelDeliveryAttempted {
@@ -3738,12 +4110,87 @@ mod tests {
                 status: SessionStatus::Idle,
                 bindings: Vec::new(),
                 last_turn: None,
+                pending_user_action: None,
             },
         };
         assert_eq!(
             render_session_event_with_theme(&theme, &mut state, &ignored),
             None
         );
+    }
+
+    #[test]
+    fn normal_chat_hides_write_todos_error_events() {
+        let theme = CliTheme::plain();
+        let event = RuntimeEvent::LocalToolResponded {
+            turn_id: TurnId::new(),
+            step_id: StepId::new(),
+            tool_name: "write_todos".to_owned(),
+            executor: RuntimeExecutor::main_agent(),
+            at: std::time::SystemTime::now(),
+            latency: std::time::Duration::from_millis(1),
+            was_error: true,
+            result_summary: "tool error".to_owned(),
+            error: Some("write_todos received non-null argument(s) for another tool".to_owned()),
+            response_payload: json!({}),
+        };
+
+        assert_eq!(
+            render_runtime_event_with_theme(&theme, true, false, &event),
+            None
+        );
+        let debug_lines = render_runtime_event_with_theme(&theme, true, true, &event)
+            .expect("debug watch should still show todo tool errors");
+        assert!(debug_lines.join("\n").contains("write_todos received"));
+    }
+
+    #[test]
+    fn pending_user_action_card_sanitizes_url_and_requires_done_after_login() {
+        let theme = CliTheme::plain();
+        let pending = PendingUserAction {
+            kind: "external_user_step".to_owned(),
+            message: "A required user action is needed before I can continue.".to_owned(),
+            url: Some(
+                "https://kite.zerodha.com/connect/login?api_key=kitemcp\\n\\nAfter".to_owned(),
+            ),
+            blocked_goal: Some("Fetch portfolio holdings".to_owned()),
+        };
+
+        let rendered = render_pending_user_action_lines(&theme, &pending).join("\n");
+
+        assert!(rendered.contains("URL: https://kite.zerodha.com/connect/login?api_key=kitemcp"));
+        assert!(!rendered.contains("\\n\\nAfter"));
+        assert!(rendered.contains("After logging in, reply `done` to continue."));
+        assert!(rendered.contains("1. Open link"));
+        assert!(rendered.contains("2. Show status"));
+        assert!(!rendered.contains("Continue after completing the action"));
+    }
+
+    #[test]
+    fn turn_summary_does_not_double_wrap_answer_text() {
+        let theme = CliTheme::plain();
+        let summary = TurnRecordSummary {
+            turn_number: 1,
+            model_name: "gpt-5.4-mini".to_owned(),
+            elapsed_ms: 5_210,
+            final_text: String::new(),
+            termination: TerminationReason::Final,
+            usage: UsageSummary {
+                input_tokens: 8_104,
+                cached_tokens: 3_584,
+                output_tokens: 358,
+                total_tokens: 8_462,
+            },
+            completed_at: std::time::SystemTime::now(),
+            pending_user_action: None,
+        };
+        let answer = "Karun Nair is an Indian cricketer, best known as a right-handed middle-order batter. He has played for Karnataka, several IPL teams, and the India national team. One of his most notable achievements is scoring a Test triple century for India, which put him among a very small group of Indian batters to do so.";
+
+        let rendered = render_turn_summary(&theme, APP_NAME, answer, Some(&summary));
+
+        assert!(rendered.contains("batters to do so."));
+        assert!(!rendered.lines().any(|line| line.trim() == "| batters"));
+        assert!(!rendered.lines().any(|line| line.trim() == "| to do so."));
     }
 
     #[test]
@@ -3785,30 +4232,62 @@ mod tests {
     #[test]
     fn live_turn_region_places_todo_before_events() {
         let state = SessionEventRenderState {
+            debug_view: false,
             turn_open: true,
             session_id: None,
             current_turn_id: None,
             workspace_root: None,
             last_todo_signature: None,
             todo_card_emitted: false,
-            live_header: Some("● Live Turn executing".to_owned()),
+            live_header: Some("- Live Turn executing".to_owned()),
             live_todo_card: Some("TODO CARD".to_owned()),
             live_event_lines: vec![
                 "  • [model] querying model".to_owned(),
                 "  • [mcp] calling ipl/query".to_owned(),
             ],
             live_region_height: 0,
+            live_spinner_frame: 0,
         };
 
         assert_eq!(
             live_turn_region_components(&state),
             vec![
-                "● Live Turn executing".to_owned(),
+                "- Live Turn executing".to_owned(),
                 "TODO CARD".to_owned(),
                 "  • [model] querying model".to_owned(),
                 "  • [mcp] calling ipl/query".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn live_turn_header_uses_spinner_frames() {
+        let theme = CliTheme::plain();
+
+        assert_eq!(render_live_turn_header(&theme, 0), "- Live Turn executing");
+        assert_eq!(render_live_turn_header(&theme, 1), "\\ Live Turn executing");
+        assert_eq!(render_live_turn_header(&theme, 2), "| Live Turn executing");
+        assert_eq!(render_live_turn_header(&theme, 3), "/ Live Turn executing");
+        assert_eq!(render_live_turn_header(&theme, 4), "- Live Turn executing");
+    }
+
+    #[test]
+    fn welcome_banner_includes_session_id() {
+        let theme = CliTheme::plain();
+        let session_id = agent_controlplane::SessionId::new();
+        let session = SessionRecord {
+            session_id: session_id.clone(),
+            created_at: std::time::SystemTime::now(),
+            updated_at: std::time::SystemTime::now(),
+            status: SessionStatus::Idle,
+            bindings: Vec::new(),
+            last_turn: None,
+            pending_user_action: None,
+        };
+
+        let rendered = render_welcome_banner(&theme, &session, "http://127.0.0.1:8080");
+
+        assert!(rendered.contains(&format!("Session: {session_id}")));
     }
 
     #[test]
@@ -3833,6 +4312,7 @@ mod tests {
         .expect("todo file should be writable");
 
         let mut state = SessionEventRenderState {
+            debug_view: false,
             turn_open: true,
             session_id: Some(session_id),
             current_turn_id: Some(turn_id.to_string()),
@@ -3843,6 +4323,7 @@ mod tests {
             live_todo_card: None,
             live_event_lines: Vec::new(),
             live_region_height: 0,
+            live_spinner_frame: 0,
         };
         let rendered =
             render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
@@ -3855,6 +4336,15 @@ mod tests {
             render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root),
             None
         );
+        std::fs::write(
+            &todo_path,
+            "1. [completed] [main-agent] Clarify scope\n2. [completed] [mcp-executor] Query IPL data\n3. [in_progress] [tool-executor] Prepare chart\n",
+        )
+        .expect("updated todo file should be writable");
+        let updated = render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
+            .expect("changed todo file should render again");
+        assert!(updated.contains("[☑] Query IPL data"));
+        assert!(updated.contains("[■] Prepare chart"));
 
         std::fs::remove_dir_all(&workspace_root).expect("temp workspace should be removable");
     }
@@ -3880,8 +4370,11 @@ mod tests {
                 .expect("first todo path should have a parent"),
         )
         .expect("first turn directory should be creatable");
-        std::fs::write(&first_todo_path, "1. [completed] [main-agent] Prior turn task\n")
-            .expect("first todo file should be writable");
+        std::fs::write(
+            &first_todo_path,
+            "1. [completed] [main-agent] Prior turn task\n",
+        )
+        .expect("first todo file should be writable");
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::create_dir_all(
             second_todo_path
@@ -3901,6 +4394,7 @@ mod tests {
         );
 
         let mut state = SessionEventRenderState {
+            debug_view: false,
             turn_open: true,
             session_id: Some(session_id),
             current_turn_id: None,
@@ -3911,6 +4405,7 @@ mod tests {
             live_todo_card: None,
             live_event_lines: Vec::new(),
             live_region_height: 0,
+            live_spinner_frame: 0,
         };
         let rendered =
             render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
@@ -3921,14 +4416,96 @@ mod tests {
     }
 
     #[test]
-    fn consumes_only_one_todo_card_per_turn() {
+    fn does_not_fall_back_to_previous_todo_after_new_turn_id_is_known() {
+        let theme = CliTheme::plain();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "arka-cli-todo-progress-current-turn-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = agent_controlplane::SessionId::new();
+        let previous_turn_id = TurnId::new();
+        let current_turn_id = TurnId::new();
+        let previous_todo_path = runtime_workspace_todo_path(
+            &workspace_root,
+            &session_id,
+            &previous_turn_id.to_string(),
+        );
+
+        std::fs::create_dir_all(
+            previous_todo_path
+                .parent()
+                .expect("previous todo path should have a parent"),
+        )
+        .expect("previous turn directory should be creatable");
+        std::fs::write(
+            &previous_todo_path,
+            "1. [completed] [main-agent] Prior turn task\n",
+        )
+        .expect("previous todo file should be writable");
+
+        assert_eq!(
+            resolve_runtime_todo_path(
+                &workspace_root,
+                &session_id,
+                Some(&current_turn_id.to_string())
+            ),
+            None
+        );
+
+        let mut state = SessionEventRenderState {
+            debug_view: false,
+            turn_open: true,
+            session_id: Some(session_id.clone()),
+            current_turn_id: Some(current_turn_id.to_string()),
+            workspace_root: None,
+            last_todo_signature: None,
+            todo_card_emitted: false,
+            live_header: None,
+            live_todo_card: None,
+            live_event_lines: Vec::new(),
+            live_region_height: 0,
+            live_spinner_frame: 0,
+        };
+        assert_eq!(
+            render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root),
+            None
+        );
+
+        let current_todo_path =
+            runtime_workspace_todo_path(&workspace_root, &session_id, &current_turn_id.to_string());
+        std::fs::create_dir_all(
+            current_todo_path
+                .parent()
+                .expect("current todo path should have a parent"),
+        )
+        .expect("current turn directory should be creatable");
+        std::fs::write(
+            &current_todo_path,
+            "1. [pending] [main-agent] Current turn task\n",
+        )
+        .expect("current todo file should be writable");
+
+        let rendered =
+            render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
+                .expect("current turn todo file should render once it exists");
+        assert!(rendered.contains("Current turn task"));
+        assert!(!rendered.contains("Prior turn task"));
+
+        std::fs::remove_dir_all(&workspace_root).expect("temp workspace should be removable");
+    }
+
+    #[test]
+    fn emits_changed_todo_cards_within_the_same_turn() {
         let mut state = SessionEventRenderState::default();
 
         assert_eq!(
             consume_todo_card_for_turn(&mut state, "TODO 1".to_owned()),
             Some("TODO 1".to_owned())
         );
-        assert_eq!(consume_todo_card_for_turn(&mut state, "TODO 2".to_owned()), None);
+        assert_eq!(
+            consume_todo_card_for_turn(&mut state, "TODO 2".to_owned()),
+            Some("TODO 2".to_owned())
+        );
 
         state.todo_card_emitted = false;
         assert_eq!(
@@ -3996,6 +4573,7 @@ mod tests {
                 total_tokens: 357_445,
             },
             completed_at: std::time::SystemTime::now(),
+            pending_user_action: None,
         };
 
         assert_eq!(

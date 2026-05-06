@@ -21,8 +21,9 @@ use crate::{
 };
 use agent_runtime::{
     AgentRuntime, ConversationMessage, EventSink, McpSession, MessageRecord, ModelConfig,
-    ResponseTarget, RuntimeError as AgentRuntimeError, RuntimeEvent, RuntimeExecutor,
-    RuntimeLimits, ServerName, TerminationReason, TurnId, TurnRecord, UsageSummary,
+    PendingUserAction, ResponseTarget, RuntimeError as AgentRuntimeError, RuntimeEvent,
+    RuntimeExecutor, RuntimeLimits, ServerName, TerminationReason, TurnId, TurnRecord,
+    UsageSummary,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -67,6 +68,8 @@ pub struct TurnRunnerOutput {
     pub events: Vec<agent_runtime::RuntimeEvent>,
     /// Canonical runtime turn record.
     pub turn: agent_runtime::TurnRecord,
+    /// External user action required before the original goal can continue.
+    pub pending_user_action: Option<PendingUserAction>,
     /// New local artifacts produced during the turn inside the session workspace.
     pub generated_artifacts: Vec<GeneratedArtifact>,
 }
@@ -298,6 +301,7 @@ where
                     usage: outcome.usage,
                     events,
                     turn,
+                    pending_user_action: outcome.pending_user_action,
                     generated_artifacts,
                 })
             }

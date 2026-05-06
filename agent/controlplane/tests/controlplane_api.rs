@@ -999,6 +999,7 @@ fn turn_output(final_text: &str) -> TurnRunnerOutput {
                 total_tokens: 2,
             },
         },
+        pending_user_action: None,
         generated_artifacts: Vec::new(),
     }
 }
