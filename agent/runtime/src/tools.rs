@@ -322,6 +322,7 @@ pub async fn execute_local_tool(
     context: &LocalToolContext,
     remaining_turn_budget: Duration,
 ) -> Result<ToolCallResultEnvelope, LocalToolExecutionError> {
+    reject_unexpected_non_null_arguments(tool_name, arguments)?;
     match tool_name.as_str() {
         "read_file" => {
             let args: ReadFileArgs = serde_json::from_value(arguments.clone())
@@ -357,6 +358,39 @@ pub async fn execute_local_tool(
             "unknown local tool `{other}`"
         ))),
     }
+}
+
+fn reject_unexpected_non_null_arguments(
+    tool_name: &LocalToolName,
+    arguments: &Value,
+) -> Result<(), LocalToolExecutionError> {
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let allowed: &[&str] = match tool_name.as_str() {
+        "read_file" => &["path"],
+        "write_file" => &["path", "content"],
+        "edit_file" => &["path", "old_text", "new_text"],
+        "glob" => &["pattern", "excludes"],
+        "bash" => &["command", "timeout_ms"],
+        "write_todos" => &["operation", "items", "item_index", "status"],
+        _ => return Ok(()),
+    };
+
+    let unexpected = object
+        .iter()
+        .filter(|(key, value)| !value.is_null() && !allowed.contains(&key.as_str()))
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>();
+    if unexpected.is_empty() {
+        return Ok(());
+    }
+
+    Err(LocalToolExecutionError::InvalidArguments(format!(
+        "`{}` received non-null argument(s) for another tool: {}. Use the correct local tool instead; for shell commands use `bash`, and for todo status changes use `write_todos` only.",
+        tool_name.as_str(),
+        unexpected.join(", ")
+    )))
 }
 
 fn execute_write_todos(
@@ -1395,6 +1429,32 @@ mod tests {
         .await
         .expect_err("bash should time out");
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn local_tools_reject_non_null_arguments_for_other_tools() {
+        let temp_dir = temp_dir("tool-arg-hygiene");
+        let context = local_tool_context(&temp_dir);
+        std::fs::write(&context.todo_path, "1. [pending] Task").expect("seed todo file");
+
+        let error = execute_local_tool(
+            &LocalToolName::new("write_todos").expect("valid tool"),
+            &json!({
+                "operation":"set_status",
+                "item_index":1,
+                "status":"in_progress",
+                "command":"printf should-run-via-bash"
+            }),
+            &context,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("write_todos must not accept bash command arguments");
+
+        let message = error.to_string();
+        assert!(message.contains("received non-null argument(s) for another tool"));
+        assert!(message.contains("command"));
+        assert!(message.contains("for shell commands use `bash`"));
     }
 
     #[tokio::test]

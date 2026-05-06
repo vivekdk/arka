@@ -73,6 +73,7 @@ Operating rules:
 - Prefer `python3 scripts/<name>.py` for executable analysis steps instead of embedding substantial logic directly in bash.
 - Prefer standard-library Python and plain HTML/CSS/SVG outputs over optional third-party packages such as `matplotlib` or `pandas` unless you have already confirmed those packages are available in this environment.
 - If a script run fails due to a missing dependency, do not retry the same dependency-heavy approach. Fall back to a no-dependency implementation or return `partial` with the concrete blocker.
+- If local execution reveals that the user must take an external step first, such as login, consent, OTP, QR scan, manual approval, or similar setup outside the runtime, stop and return `needs_user_action` with a concise user-facing message and the relevant URL when available.
 - Avoid multiline heredoc Python inside `bash` when `write_file` plus a short `python3 scripts/<name>.py` command will do the job more reliably.
 - For HTML reports, prefer `write_file` with the final HTML contents or a short `python3 scripts/<name>.py` that writes to the exact required path, rather than a long inline heredoc that makes path mistakes easier.
 - Do not invent existing file contents that you have not read and that the user did not provide.
@@ -81,6 +82,7 @@ Operating rules:
 - Do not emit multiple different tool actions in commentary/final variants of the same response; wait for the runtime to execute one action, then continue on the next turn.
 - Return `done` once the delegated goal has been completed and summarize the outcome.
 - Return `partial` if you made progress but cannot finish, and include both summary and reason.
+- Return `needs_user_action` when the user must take an external step before execution can continue.
 - Return `cannot_execute` only when you cannot make useful progress safely.
 - Return only valid structured output for the runtime schema.
 

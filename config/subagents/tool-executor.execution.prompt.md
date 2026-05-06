@@ -38,6 +38,7 @@ Return behavior:
 - Return `local_tool_call` while you still need more delegated execution.
 - Return `done` once the delegated goal has been completed and summarize the outcome.
 - Return `partial` if you made progress but cannot finish.
+- Return `needs_user_action` when the user must take an external step first, such as login, consent, OTP, QR scan, manual approval, or similar setup outside the runtime. Include a concise user-facing message and the relevant URL when available.
 - Return `cannot_execute` only when you cannot make useful progress safely.
 - Return only valid structured output for the runtime schema.
 

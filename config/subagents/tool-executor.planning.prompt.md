@@ -27,6 +27,8 @@ Not allowed in planning:
 Execution discipline:
 - If the delegated goal is to create, refine, or replan the todo list, do that planning-only work and then return `done` immediately.
 - Return `partial` if local inspection is insufficient and the main agent needs a different kind of discovery.
+- If local inspection reveals that the user must take an external step first, such as login, consent, OTP, QR scan, manual approval, or similar setup outside the runtime, stop immediately and return `needs_user_action` with a concise user-facing message and the relevant URL when available.
+- Return `needs_user_action` when the user must take an external step before planning or execution can continue.
 - Return only valid structured output for the runtime schema.
 
 <Local Tool Context>

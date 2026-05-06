@@ -250,6 +250,17 @@ Supported dynamic tags:
 - `<dynamic variable: available sub-agents>`
 - `<dynamic variable: available tools>`
 
+### Project instructions
+
+Arka also supports root-level project instructions through `AGENTS` files.
+
+- Discovery checks only the launch root where Arka creates `.arka/tmp/`
+- `AGENTS.override.md` takes precedence over `AGENTS.md`
+- empty files are skipped, so an empty override falls back to a non-empty base file
+- nested `AGENTS` files are ignored
+
+When present, the selected file is injected into each model prompt as a dedicated `Project Instructions` section. This is separate from the base system prompt template.
+
 ### MCP registry
 
 The default registry path is `config/mcp_servers.json`. Start from `config/mcp_servers.example.json`.

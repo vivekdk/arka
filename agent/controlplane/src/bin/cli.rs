@@ -5,6 +5,7 @@
 
 use std::{
     env,
+    fs,
     future::Future,
     io::{self, BufRead, IsTerminal, Write},
     path::PathBuf,
@@ -858,6 +859,7 @@ struct SessionEventRenderState {
     current_turn_id: Option<String>,
     workspace_root: Option<PathBuf>,
     last_todo_signature: Option<String>,
+    todo_card_emitted: bool,
     live_header: Option<String>,
     live_todo_card: Option<String>,
     live_event_lines: Vec<String>,
@@ -894,6 +896,7 @@ fn render_session_event_with_theme(
             state.current_turn_id = None;
             state.workspace_root = None;
             state.last_todo_signature = None;
+            state.todo_card_emitted = false;
             state.live_header = None;
             state.live_todo_card = None;
             state.live_event_lines.clear();
@@ -990,7 +993,8 @@ fn emit_session_event(
     let lines = render_session_event_with_theme(theme, state, event);
     let todo_card = matches!(event, SessionEvent::RuntimeEvent { .. })
         .then(|| render_todo_progress_from_workspace(theme, state))
-        .flatten();
+        .flatten()
+        .and_then(|card| consume_todo_card_for_turn(state, card));
 
     if !theme.interactive() {
         if let Some(lines) = lines {
@@ -1008,13 +1012,22 @@ fn emit_session_event(
             redraw_live_turn_region(state)?;
         }
         SessionEvent::RuntimeEvent { .. } if state.turn_open => {
-            if let Some(lines) = lines {
-                state.live_event_lines.extend(lines);
-            }
+            let todo_card_added = todo_card.is_some();
+            let event_lines = lines.clone().unwrap_or_default();
             if let Some(todo_card) = todo_card {
                 state.live_todo_card = Some(todo_card);
             }
-            if !state.live_event_lines.is_empty() || state.live_todo_card.is_some() {
+
+            if state.live_todo_card.is_some() {
+                if todo_card_added || !state.live_event_lines.is_empty() {
+                    state.live_event_lines.extend(event_lines);
+                    redraw_live_turn_region(state)?;
+                    state.live_event_lines.clear();
+                } else if !event_lines.is_empty() {
+                    print_rendered_lines(&event_lines)?;
+                }
+            } else if !event_lines.is_empty() {
+                state.live_event_lines.extend(event_lines);
                 redraw_live_turn_region(state)?;
             }
         }
@@ -1048,6 +1061,17 @@ fn reset_live_turn_region(state: &mut SessionEventRenderState) {
     state.live_todo_card = None;
     state.live_event_lines.clear();
     state.live_region_height = 0;
+}
+
+fn consume_todo_card_for_turn(
+    state: &mut SessionEventRenderState,
+    todo_card: String,
+) -> Option<String> {
+    if state.todo_card_emitted {
+        return None;
+    }
+    state.todo_card_emitted = true;
+    Some(todo_card)
 }
 
 fn redraw_live_turn_region(state: &mut SessionEventRenderState) -> io::Result<()> {
@@ -1109,8 +1133,8 @@ fn render_todo_progress_from_workspace_root(
     workspace_root: &PathBuf,
 ) -> Option<String> {
     let session_id = state.session_id.as_ref()?;
-    let turn_id = state.current_turn_id.as_deref()?;
-    let todo_path = runtime_workspace_todo_path(workspace_root, session_id, turn_id);
+    let todo_path =
+        resolve_runtime_todo_path(workspace_root, session_id, state.current_turn_id.as_deref())?;
     let todos = TodoList::load_from_path(&todo_path).ok()?;
     let signature = todos.render();
     if state.last_todo_signature.as_deref() == Some(signature.as_str()) {
@@ -1152,6 +1176,49 @@ fn runtime_workspace_todo_path(
         .join(session_id.to_string())
         .join(turn_id)
         .join("todos.txt")
+}
+
+fn resolve_runtime_todo_path(
+    workspace_root: &PathBuf,
+    session_id: &SessionId,
+    current_turn_id: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(turn_id) = current_turn_id {
+        let todo_path = runtime_workspace_todo_path(workspace_root, session_id, turn_id);
+        if todo_path.exists() {
+            return Some(todo_path);
+        }
+    }
+
+    latest_runtime_workspace_todo_path(workspace_root, session_id)
+}
+
+fn latest_runtime_workspace_todo_path(
+    workspace_root: &PathBuf,
+    session_id: &SessionId,
+) -> Option<PathBuf> {
+    let session_workspace = workspace_root.join(session_id.to_string());
+    let entries = fs::read_dir(&session_workspace).ok()?;
+    let mut newest_todo: Option<(std::time::SystemTime, PathBuf)> = None;
+
+    for entry in entries.flatten() {
+        let todo_path = entry.path().join("todos.txt");
+        if !todo_path.is_file() {
+            continue;
+        }
+        let Ok(modified) = todo_path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+        else {
+            continue;
+        };
+        match &newest_todo {
+            Some((best_modified, _)) if &modified <= best_modified => {}
+            _ => newest_todo = Some((modified, todo_path)),
+        }
+    }
+
+    newest_todo.map(|(_, path)| path)
 }
 
 fn render_runtime_event_with_theme(
@@ -3328,13 +3395,14 @@ mod tests {
 
     use super::{
         CONNECT_RETRY_COUNT, ChatCommand, CliTheme, INITIAL_BACKOFF_MS, McpCommand,
-        SessionEventRenderState, build_metadata_catalogs, format_mcp_remote_refresh_error,
-        format_turn_meta_line, is_mcp_remote_stdio, live_turn_region_components,
-        mcp_remote_defaults, parse_chat_command, parse_sse_data, prompt_text,
-        render_markdownish_text, render_runtime_event_with_theme, render_session_event_with_theme,
-        render_todo_progress_card, render_todo_progress_from_workspace_root, render_user_message,
-        resolve_runtime_workspace_root, runtime_workspace_todo_path, send_with_retry,
-        server_supports_capability, should_retry_request, split_sse_frame,
+        SessionEventRenderState, build_metadata_catalogs, consume_todo_card_for_turn,
+        format_mcp_remote_refresh_error, format_turn_meta_line, is_mcp_remote_stdio,
+        live_turn_region_components, mcp_remote_defaults, parse_chat_command, parse_sse_data,
+        prompt_text, render_markdownish_text, render_runtime_event_with_theme,
+        render_session_event_with_theme, render_todo_progress_card,
+        render_todo_progress_from_workspace_root, render_user_message,
+        resolve_runtime_workspace_root, resolve_runtime_todo_path, runtime_workspace_todo_path,
+        send_with_retry, server_supports_capability, should_retry_request, split_sse_frame,
     };
 
     #[test]
@@ -3722,6 +3790,7 @@ mod tests {
             current_turn_id: None,
             workspace_root: None,
             last_todo_signature: None,
+            todo_card_emitted: false,
             live_header: Some("● Live Turn executing".to_owned()),
             live_todo_card: Some("TODO CARD".to_owned()),
             live_event_lines: vec![
@@ -3759,7 +3828,7 @@ mod tests {
         .expect("todo directory should be creatable");
         std::fs::write(
             &todo_path,
-            "1. [pending] [main-agent] Clarify scope\n2. [in_progress] [mcp-executor] Query IPL data\n3. [completed] [tool-executor] Prepare chart\n",
+            "1. [completed] [main-agent] Clarify scope\n2. [in_progress] [mcp-executor] Query IPL data\n3. [pending] [tool-executor] Prepare chart\n",
         )
         .expect("todo file should be writable");
 
@@ -3769,6 +3838,7 @@ mod tests {
             current_turn_id: Some(turn_id.to_string()),
             workspace_root: None,
             last_todo_signature: None,
+            todo_card_emitted: false,
             live_header: None,
             live_todo_card: None,
             live_event_lines: Vec::new(),
@@ -3778,15 +3848,93 @@ mod tests {
             render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
                 .expect("todo file should render");
         assert!(rendered.contains("Todo Progress"));
-        assert!(rendered.contains("[☐] Clarify scope"));
+        assert!(rendered.contains("[☑] Clarify scope"));
         assert!(rendered.contains("[■] Query IPL data"));
-        assert!(rendered.contains("[☑] Prepare chart"));
+        assert!(rendered.contains("[☐] Prepare chart"));
         assert_eq!(
             render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root),
             None
         );
 
         std::fs::remove_dir_all(&workspace_root).expect("temp workspace should be removable");
+    }
+
+    #[test]
+    fn falls_back_to_latest_turn_todo_when_current_turn_id_is_missing() {
+        let theme = CliTheme::plain();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "arka-cli-todo-progress-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session_id = agent_controlplane::SessionId::new();
+        let first_turn_id = TurnId::new();
+        let second_turn_id = TurnId::new();
+        let first_todo_path =
+            runtime_workspace_todo_path(&workspace_root, &session_id, &first_turn_id.to_string());
+        let second_todo_path =
+            runtime_workspace_todo_path(&workspace_root, &session_id, &second_turn_id.to_string());
+
+        std::fs::create_dir_all(
+            first_todo_path
+                .parent()
+                .expect("first todo path should have a parent"),
+        )
+        .expect("first turn directory should be creatable");
+        std::fs::write(&first_todo_path, "1. [completed] [main-agent] Prior turn task\n")
+            .expect("first todo file should be writable");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::create_dir_all(
+            second_todo_path
+                .parent()
+                .expect("second todo path should have a parent"),
+        )
+        .expect("second turn directory should be creatable");
+        std::fs::write(
+            &second_todo_path,
+            "1. [pending] [main-agent] Follow-up turn task\n",
+        )
+        .expect("second todo file should be writable");
+
+        assert_eq!(
+            resolve_runtime_todo_path(&workspace_root, &session_id, None),
+            Some(second_todo_path.clone())
+        );
+
+        let mut state = SessionEventRenderState {
+            turn_open: true,
+            session_id: Some(session_id),
+            current_turn_id: None,
+            workspace_root: None,
+            last_todo_signature: None,
+            todo_card_emitted: false,
+            live_header: None,
+            live_todo_card: None,
+            live_event_lines: Vec::new(),
+            live_region_height: 0,
+        };
+        let rendered =
+            render_todo_progress_from_workspace_root(&theme, &mut state, &workspace_root)
+                .expect("latest todo file should render");
+        assert!(rendered.contains("Follow-up turn task"));
+
+        std::fs::remove_dir_all(&workspace_root).expect("temp workspace should be removable");
+    }
+
+    #[test]
+    fn consumes_only_one_todo_card_per_turn() {
+        let mut state = SessionEventRenderState::default();
+
+        assert_eq!(
+            consume_todo_card_for_turn(&mut state, "TODO 1".to_owned()),
+            Some("TODO 1".to_owned())
+        );
+        assert_eq!(consume_todo_card_for_turn(&mut state, "TODO 2".to_owned()), None);
+
+        state.todo_card_emitted = false;
+        assert_eq!(
+            consume_todo_card_for_turn(&mut state, "TODO 3".to_owned()),
+            Some("TODO 3".to_owned())
+        );
     }
 
     #[test]
@@ -3805,7 +3953,15 @@ mod tests {
         let resolved = resolve_runtime_workspace_root(Some(&session_id));
         std::env::set_current_dir(&original_dir).expect("cwd should be restorable");
 
-        assert_eq!(resolved, Some(workspace_root.clone()));
+        let resolved = resolved
+            .as_ref()
+            .and_then(|path| path.canonicalize().ok())
+            .expect("workspace root should resolve");
+        let expected = workspace_root
+            .canonicalize()
+            .expect("expected workspace root should canonicalize");
+
+        assert_eq!(resolved, expected);
         std::fs::remove_dir_all(&sandbox_root).expect("sandbox root should be removable");
     }
 

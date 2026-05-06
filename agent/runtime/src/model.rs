@@ -275,6 +275,11 @@ pub enum SubagentDecision {
         summary: String,
         reason: String,
     },
+    NeedsUserAction {
+        message: String,
+        #[serde(default)]
+        url: Option<String>,
+    },
     CannotExecute {
         reason: String,
     },

@@ -254,6 +254,23 @@ fn main() {
                             "isError": false
                         }),
                     ),
+                    "login" => respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Login required. Open the returned URL and authenticate first."
+                                }
+                            ],
+                            "structuredContent": {
+                                "authenticated": false,
+                                "login_url": "https://kite.example.com/login"
+                            },
+                            "isError": false
+                        }),
+                    ),
                     "delete_leads" => respond(
                         &mut writer,
                         id,
@@ -367,6 +384,13 @@ fn tool_catalog(tool_mode: &str) -> Vec<Value> {
         json!({
             "name": "delete_leads",
             "description": "Delete lead records",
+            "inputSchema": {
+                "type": "object"
+            }
+        }),
+        json!({
+            "name": "login",
+            "description": "Return the login link when authentication is required",
             "inputSchema": {
                 "type": "object"
             }
