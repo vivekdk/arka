@@ -379,6 +379,10 @@ Start an interactive loop:
 cargo run -p agent-controlplane --bin cli -- repl
 ```
 
+The interactive CLI defaults to a chat-first transcript. Use `/status` when you
+need session identifiers or operational details, and `/watch` when you need the
+full runtime event stream for debugging.
+
 Submit an approval:
 
 ```bash

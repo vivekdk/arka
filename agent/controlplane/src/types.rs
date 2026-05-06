@@ -5,7 +5,7 @@
 
 use std::time::SystemTime;
 
-use agent_runtime::{TerminationReason, UsageSummary};
+use agent_runtime::{PendingUserAction, TerminationReason, UsageSummary};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -127,6 +127,8 @@ pub enum SessionStatus {
     Running,
     /// Execution is paused pending an approval decision.
     WaitingForApproval,
+    /// Execution is paused pending an external user action.
+    WaitingForUserAction,
     /// Session execution was interrupted by an external command.
     Interrupted,
     /// The last turn failed.
@@ -226,6 +228,9 @@ pub struct TurnRecordSummary {
     pub usage: UsageSummary,
     /// Completion timestamp.
     pub completed_at: SystemTime,
+    /// External user action required before this turn can continue, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_user_action: Option<PendingUserAction>,
 }
 
 /// Top-level session record stored by the control plane.
@@ -243,6 +248,9 @@ pub struct SessionRecord {
     pub bindings: Vec<ChannelBinding>,
     /// Summary of the last completed turn, if any.
     pub last_turn: Option<TurnRecordSummary>,
+    /// Active external user action currently blocking the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_user_action: Option<PendingUserAction>,
 }
 
 /// Normalized inbound channel envelope.

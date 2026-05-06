@@ -3,6 +3,9 @@ For Kite:
 - Give the user the login link in the response, tell them to log in first, and end the turn.
 - Do not continue to holdings, pricing, or portfolio computation until the user has completed login.
 
+For MCPs:
+If MCP is related to a database and you have to execute database queries, you can do joins and execute a single query instead of multiple single queries and combining them later
+
 ## Agent skills
 
 ### Issue tracker

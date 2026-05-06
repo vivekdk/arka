@@ -316,6 +316,21 @@ pub enum TerminationReason {
     RuntimeError,
 }
 
+/// Structured metadata for a turn that is blocked on an external user action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUserAction {
+    /// Provider-agnostic action class, for example `external_user_step`.
+    pub kind: String,
+    /// User-facing explanation of what must happen before work can continue.
+    pub message: String,
+    /// Optional URL the user can open to complete the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The original goal that was blocked by the external action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_goal: Option<String>,
+}
+
 /// One per-step status classification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepOutcomeKind {
@@ -374,6 +389,9 @@ pub struct TurnOutcome {
     pub usage: UsageSummary,
     /// Why the turn ended.
     pub termination: TerminationReason,
+    /// External user action required before the original goal can continue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_user_action: Option<PendingUserAction>,
 }
 
 /// Canonical record for one turn.
