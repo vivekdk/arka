@@ -21,8 +21,8 @@ use crate::{
     policy::{ToolPolicyContext, ToolPolicyEngine, ToolPolicyPhase},
     prompt::{
         PromptAssembler, PromptRenderError, TodoPromptContext, TurnPolicyPromptContext,
-        load_and_render_system_prompt, render_execution_handoff, render_todo_context,
-        render_turn_policy_context,
+        load_and_render_system_prompt, load_project_instructions, render_execution_handoff,
+        render_todo_context, render_turn_policy_context,
     },
     state::{
         DelegationTarget, LlmMessageRecord, LocalToolCallMessageRecord,
@@ -232,6 +232,13 @@ where
         })?;
         let todo_path = todo_file_path(&request.working_directory, &turn_id);
         let html_output_path = deterministic_html_output_path(&request.working_directory, &turn_id);
+        let should_require_turn_todos =
+            should_require_todos_for_turn(&request.user_message, &request.conversation_history);
+        let effective_force_todo_file = request.require_todos && should_require_turn_todos;
+        let pending_user_action_context = derive_pending_user_action_context(
+            &request.recent_session_messages,
+            &request.user_message,
+        );
         let turn_started_at = SystemTime::now();
         sink.record(RuntimeEvent::TurnStarted {
             turn_id: turn_id.clone(),
@@ -279,10 +286,18 @@ where
             let turn_policy_context = TurnPolicyPromptContext {
                 phase,
                 html_output_path: html_output_path.clone(),
-                force_todo_file: request.require_todos,
+                force_todo_file: effective_force_todo_file,
                 execution_todo_required: execution_handoff
                     .as_ref()
                     .map(|handoff| handoff.todo_required),
+                pending_user_action: pending_user_action_context.pending_user_action,
+                pending_user_action_kind: pending_user_action_context
+                    .pending_user_action_kind
+                    .clone(),
+                pending_user_action_goal: pending_user_action_context
+                    .pending_user_action_goal
+                    .clone(),
+                resume_after_user_action: pending_user_action_context.resume_after_user_action,
             };
             let system_prompt = load_and_render_system_prompt(
                 &request.system_prompt_path,
@@ -293,12 +308,14 @@ where
                 &local_tool_catalog,
                 &request.response_target,
             )?;
+            let project_instructions = load_project_instructions(&request.working_directory)?;
             let current_prompt_messages = match phase {
                 TurnPhase::Planning => &planning_prompt_messages,
                 TurnPhase::Execution => &execution_prompt_messages,
             };
             let prompt = self.prompt_assembler.build(
                 &system_prompt,
+                project_instructions.as_deref(),
                 &request.conversation_history,
                 &request.recent_session_messages,
                 current_prompt_messages,
@@ -433,7 +450,7 @@ where
                     }
 
                     let Some(outcome) =
-                        normalize_planning_outcome(outcome, request.require_todos, &todo_path)?
+                        normalize_planning_outcome(outcome, effective_force_todo_file, &todo_path)?
                     else {
                         let feedback = MessageRecord::Llm(LlmMessageRecord {
                             message_id: MessageId::new(),
@@ -469,10 +486,17 @@ where
                         });
                         continue;
                     };
+                    let outcome = remove_resolved_user_action_wait_todos(
+                        outcome,
+                        pending_user_action_context.resume_after_user_action,
+                    );
 
-                    if let Some(feedback_content) =
-                        planning_todo_items_feedback(&outcome, request.require_todos, &todo_path)?
-                    {
+                    if let Some(feedback_content) = planning_todo_items_feedback(
+                        &outcome,
+                        effective_force_todo_file,
+                        should_require_turn_todos,
+                        &todo_path,
+                    )? {
                         let feedback = MessageRecord::Llm(LlmMessageRecord {
                             message_id: MessageId::new(),
                             timestamp: SystemTime::now(),
@@ -508,8 +532,12 @@ where
                         continue;
                     }
 
-                    let handoff =
-                        materialize_planning_outcome(&outcome, &todo_path, request.require_todos)?;
+                    let handoff = materialize_planning_outcome(
+                        &outcome,
+                        &todo_path,
+                        effective_force_todo_file,
+                        should_require_turn_todos,
+                    )?;
                     let transition_message = MessageRecord::Llm(LlmMessageRecord {
                         message_id: MessageId::new(),
                         timestamp: SystemTime::now(),
@@ -549,7 +577,8 @@ where
                     if phase == TurnPhase::Planning {
                         if let Some(handoff) = infer_execution_handoff_from_legacy_planning(
                             &content,
-                            request.require_todos,
+                            effective_force_todo_file,
+                            should_require_turn_todos,
                             &todo_path,
                         )? {
                             let transition_message = MessageRecord::Llm(LlmMessageRecord {
@@ -847,7 +876,7 @@ where
                     let mut delegation_phase = phase;
                     if should_auto_transition_to_execution(
                         phase,
-                        request.require_todos,
+                        effective_force_todo_file,
                         &todo_path,
                         &delegation,
                     ) {
@@ -1098,6 +1127,46 @@ where
                         });
                         continue;
                     }
+                    if let Some(feedback) = capability_scope_too_narrow_feedback_for_delegation(
+                        &todo_path,
+                        mcp_session,
+                        &delegation,
+                        &resolved_subagent_type,
+                    )? {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        step_messages.push(feedback.clone());
+                        all_messages.push(feedback);
+                        push_prompt_message_for_phase(
+                            delegation_phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            step_messages.last().expect("message just pushed").clone(),
+                        );
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Continue,
+                            usage: step_usage,
+                        };
+                        steps.push(step);
+                        sink.record(RuntimeEvent::StepEnded {
+                            turn_id: turn_id.clone(),
+                            step_id: step_id.clone(),
+                            executor: main_executor.clone(),
+                            at: SystemTime::now(),
+                        });
+                        continue;
+                    }
                     if delegation_phase == TurnPhase::Execution {
                         if let Some(feedback) = html_todo_feedback_for_delegation(
                             &todo_path,
@@ -1224,6 +1293,12 @@ where
                     for trace_message in maybe_execution.trace_messages {
                         step_messages.push(trace_message.clone());
                         all_messages.push(trace_message.clone());
+                        push_prompt_message_for_phase(
+                            delegation_phase,
+                            &mut planning_prompt_messages,
+                            &mut execution_prompt_messages,
+                            trace_message,
+                        );
                     }
                     step_messages.push(subagent_result_message.clone());
                     all_messages.push(subagent_result_message.clone());
@@ -1233,6 +1308,42 @@ where
                         &mut execution_prompt_messages,
                         subagent_result_message,
                     );
+
+                    if let Some(final_text) = user_action_final_text(&step_messages) {
+                        let final_message = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: final_text.clone(),
+                        });
+                        step_messages.push(final_message.clone());
+                        all_messages.push(final_message);
+
+                        let step = StepRecord {
+                            step_id: step_id.clone(),
+                            step_number,
+                            started_at: step_started_at,
+                            ended_at: SystemTime::now(),
+                            prompt,
+                            decision: Some(decision),
+                            messages: step_messages,
+                            outcome: StepOutcomeKind::Final,
+                            usage: usage_delta(step_usage, maybe_execution.usage),
+                        };
+                        steps.push(step);
+                        return finish_turn(
+                            sink,
+                            turn_id,
+                            turn_started_at,
+                            SystemTime::now(),
+                            steps,
+                            all_messages,
+                            usage,
+                            final_text.clone(),
+                            final_text,
+                            TerminationReason::Final,
+                            &main_executor,
+                        );
+                    }
 
                     let step = StepRecord {
                         step_id: step_id.clone(),
@@ -1353,15 +1464,25 @@ where
         let configured = registry.get_enabled(subagent_type)?;
         let todo_path = todo_file_path(&request.working_directory, turn_id);
         let html_output_path = deterministic_html_output_path(&request.working_directory, turn_id);
+        let effective_force_todo_file = request.require_todos
+            && should_require_todos_for_turn(&request.user_message, &request.conversation_history);
+        let pending_user_action_context = derive_pending_user_action_context(
+            &request.recent_session_messages,
+            &request.user_message,
+        );
         let turn_policy_context = TurnPolicyPromptContext {
             phase,
             html_output_path: html_output_path.clone(),
-            force_todo_file: request.require_todos,
+            force_todo_file: effective_force_todo_file,
             execution_todo_required: if phase == TurnPhase::Planning {
                 None
             } else {
                 Some(todo_path.exists())
             },
+            pending_user_action: pending_user_action_context.pending_user_action,
+            pending_user_action_kind: pending_user_action_context.pending_user_action_kind,
+            pending_user_action_goal: pending_user_action_context.pending_user_action_goal,
+            resume_after_user_action: pending_user_action_context.resume_after_user_action,
         };
         let base_prompt = build_subagent_prompt(
             &request.subagent_registry_path,
@@ -1541,6 +1662,21 @@ where
                             "partial",
                             executed_action_count,
                             format_partial_detail(&summary, &reason),
+                            Some(tool_mask_plan),
+                        ),
+                        DelegatedExecutionOutcome {
+                            usage,
+                            trace_messages,
+                        },
+                    ));
+                }
+                SubagentDecision::NeedsUserAction { message, url } => {
+                    return Ok((
+                        subagent_result_message(
+                            subagent_type,
+                            "needs_user_action",
+                            executed_action_count,
+                            format_user_action_detail(&message, url.as_deref()),
                             Some(tool_mask_plan),
                         ),
                         DelegatedExecutionOutcome {
@@ -1802,6 +1938,17 @@ where
                     trace_messages.push(result_message.clone());
                     subagent_messages.push(call_message);
                     subagent_messages.push(result_message);
+                    if let Some(feedback) =
+                        discovery_commit_feedback_for_mcp_result(&call_target, &captured)
+                    {
+                        let feedback = MessageRecord::Llm(LlmMessageRecord {
+                            message_id: MessageId::new(),
+                            timestamp: SystemTime::now(),
+                            content: feedback,
+                        });
+                        trace_messages.push(feedback.clone());
+                        subagent_messages.push(feedback);
+                    }
                     if was_error {
                         total_mcp_error_count += 1;
                         if total_mcp_error_count >= MAX_TOTAL_SUBAGENT_MCP_ERRORS {
@@ -2377,16 +2524,62 @@ fn normalize_planning_outcome(
     Ok(Some(outcome))
 }
 
+fn remove_resolved_user_action_wait_todos(
+    mut outcome: PlanningOutcome,
+    resume_after_user_action: bool,
+) -> PlanningOutcome {
+    if !resume_after_user_action {
+        return outcome;
+    }
+    outcome
+        .todo_items
+        .retain(|item| !todo_item_waits_for_user_action(item));
+    outcome
+}
+
+fn todo_item_waits_for_user_action(item: &str) -> bool {
+    let normalized = item.to_ascii_lowercase();
+    let mentions_user_action = [
+        "user action",
+        "external user step",
+        "login",
+        "log in",
+        "authenticate",
+        "authentication",
+        "authorize",
+        "authorization",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if !mentions_user_action {
+        return false;
+    }
+
+    [
+        "wait for the user",
+        "wait until the user",
+        "ask the user",
+        "tell the user",
+        "prompt the user",
+        "restart the request",
+        "send the request again",
+        "try again after",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn planning_todo_items_feedback(
     outcome: &PlanningOutcome,
     force_todo_file: bool,
+    include_html_tail: bool,
     todo_path: &Path,
 ) -> Result<Option<String>, RuntimeError> {
     let todo_required = outcome.todo_required || force_todo_file || todo_path.exists();
     if !todo_required || todo_path.exists() {
         return Ok(None);
     }
-    match TodoList::initialize(&outcome.todo_items) {
+    match TodoList::initialize_with_html_tail(&outcome.todo_items, include_html_tail) {
         Ok(_) => Ok(None),
         Err(TodoError::Validation(message)) if message.contains("executor hint") => {
             Ok(Some(format!(
@@ -2403,10 +2596,12 @@ fn materialize_planning_outcome(
     outcome: &PlanningOutcome,
     todo_path: &Path,
     force_todo_file: bool,
+    include_html_tail: bool,
 ) -> Result<ExecutionHandoff, RuntimeError> {
     let todo_required = outcome.todo_required || force_todo_file || todo_path.exists();
     if todo_required && !todo_path.exists() {
-        TodoList::initialize(&outcome.todo_items)?.save_to_path(todo_path)?;
+        TodoList::initialize_with_html_tail(&outcome.todo_items, include_html_tail)?
+            .save_to_path(todo_path)?;
     }
     let mut normalized = outcome.clone();
     normalized.todo_required = todo_required;
@@ -2416,6 +2611,7 @@ fn materialize_planning_outcome(
 fn infer_execution_handoff_from_legacy_planning(
     summary: &str,
     force_todo_file: bool,
+    include_html_tail: bool,
     todo_path: &Path,
 ) -> Result<Option<ExecutionHandoff>, RuntimeError> {
     let todo_required = force_todo_file || todo_path.exists();
@@ -2440,6 +2636,7 @@ fn infer_execution_handoff_from_legacy_planning(
             &outcome,
             todo_path,
             force_todo_file,
+            include_html_tail,
         )?));
     }
     Ok(None)
@@ -2794,6 +2991,50 @@ fn disabled_mcp_capability_feedback_for_delegation(
     )))
 }
 
+fn capability_scope_too_narrow_feedback_for_delegation(
+    todo_path: &Path,
+    mcp_session: &McpSession,
+    delegation: &crate::model::SubagentDelegationRequest,
+    resolved_subagent_type: &str,
+) -> Result<Option<String>, RuntimeError> {
+    if resolved_subagent_type != "mcp-executor" {
+        return Ok(None);
+    }
+    let DelegationTarget::McpCapability(target) = &delegation.target else {
+        return Ok(None);
+    };
+    if target.capability_kind != CapabilityKind::Tool {
+        return Ok(None);
+    }
+
+    let server = mcp_session
+        .servers
+        .get(&target.server_name)
+        .ok_or_else(|| RuntimeError::UnknownServer(target.server_name.to_string()))?;
+    let current_todo_text = load_todo_list_if_present(todo_path)?.and_then(|todo_list| {
+        todo_list
+            .next_actionable()
+            .map(|(_, item)| item.text.clone())
+    });
+    let diagnostic_text = current_todo_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(&delegation.goal);
+
+    let matching_tools = tool_names_referenced_by_text(&server.full_catalog, diagnostic_text);
+    if matching_tools.len() < 2 {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "The selected MCP capability target `{}` is too narrow for this delegated step. The current step appears to require multiple MCP tools on server `{}` (matched: {}). Delegate `mcp-executor` with `mcp_server_scope` for server `{}` instead of a single capability target.",
+        target.capability_id,
+        target.server_name,
+        matching_tools.join(", "),
+        target.server_name
+    )))
+}
+
 fn todo_item_prefers_mcp_executor(item: &TodoItem) -> bool {
     item.executor_hint == Some(TodoExecutor::McpExecutor)
 }
@@ -2856,6 +3097,10 @@ fn sync_mcp_todo_after_delegation(
             }
         }
         "cannot_execute" => {
+            todo_list.set_status(item_index, crate::todo::TodoStatus::Failed)?;
+            todo_list.save_to_path(todo_path)?;
+        }
+        "needs_user_action" => {
             todo_list.set_status(item_index, crate::todo::TodoStatus::Failed)?;
             todo_list.save_to_path(todo_path)?;
         }
@@ -2992,6 +3237,37 @@ fn mcp_partial_indicates_blocking_failure(detail: &str) -> bool {
             .contains("sub-agent exhausted its reasoning budget before reaching a terminal result")
         || contains_postgres_transaction_session_error(&detail)
         || detail.contains("duplicate-call")
+        || detail_contains_auth_blocker(&detail)
+}
+
+fn detail_contains_auth_blocker(detail: &str) -> bool {
+    let mentions_auth = [
+        "auth",
+        "login",
+        "log in",
+        "authorization",
+        "authorize",
+        "consent",
+        "otp",
+        "qr",
+        "manual approval",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+    let mentions_block = [
+        "blocked",
+        "required",
+        "requires",
+        "cannot",
+        "can't",
+        "unable",
+        "before continuing",
+        "before any",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+
+    mentions_auth && mentions_block
 }
 
 fn should_cycle_mcp_connection_after_success(server: &PreparedServer, tool_name: &str) -> bool {
@@ -3103,9 +3379,9 @@ fn reconcile_mandatory_todos_from_turn_trace(
         return Ok(());
     };
 
+    let mut changed = repair_missing_mandatory_html_artifact(&mut todos, html_output_path);
     let html_written = observed_html_write(messages, html_output_path);
     let html_path_printed = observed_html_path_print(messages, html_output_path, working_directory);
-    let mut changed = false;
 
     if html_written {
         changed |= auto_complete_next_todo_if_matches(&mut todos, MANDATORY_TODO_GENERATE_HTML)?;
@@ -3119,6 +3395,31 @@ fn reconcile_mandatory_todos_from_turn_trace(
     }
 
     Ok(())
+}
+
+fn repair_missing_mandatory_html_artifact(todos: &mut TodoList, html_output_path: &Path) -> bool {
+    if html_report_file_is_acceptable(html_output_path) {
+        return false;
+    }
+
+    let Some(generate_index) = todos
+        .items
+        .iter()
+        .position(|item| item.text == MANDATORY_TODO_GENERATE_HTML)
+    else {
+        return false;
+    };
+    if todos.items[generate_index].status != crate::todo::TodoStatus::Completed {
+        return false;
+    }
+
+    todos.items[generate_index].status = crate::todo::TodoStatus::Failed;
+    for item in todos.items.iter_mut().skip(generate_index + 1) {
+        if item.text == MANDATORY_TODO_OPEN_HTML {
+            item.status = crate::todo::TodoStatus::Pending;
+        }
+    }
+    true
 }
 
 fn reconcile_active_todo_from_turn_trace(
@@ -3226,6 +3527,14 @@ struct LatestMcpExecutionSegment<'a> {
     result: &'a crate::state::SubAgentResultMessageRecord,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingUserActionContext {
+    pending_user_action: bool,
+    pending_user_action_kind: Option<String>,
+    pending_user_action_goal: Option<String>,
+    resume_after_user_action: bool,
+}
+
 fn latest_mcp_execution_segment(
     messages: &[MessageRecord],
 ) -> Option<LatestMcpExecutionSegment<'_>> {
@@ -3248,6 +3557,76 @@ fn latest_mcp_execution_segment(
         messages: &messages[call_index..=result_index],
         result,
     })
+}
+
+fn derive_pending_user_action_context(
+    recent_session_messages: &[MessageRecord],
+    user_message: &str,
+) -> PendingUserActionContext {
+    let mut latest_pending_result: Option<&crate::state::SubAgentResultMessageRecord> = None;
+    let mut latest_blocked_goal: Option<String> = None;
+
+    for (index, message) in recent_session_messages.iter().enumerate().rev() {
+        let MessageRecord::SubAgentResult(record) = message else {
+            continue;
+        };
+        if record.status != "needs_user_action" {
+            continue;
+        }
+        latest_pending_result = Some(record);
+        latest_blocked_goal = recent_session_messages[..index]
+            .iter()
+            .rev()
+            .find_map(|candidate| match candidate {
+                MessageRecord::SubAgentCall(call) => Some(call.goal.clone()),
+                _ => None,
+            });
+        break;
+    }
+
+    let Some(_result) = latest_pending_result else {
+        return PendingUserActionContext::default();
+    };
+
+    PendingUserActionContext {
+        pending_user_action: true,
+        pending_user_action_kind: Some("external_user_step".to_owned()),
+        pending_user_action_goal: latest_blocked_goal,
+        resume_after_user_action: message_looks_like_user_action_resume(user_message),
+    }
+}
+
+fn message_looks_like_user_action_resume(user_message: &str) -> bool {
+    let normalized = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let trimmed = normalized
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .trim()
+        .to_owned();
+    if trimmed.is_empty() || trimmed.len() > 80 {
+        return false;
+    }
+
+    [
+        "logged in",
+        "signed in",
+        "authorized",
+        "authenticated",
+        "verified",
+        "done",
+        "completed",
+        "go ahead",
+        "continue",
+        "retry",
+        "try again",
+        "please do",
+        "do it",
+    ]
+    .iter()
+    .any(|phrase| trimmed == *phrase || trimmed.starts_with(phrase))
 }
 
 fn render_mcp_execution_evidence(segment: &LatestMcpExecutionSegment<'_>) -> String {
@@ -3336,6 +3715,81 @@ fn normalized_runtime_tokens(text: &str) -> HashSet<String> {
         .filter_map(|token| {
             let token = token.trim().to_ascii_lowercase();
             if token.len() < 4 || STOPWORDS.contains(&token.as_str()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
+}
+
+fn tool_names_referenced_by_text(catalog: &McpFullCatalog, text: &str) -> Vec<String> {
+    let normalized_text = text.to_ascii_lowercase();
+    let text_tokens = normalized_runtime_tokens(&normalized_text);
+    catalog
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            let name_tokens = significant_tool_tokens(&tool.name);
+            let description_tokens = tool
+                .description
+                .as_deref()
+                .map(significant_tool_tokens)
+                .unwrap_or_default();
+            let exact_name_match = normalized_text.contains(&tool.name.to_ascii_lowercase());
+            let name_overlap = name_tokens.intersection(&text_tokens).count();
+            let description_overlap = description_tokens.intersection(&text_tokens).count();
+
+            if exact_name_match
+                || name_overlap >= 1
+                || (description_overlap >= 1
+                    && (!name_tokens.is_empty() || !description_tokens.is_empty()))
+            {
+                Some(tool.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn significant_tool_tokens(text: &str) -> HashSet<String> {
+    const GENERIC_TOOL_TOKENS: &[&str] = &[
+        "get",
+        "set",
+        "run",
+        "list",
+        "read",
+        "write",
+        "search",
+        "describe",
+        "preview",
+        "query",
+        "tool",
+        "data",
+        "current",
+        "specific",
+        "using",
+        "supports",
+        "large",
+        "return",
+        "returns",
+        "fetch",
+        "retrieve",
+        "latest",
+        "active",
+        "existing",
+        "all",
+        "user",
+        "users",
+        "history",
+        "information",
+    ];
+
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() < 3 || GENERIC_TOOL_TOKENS.contains(&token.as_str()) {
                 None
             } else {
                 Some(token)
@@ -3504,6 +3958,13 @@ fn content_looks_like_blocker_summary(content: &str) -> bool {
         "fresh execution path",
         "alternate allowed",
         "blocked mcp path",
+        "still blocked",
+        "blocked by",
+        "blocked on",
+        "authentication is still required",
+        "authentication remains required",
+        "session remains unauthenticated",
+        "session is still blocked",
         "duplicate query",
     ];
     blocker_terms.iter().any(|term| normalized.contains(term))
@@ -3521,6 +3982,7 @@ fn message_indicates_execution_blocker(message: &MessageRecord) -> bool {
                 || detail.contains("cannot execute")
                 || detail.contains("repeated mcp failures")
                 || detail.contains("forced an early stop")
+                || detail_contains_auth_blocker(&detail)
         }
         MessageRecord::Llm(record) => {
             let content = record.content.to_lowercase();
@@ -3631,7 +4093,6 @@ fn html_todo_feedback_for_delegation(
     Ok(None)
 }
 
-#[cfg(test)]
 fn should_require_todos_for_turn(
     user_message: &str,
     conversation_history: &[crate::state::ConversationMessage],
@@ -3640,7 +4101,6 @@ fn should_require_todos_for_turn(
         || is_simple_factual_follow_up_turn(user_message, conversation_history))
 }
 
-#[cfg(test)]
 fn is_simple_factual_turn(user_message: &str) -> bool {
     let normalized = user_message
         .split_whitespace()
@@ -3712,10 +4172,28 @@ fn is_simple_factual_turn(user_message: &str) -> bool {
         return true;
     }
 
+    let metric_patterns = [
+        "current value of ",
+        "value of my ",
+        "value of the ",
+        "price of ",
+        "market value of ",
+        "portfolio value",
+        "current price of ",
+        "latest price of ",
+        "holdings value",
+    ];
+    if metric_patterns
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+        && normalized.split_whitespace().count() <= 12
+    {
+        return true;
+    }
+
     normalized.ends_with('?') && normalized.split_whitespace().count() <= 12
 }
 
-#[cfg(test)]
 fn is_simple_factual_follow_up_turn(
     user_message: &str,
     conversation_history: &[crate::state::ConversationMessage],
@@ -3732,7 +4210,6 @@ fn is_simple_factual_follow_up_turn(
         .unwrap_or(false)
 }
 
-#[cfg(test)]
 fn is_short_contextual_follow_up(user_message: &str) -> bool {
     let normalized = user_message
         .split_whitespace()
@@ -3771,7 +4248,6 @@ fn is_short_contextual_follow_up(user_message: &str) -> bool {
         || is_short_metric_clarification_follow_up(&trimmed)
 }
 
-#[cfg(test)]
 fn is_short_metric_clarification_follow_up(user_message: &str) -> bool {
     if user_message.len() > 90 || user_message.contains('?') {
         return false;
@@ -4012,6 +4488,16 @@ fn build_subagent_prompt(
         "\n## Turn Policy\n{}\n",
         render_turn_policy_context(turn_policy_context)
     );
+    let resumed_user_action_block = if turn_policy_context.pending_user_action
+        && turn_policy_context.resume_after_user_action
+        && matches!(
+            target,
+            DelegationTarget::McpCapability(_) | DelegationTarget::McpServerScope(_)
+        ) {
+        "\n## Resumed External User Action\nThe current user message is a resume signal after a previous external user action. Treat older login, authorization, consent, OTP, QR, or manual-approval results from prior turns as stale context, not as a fresh blocker. Continue the delegated MCP goal and call the relevant MCP tool when one is available. Return `needs_user_action` or `cannot_execute` for authentication only after a fresh MCP result in this delegation reports that user action is still required.\n"
+    } else {
+        ""
+    };
     let execution_handoff_block = if phase == TurnPhase::Execution {
         execution_handoff
             .map(|handoff| {
@@ -4076,7 +4562,7 @@ fn build_subagent_prompt(
             };
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n{server_guidance_block}{turn_policy_block}{execution_handoff_block}{todo_block}\n{}\n{}\n{capability_block}",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected target: {}\n- Execution scope: only the selected MCP capability\n- Local tools: unavailable\n{server_guidance_block}{turn_policy_block}{resumed_user_action_block}{execution_handoff_block}{todo_block}\n{}\n{}\n{capability_block}",
                 target.capability_id, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -4098,7 +4584,7 @@ fn build_subagent_prompt(
             let server_guidance_block = render_mcp_server_guidance(server);
 
             Ok(format!(
-                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n{server_guidance_block}{turn_policy_block}{execution_handoff_block}{todo_block}\n{}\n{}\n",
+                "{template}\n\n## Delegation Context\n- Goal: {goal}\n- User request: {user_message}\n- Selected server: {}\n- Execution scope: any allowed MCP tool or resource on this server only\n- Local tools: unavailable\n- Do not switch to a different MCP server\n{server_guidance_block}{turn_policy_block}{resumed_user_action_block}{execution_handoff_block}{todo_block}\n{}\n{}\n",
                 target.server_name, confirmed_tables_block, recent_results_block,
             ))
         }
@@ -4159,7 +4645,7 @@ fn build_subagent_prompt(
 
 fn render_recent_mcp_results_context(messages: &[MessageRecord]) -> String {
     const MAX_RECENT_RESULTS: usize = 3;
-    const MAX_RESULT_SUMMARY_CHARS: usize = 1_500;
+    const MAX_RESULT_SUMMARY_CHARS: usize = 100_000;
 
     let recent_results = messages
         .iter()
@@ -4322,6 +4808,62 @@ fn extract_table_references(query: &str) -> Vec<String> {
     }
 
     tables
+}
+
+fn discovery_commit_feedback_for_mcp_result(
+    call_target: &McpCapabilityTarget,
+    captured: &CapturedMcpResult,
+) -> Option<String> {
+    if captured.was_error
+        || call_target.capability_kind != CapabilityKind::Tool
+        || call_target.capability_id != "list_tables"
+    {
+        return None;
+    }
+
+    let tables = captured
+        .response_payload
+        .get("structuredContent")
+        .and_then(|value| value.get("tables"))
+        .and_then(serde_json::Value::as_array)?;
+
+    let candidate = tables.iter().find_map(|table| {
+        let name = table.get("name").and_then(serde_json::Value::as_str)?;
+        if name != "users" {
+            return None;
+        }
+
+        let database = table
+            .get("database")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let columns = table
+            .get("columns")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let time_field = columns.iter().find_map(|column| {
+            let name = column.get("name").and_then(serde_json::Value::as_str)?;
+            let normalized = name.to_ascii_lowercase();
+            if normalized == "created_at"
+                || normalized.ends_with("_created_at")
+                || normalized.ends_with("_at")
+                || normalized.contains("timestamp")
+                || normalized == "date"
+            {
+                Some(name.to_owned())
+            } else {
+                None
+            }
+        })?;
+
+        Some((database.to_owned(), name.to_owned(), time_field))
+    })?;
+
+    Some(format!(
+        "Discovery already confirmed a plausible source table `{}`.`{}` with time field `{}`. Do not call `list_tables` again for the same goal unless this table is contradictory. Use `run_query` next with only the required `database` and `query` arguments.",
+        candidate.0, candidate.1, candidate.2
+    ))
 }
 
 fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
@@ -4660,6 +5202,11 @@ fn subagent_decision_summary(decision: &SubagentDecision) -> String {
             "partial: summary={}, reason={}",
             truncate_for_log(summary, 120),
             truncate_for_log(reason, 120)
+        ),
+        SubagentDecision::NeedsUserAction { message, url } => format!(
+            "needs_user_action: message={}, url={}",
+            truncate_for_log(message, 120),
+            url.as_deref().unwrap_or("")
         ),
         SubagentDecision::CannotExecute { reason } => {
             format!("cannot_execute: {}", truncate_for_log(reason, 160))
@@ -5295,6 +5842,281 @@ fn summarize_resource_result(result: &McpResourceReadResult) -> String {
     }
 }
 
+fn user_action_final_text(messages: &[MessageRecord]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if let MessageRecord::SubAgentResult(record) = message {
+            if record.status == "needs_user_action" {
+                return Some(record.detail.clone());
+            }
+        }
+    }
+
+    for message in messages.iter().rev() {
+        match message {
+            MessageRecord::McpResult(record) => {
+                if let Some(final_text) = user_action_final_text_from_texts(&[
+                    &record.result_summary,
+                    record.error.as_deref().unwrap_or(""),
+                ]) {
+                    return Some(final_text);
+                }
+            }
+            MessageRecord::LocalToolResult(record) => {
+                if let Some(final_text) = user_action_final_text_from_texts(&[
+                    &record.result_summary,
+                    record.error.as_deref().unwrap_or(""),
+                ]) {
+                    return Some(final_text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn user_action_final_text_from_texts(texts: &[&str]) -> Option<String> {
+    let mut action_url = None;
+    let mut action_message = None;
+    let mut saw_signal = false;
+
+    for text in texts {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if action_url.is_none() {
+            action_url = extract_user_action_url(text);
+        }
+        if action_message.is_none() {
+            action_message = extract_user_action_message(text);
+        }
+        if user_action_required_text(text) {
+            saw_signal = true;
+        }
+    }
+
+    if !saw_signal && action_url.is_none() {
+        return None;
+    }
+
+    Some(format_user_action_detail(
+        action_message
+            .as_deref()
+            .unwrap_or("A required user action is needed before I can continue."),
+        action_url.as_deref(),
+    ))
+}
+
+fn user_action_required_text(text: &str) -> bool {
+    if text_has_user_action_phrase(text) {
+        return true;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value_indicates_user_action(&value)
+}
+
+fn value_indicates_user_action(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            let normalized_key = key.to_ascii_lowercase();
+            if matches!(
+                normalized_key.as_str(),
+                "logged_in"
+                    | "loggedin"
+                    | "is_logged_in"
+                    | "authenticated"
+                    | "is_authenticated"
+                    | "authorized"
+                    | "is_authorized"
+                    | "verified"
+                    | "is_verified"
+            ) {
+                return value == &Value::Bool(false);
+            }
+            if matches!(normalized_key.as_str(), "status" | "state" | "code") {
+                if let Some(text) = value.as_str() {
+                    let normalized = text.to_ascii_lowercase();
+                    if normalized.contains("login_required")
+                        || normalized.contains("not_logged_in")
+                        || normalized.contains("authentication_required")
+                        || normalized.contains("authorization_required")
+                        || normalized.contains("consent_required")
+                        || normalized.contains("approval_required")
+                        || normalized.contains("verification_required")
+                        || normalized.contains("otp_required")
+                    {
+                        return true;
+                    }
+                }
+            }
+            if matches!(
+                normalized_key.as_str(),
+                "message" | "error" | "detail" | "reason" | "instruction"
+            ) {
+                if let Some(text) = value.as_str() {
+                    if text_has_user_action_phrase(text) {
+                        return true;
+                    }
+                }
+            }
+            value_indicates_user_action(value)
+        }),
+        Value::Array(items) => items.iter().any(value_indicates_user_action),
+        Value::String(text) => text_has_user_action_phrase(text),
+        _ => false,
+    }
+}
+
+fn text_has_user_action_phrase(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    [
+        "not logged in",
+        "login first",
+        "log in first",
+        "login required",
+        "authentication required",
+        "requires login",
+        "sign in first",
+        "sign in required",
+        "authorize access",
+        "authorization required",
+        "authorization link",
+        "approval required",
+        "consent required",
+        "verify your account",
+        "verification required",
+        "otp required",
+        "one-time password",
+        "scan the qr",
+        "scan qr",
+        "reauthorize",
+        "complete setup",
+        "complete verification",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn extract_user_action_message(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(message) = extract_user_action_message_from_value(&value) {
+            return Some(message);
+        }
+    }
+
+    if text_has_user_action_phrase(text) {
+        Some(text.trim().to_owned())
+    } else {
+        None
+    }
+}
+
+fn extract_user_action_message_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let normalized_key = key.to_ascii_lowercase();
+                if matches!(
+                    normalized_key.as_str(),
+                    "message" | "detail" | "reason" | "instruction"
+                ) && value.as_str().is_some_and(text_has_user_action_phrase)
+                {
+                    return value.as_str().map(str::to_owned);
+                }
+                if let Some(message) = extract_user_action_message_from_value(value) {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(extract_user_action_message_from_value),
+        Value::String(text) => {
+            if text_has_user_action_phrase(text) {
+                Some(text.to_owned())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_user_action_url(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(url) = extract_user_action_url_from_value(&value) {
+            return Some(url);
+        }
+    }
+
+    extract_url_from_text(text)
+}
+
+fn extract_user_action_url_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let normalized_key = key.to_ascii_lowercase();
+                if (normalized_key.contains("url")
+                    || normalized_key.contains("login")
+                    || normalized_key.contains("auth")
+                    || normalized_key.contains("authorize")
+                    || normalized_key.contains("consent")
+                    || normalized_key.contains("approval")
+                    || normalized_key.contains("verify"))
+                    && value
+                        .as_str()
+                        .is_some_and(|candidate| candidate.starts_with("http"))
+                {
+                    return value.as_str().map(str::to_owned);
+                }
+                if let Some(url) = extract_user_action_url_from_value(value) {
+                    return Some(url);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(extract_user_action_url_from_value),
+        Value::String(text) => extract_url_from_text(text),
+        _ => None,
+    }
+}
+
+fn extract_url_from_text(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let candidate = token
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | '.' | ')' | ']' | '}' | '>'));
+        if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            Some(candidate.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn format_user_action_detail(message: &str, url: Option<&str>) -> String {
+    let message = message.trim();
+    match url {
+        Some(url) if !message.is_empty() => {
+            format!("{message}\nOpen this link to continue: {url}\nAfter that, send the request again.")
+        }
+        Some(url) => {
+            format!(
+                "A required user action is needed before I can continue.\nOpen this link to continue: {url}\nAfter that, send the request again."
+            )
+        }
+        None if !message.is_empty() => {
+            format!("{message}\nAfter that, send the request again.")
+        }
+        None => "A required user action is needed before I can continue. After that, send the request again.".to_owned(),
+    }
+}
+
 fn finish_turn(
     sink: &mut dyn EventSink,
     turn_id: TurnId,
@@ -5529,19 +6351,23 @@ mod tests {
     };
 
     use super::{
-        FinalTodoAdvance, McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON, PreparedServer,
-        auto_advance_summary_todo_from_final_content, build_subagent_prompt,
-        build_subagent_tool_catalog, disabled_mcp_capability_feedback_for_delegation,
-        disabled_mcp_capability_reason, generic_starter_replan_feedback_for_delegation,
+        CapturedMcpResult, FinalTodoAdvance, McpSession, POSTGRES_SCHEMA_RESOURCE_DISABLED_REASON,
+        PreparedServer, auto_advance_summary_todo_from_final_content, build_subagent_prompt,
+        build_subagent_tool_catalog, capability_scope_too_narrow_feedback_for_delegation,
+        content_looks_like_blocker_summary, derive_pending_user_action_context,
+        disabled_mcp_capability_feedback_for_delegation, disabled_mcp_capability_reason,
+        discovery_commit_feedback_for_mcp_result, generic_starter_replan_feedback_for_delegation,
         html_todo_feedback_for_delegation, immediate_partial_detail_for_local_tool_error,
         incomplete_todo_final_feedback, invalid_subagent_feedback,
-        mcp_collection_feedback_for_delegation, planning_todo_items_feedback,
+        mcp_collection_feedback_for_delegation, mcp_partial_indicates_blocking_failure,
+        message_looks_like_user_action_resume, planning_todo_items_feedback,
         reconcile_active_todo_from_turn_trace, reconcile_mandatory_todos_from_turn_trace,
-        reconcile_pending_mcp_todos_from_turn_trace, render_confirmed_table_context,
-        render_recent_mcp_results_context, sanitize_mcp_tool_arguments,
-        should_cycle_mcp_connection_after_success, should_require_todos_for_turn,
-        should_retry_postgres_query_session_error, sync_mcp_todo_after_delegation,
-        sync_mcp_todo_before_delegation, tool_executor_mcp_todo_partial_feedback,
+        reconcile_pending_mcp_todos_from_turn_trace, remove_resolved_user_action_wait_todos,
+        render_confirmed_table_context, render_recent_mcp_results_context,
+        sanitize_mcp_tool_arguments, should_cycle_mcp_connection_after_success,
+        should_require_todos_for_turn, should_retry_postgres_query_session_error,
+        sync_mcp_todo_after_delegation, sync_mcp_todo_before_delegation,
+        tool_executor_mcp_todo_partial_feedback, user_action_final_text,
         validate_delegation_subagent,
     };
 
@@ -5563,7 +6389,7 @@ mod tests {
             risks_and_constraints: vec![],
         };
 
-        let feedback = planning_todo_items_feedback(&outcome, false, &todo_path)
+        let feedback = planning_todo_items_feedback(&outcome, false, true, &todo_path)
             .expect("feedback should compute")
             .expect("unhinted todo should request feedback");
 
@@ -5591,10 +6417,73 @@ mod tests {
             risks_and_constraints: vec![],
         };
 
-        let feedback = planning_todo_items_feedback(&outcome, false, &todo_path)
+        let feedback = planning_todo_items_feedback(&outcome, false, true, &todo_path)
             .expect("feedback should compute");
 
         assert!(feedback.is_none());
+    }
+
+    #[test]
+    fn resumed_user_action_drops_stale_wait_todos_but_keeps_work_todos() {
+        let outcome = PlanningOutcome {
+            planning_complete: true,
+            answer_brief: String::new(),
+            todo_required: true,
+            planning_summary: "Resume blocked external workflow.".to_owned(),
+            selected_sources: vec![],
+            discovered_facts: vec![],
+            execution_strategy: "Continue after the external user step.".to_owned(),
+            todo_items: vec![
+                "[main-agent] Wait for the user to complete authentication, then restart the request."
+                    .to_owned(),
+                "[mcp-executor] After authentication, retrieve account data from the API."
+                    .to_owned(),
+            ],
+            risks_and_constraints: vec![],
+        };
+
+        let sanitized = remove_resolved_user_action_wait_todos(outcome, true);
+
+        assert_eq!(
+            sanitized.todo_items,
+            vec!["[mcp-executor] After authentication, retrieve account data from the API."]
+        );
+    }
+
+    #[test]
+    fn auth_required_mcp_detail_is_a_blocking_failure() {
+        let detail = "Authentication is still required; no portfolio data can be accessed until the user completes Kite login.";
+
+        assert!(mcp_partial_indicates_blocking_failure(detail));
+        assert!(content_looks_like_blocker_summary(
+            "I’m still blocked on Kite authentication in the session context, so I can’t continue yet."
+        ));
+    }
+
+    #[test]
+    fn user_action_final_text_short_circuits_on_login_link_even_without_explicit_auth_flag() {
+        let final_text = user_action_final_text(
+            &[MessageRecord::McpResult(McpResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                target: McpCapabilityTarget {
+                    server_name: ServerName::new("kite").expect("valid server"),
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "login".to_owned(),
+                },
+                result_summary: "{\"url\":\"https://kite.trade/connect/login\",\"message\":\"Authorize this app\"}".to_owned(),
+                error: None,
+            })],
+        )
+        .expect("login-link result should short-circuit");
+
+        assert!(final_text.contains("https://kite.trade/connect/login"));
+        let normalized = final_text.to_ascii_lowercase();
+        assert!(
+            normalized.contains("authorize")
+                || normalized.contains("open this link")
+                || normalized.contains("required user action")
+        );
     }
 
     #[test]
@@ -5618,6 +6507,36 @@ mod tests {
         assert!(rendered.contains("target=run_select_query"));
         assert!(rendered.contains("\"week_start\""));
         assert!(rendered.contains("write the relevant rows into a local file"));
+    }
+
+    #[test]
+    fn recent_mcp_results_context_preserves_large_local_tool_handoffs() {
+        let rows = (0..120)
+            .map(|index| {
+                serde_json::json!({
+                    "symbol": format!("SYM{index:03}"),
+                    "quantity": index + 1,
+                    "last_price": 100.0 + index as f64,
+                })
+            })
+            .collect::<Vec<_>>();
+        let messages = vec![MessageRecord::McpResult(McpResultMessageRecord {
+            message_id: MessageId::new(),
+            timestamp: SystemTime::now(),
+            target: McpCapabilityTarget {
+                server_name: ServerName::new("broker").expect("valid server"),
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "get_holdings".to_owned(),
+            },
+            result_summary: serde_json::to_string(&rows).expect("rows should serialize"),
+            error: None,
+        })];
+
+        let rendered = render_recent_mcp_results_context(&messages);
+
+        assert!(rendered.contains("SYM000"));
+        assert!(rendered.contains("SYM119"));
+        assert!(!rendered.contains("..."));
     }
 
     #[test]
@@ -5665,6 +6584,10 @@ mod tests {
                 html_output_path: PathBuf::from("/tmp/arka-session/outputs/turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(false),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             &messages,
@@ -5747,6 +6670,10 @@ mod tests {
                 html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(true),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             Some(&handoff),
             &[],
@@ -5781,6 +6708,10 @@ mod tests {
                 html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: None,
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             Some(&handoff),
             &[],
@@ -5837,6 +6768,10 @@ mod tests {
                 html_output_path: temp_dir.join("outputs").join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(true),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             &[],
@@ -5990,6 +6925,46 @@ mod tests {
         assert_eq!(
             reconciled.items[2].status,
             crate::todo::TodoStatus::Completed
+        );
+    }
+
+    #[test]
+    fn reconcile_mandatory_todos_repairs_completed_html_step_when_file_is_missing() {
+        let working_directory = test_fixtures_root();
+        let turn_dir = working_directory.join("turn-missing-html-repair");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        let html_output_path = working_directory
+            .join("outputs")
+            .join("turn-missing-html-repair-report.html");
+        if html_output_path.exists() {
+            std::fs::remove_file(&html_output_path).expect("stale report should be removable");
+        }
+
+        let todos = TodoList::parse(
+            "1. [completed] Compute users-table metrics\n2. [completed] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout.\n3. [pending] Print the path of the generated HTML file.\n",
+        )
+        .expect("seed todos should parse");
+        todos
+            .save_to_path(&todo_path)
+            .expect("todo file should write");
+
+        reconcile_mandatory_todos_from_turn_trace(
+            &todo_path,
+            &html_output_path,
+            &working_directory,
+            &[],
+        )
+        .expect("reconciliation should repair stale mandatory state");
+
+        let reconciled = TodoList::load_from_path(&todo_path).expect("todo file should reload");
+        assert_eq!(reconciled.items[1].text, MANDATORY_TODO_GENERATE_HTML);
+        assert_eq!(reconciled.items[1].status, crate::todo::TodoStatus::Failed);
+        assert_eq!(reconciled.items[2].text, MANDATORY_TODO_OPEN_HTML);
+        assert_eq!(reconciled.items[2].status, crate::todo::TodoStatus::Pending);
+        assert_eq!(
+            reconciled.next_actionable().map(|(index, _)| index),
+            Some(2)
         );
     }
 
@@ -6760,6 +7735,10 @@ mod tests {
             "How many runs did Ajinkya Rahane score in 2025?",
             &[],
         ));
+        assert!(!should_require_todos_for_turn(
+            "current value of my portfolio",
+            &[],
+        ));
         assert!(should_require_todos_for_turn(
             "Analyze CSK batting trends in 2025 and generate a chart.",
             &[],
@@ -6790,6 +7769,14 @@ mod tests {
             &conversation_history
         ));
         assert!(!should_require_todos_for_turn(
+            "go ahead",
+            &[ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "current value of my portfolio".to_owned(),
+            }],
+        ));
+        assert!(!should_require_todos_for_turn(
             "best fielder is somebody who has taken the most catches",
             &conversation_history,
         ));
@@ -6809,6 +7796,55 @@ mod tests {
                 content: "Analyze IPL 2025 fielding performance and generate a report.".to_owned(),
             }],
         ));
+    }
+
+    #[test]
+    fn user_action_resume_detection_accepts_short_confirmation_messages() {
+        assert!(message_looks_like_user_action_resume("logged in"));
+        assert!(message_looks_like_user_action_resume("go ahead"));
+        assert!(message_looks_like_user_action_resume("continue"));
+        assert!(!message_looks_like_user_action_resume(
+            "please compare my holdings by sector and create a report"
+        ));
+    }
+
+    #[test]
+    fn derive_pending_user_action_context_captures_blocked_goal_and_resume_signal() {
+        let recent_session_messages = vec![
+            MessageRecord::SubAgentCall(SubAgentCallMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                goal: "Fetch holdings from the broker and compute the total portfolio value."
+                    .to_owned(),
+                target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                    server_name: ServerName::new("broker").expect("valid server"),
+                }),
+            }),
+            MessageRecord::SubAgentResult(SubAgentResultMessageRecord {
+                message_id: MessageId::new(),
+                timestamp: SystemTime::now(),
+                subagent_type: "mcp-executor".to_owned(),
+                status: "needs_user_action".to_owned(),
+                executed_action_count: 1,
+                detail: "Authentication required. Open this link to continue.".to_owned(),
+                tool_mask: None,
+            }),
+        ];
+
+        let context =
+            derive_pending_user_action_context(&recent_session_messages, "logged in, go ahead");
+
+        assert!(context.pending_user_action);
+        assert_eq!(
+            context.pending_user_action_kind.as_deref(),
+            Some("external_user_step")
+        );
+        assert_eq!(
+            context.pending_user_action_goal.as_deref(),
+            Some("Fetch holdings from the broker and compute the total portfolio value.")
+        );
+        assert!(context.resume_after_user_action);
     }
 
     #[test]
@@ -7598,6 +8634,10 @@ mod tests {
                     .join("turn-1-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(false),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             &[],
@@ -7611,6 +8651,57 @@ mod tests {
                 .contains("Execution scope: any allowed MCP tool or resource on this server only")
         );
         assert!(prompt.contains("Local tools: unavailable"));
+    }
+
+    #[test]
+    fn mcp_subagent_prompt_treats_prior_auth_context_as_stale_after_resume() {
+        let registry_path = workspace_root().join("config").join("subagents.json");
+        let configured = ConfiguredSubagent {
+            subagent_type: "mcp-executor".to_owned(),
+            display_name: "Mcp Executor".to_owned(),
+            purpose: "Complete delegated MCP work".to_owned(),
+            when_to_use: "For one-server MCP tasks".to_owned(),
+            target_requirements: "mcp server scope".to_owned(),
+            result_summary: "Executes delegated MCP work".to_owned(),
+            prompt_path: PathBuf::from("subagents/mcp-executor.prompt.md"),
+            enabled: true,
+            model_name: None,
+        };
+        let server_name = ServerName::new("ex-vol").expect("valid server");
+
+        let prompt = build_subagent_prompt(
+            &registry_path,
+            &configured,
+            &fake_mcp_session(&server_name),
+            TurnPhase::Execution,
+            &DelegationTarget::McpServerScope(McpServerScopeTarget {
+                server_name: server_name.clone(),
+            }),
+            "Resume data collection after user authentication",
+            "I logged in, go ahead",
+            &test_fixtures_root(),
+            &test_fixtures_root().join("turn-1").join("todos.txt"),
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
+                html_output_path: test_fixtures_root()
+                    .join("outputs")
+                    .join("turn-1-report.html"),
+                force_todo_file: false,
+                execution_todo_required: Some(false),
+                pending_user_action: true,
+                pending_user_action_kind: Some("external_user_step".to_owned()),
+                pending_user_action_goal: Some("Authenticate with the remote API.".to_owned()),
+                resume_after_user_action: true,
+            },
+            None,
+            &[],
+        )
+        .expect("prompt should build");
+
+        assert!(prompt.contains("## Resumed External User Action"));
+        assert!(prompt.contains("Treat older login"));
+        assert!(prompt.contains("stale context"));
+        assert!(prompt.contains("after a fresh MCP result in this delegation"));
     }
 
     #[test]
@@ -7646,6 +8737,172 @@ mod tests {
         );
 
         assert!(rendered.contains("analytics_db.users"));
+    }
+
+    #[test]
+    fn discovery_commit_feedback_triggers_for_users_table_with_time_field() {
+        let feedback = discovery_commit_feedback_for_mcp_result(
+            &McpCapabilityTarget {
+                server_name: ServerName::new("vol").expect("valid server"),
+                capability_kind: CapabilityKind::Tool,
+                capability_id: "list_tables".to_owned(),
+            },
+            &CapturedMcpResult {
+                result_summary: String::new(),
+                error: None,
+                response_payload: serde_json::json!({
+                    "structuredContent": {
+                        "tables": [
+                            {
+                                "database": "volonte",
+                                "name": "users",
+                                "columns": [
+                                    {"name": "_id"},
+                                    {"name": "created_at"},
+                                    {"name": "email"}
+                                ]
+                            }
+                        ]
+                    }
+                }),
+                was_error: false,
+            },
+        )
+        .expect("feedback should be generated");
+
+        assert!(feedback.contains("volonte`.`users"));
+        assert!(feedback.contains("created_at"));
+        assert!(feedback.contains("Use `run_query` next"));
+    }
+
+    #[test]
+    fn capability_scope_feedback_requires_server_scope_for_multi_tool_todo() {
+        let working_directory = test_fixtures_root();
+        let turn_dir = working_directory.join("turn-kite-server-scope-feedback");
+        std::fs::create_dir_all(&turn_dir).expect("turn dir should exist");
+        let todo_path = turn_dir.join("todos.txt");
+        TodoList::parse(
+            "1. [pending] [mcp-executor] After the user confirms login is complete, fetch current holdings from Kite and latest prices for each holding, then compute total portfolio value.\n",
+        )
+        .expect("todo should parse")
+        .save_to_path(&todo_path)
+        .expect("todo should write");
+
+        let server_name = ServerName::new("kite").expect("valid server");
+        let feedback = capability_scope_too_narrow_feedback_for_delegation(
+            &todo_path,
+            &McpSession {
+                servers: HashMap::from([(
+                    server_name.clone(),
+                    PreparedServer {
+                        config: McpServerConfig {
+                            name: server_name.to_string(),
+                            transport: Some(McpTransportConfig::Stdio {
+                                command: "fake".to_owned(),
+                                args: vec![],
+                                env: HashMap::new(),
+                            }),
+                            command: String::new(),
+                            args: Vec::new(),
+                            env: HashMap::new(),
+                            description: None,
+                        },
+                        minimal_catalog: McpMinimalCatalog {
+                            schema_version: CURRENT_SCHEMA_VERSION,
+                            server: McpServerMetadata {
+                                logical_name: server_name.to_string(),
+                                protocol_name: "kite".to_owned(),
+                                title: None,
+                                version: "1.0.0".to_owned(),
+                                description: Some("kite".to_owned()),
+                                instructions_summary: None,
+                            },
+                            capability_families: McpCapabilityFamilies {
+                                tools: McpCapabilityFamilySummary {
+                                    supported: true,
+                                    count: 3,
+                                },
+                                resources: McpCapabilityFamilySummary {
+                                    supported: false,
+                                    count: 0,
+                                },
+                            },
+                            tools: vec![],
+                            resources: vec![],
+                        },
+                        full_catalog: McpFullCatalog {
+                            schema_version: CURRENT_SCHEMA_VERSION,
+                            server: McpServerMetadata {
+                                logical_name: server_name.to_string(),
+                                protocol_name: "kite".to_owned(),
+                                title: None,
+                                version: "1.0.0".to_owned(),
+                                description: Some("kite".to_owned()),
+                                instructions_summary: None,
+                            },
+                            capability_families: McpCapabilityFamilies {
+                                tools: McpCapabilityFamilySummary {
+                                    supported: true,
+                                    count: 3,
+                                },
+                                resources: McpCapabilityFamilySummary {
+                                    supported: false,
+                                    count: 0,
+                                },
+                            },
+                            tools: vec![
+                                FullToolMetadata {
+                                    name: "get_holdings".to_owned(),
+                                    title: None,
+                                    description: Some(
+                                        "Get holdings for the current user".to_owned(),
+                                    ),
+                                    input_schema: serde_json::json!({"type":"object"}),
+                                },
+                                FullToolMetadata {
+                                    name: "get_ltp".to_owned(),
+                                    title: None,
+                                    description: Some(
+                                        "Get latest trading prices for a list of instruments"
+                                            .to_owned(),
+                                    ),
+                                    input_schema: serde_json::json!({"type":"object"}),
+                                },
+                                FullToolMetadata {
+                                    name: "get_profile".to_owned(),
+                                    title: None,
+                                    description: Some(
+                                        "Retrieve the user's profile information".to_owned(),
+                                    ),
+                                    input_schema: serde_json::json!({"type":"object"}),
+                                },
+                            ],
+                            resources: vec![],
+                            extensions: serde_json::json!({}),
+                        },
+                        full_catalog_markdown: String::new(),
+                        connection: None,
+                    },
+                )]),
+            },
+            &crate::model::SubagentDelegationRequest {
+                subagent_type: "mcp-executor".to_owned(),
+                target: DelegationTarget::McpCapability(McpCapabilityTarget {
+                    server_name,
+                    capability_kind: CapabilityKind::Tool,
+                    capability_id: "get_holdings".to_owned(),
+                }),
+                goal: "Fetch holdings and latest prices, then compute portfolio value.".to_owned(),
+            },
+            "mcp-executor",
+        )
+        .expect("feedback should compute")
+        .expect("feedback should be returned");
+
+        assert!(feedback.contains("too narrow"));
+        assert!(feedback.contains("mcp_server_scope"));
+        assert!(feedback.contains("get_holdings"));
+        assert!(feedback.contains("get_ltp"));
     }
 
     #[test]

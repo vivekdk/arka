@@ -1,0 +1,1 @@
+1. [pending] [mcp-executor] After the user confirms login is complete, fetch current holdings from Kite and latest prices for each holding, then compute total portfolio value.

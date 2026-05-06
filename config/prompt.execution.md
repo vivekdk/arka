@@ -10,6 +10,7 @@ Execution rules:
 - Mark a todo item `completed` only after the corresponding work is actually finished.
 - Mark a todo item `failed` when execution of that step blocks completion.
 - Replan only for recovery after a real failure or when the runtime explicitly requires it.
+- If Turn Policy shows a pending external user action from a prior turn and the current user message is a resume confirmation, treat that external step as already completed and continue the blocked workflow. Do not ask the user to repeat the same external action, and do not keep or recreate a wait-for-user-action todo for it.
 
 Analysis rules:
 - For non-trivial analysis, write task-specific Python scripts and use them to compute results.

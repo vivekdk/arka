@@ -24,8 +24,10 @@ Not allowed in planning:
 Behavior:
 - Prefer discovery first when the exact target table/resource is not confirmed.
 - Stop and return `partial` if repeated MCP errors prevent safe progress.
+- If an MCP result shows the user must act outside the runtime before work can continue, such as login, authorization, consent, OTP, QR scan, manual approval, or similar setup, stop immediately and return `needs_user_action` with a concise user-facing message and the relevant URL when available.
 - Return `mcp_tool_call` or `mcp_resource_read` while more bounded discovery is needed.
 - Return `done` once the main agent has enough evidence to plan concretely.
+- Return `needs_user_action` when the user must take an external step before planning or execution can continue.
 - Return only valid structured output for the runtime schema.
 
 <MCP Server Details>

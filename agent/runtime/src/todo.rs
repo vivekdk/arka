@@ -108,7 +108,14 @@ pub struct TodoList {
 
 impl TodoList {
     pub fn initialize(items: &[String]) -> Result<Self, TodoError> {
-        let items = new_todo_items_with_mandatory_tail(items, &[])?;
+        Self::initialize_with_html_tail(items, true)
+    }
+
+    pub fn initialize_with_html_tail(
+        items: &[String],
+        include_html_tail: bool,
+    ) -> Result<Self, TodoError> {
+        let items = new_todo_items_with_mandatory_tail(items, &[], include_html_tail)?;
         let todo_list = Self { items };
         todo_list.validate()?;
         Ok(todo_list)
@@ -294,10 +301,20 @@ impl TodoList {
             .iter()
             .map(|item| item.text.as_str())
             .collect::<Vec<_>>();
-        let replacement = new_todo_items_with_mandatory_tail(items, &preserved_texts)?;
+        let replacement = new_todo_items_with_mandatory_tail(
+            items,
+            &preserved_texts,
+            self.has_mandatory_html_tail(),
+        )?;
         preserved.extend(replacement);
         self.items = preserved;
         self.validate()
+    }
+
+    fn has_mandatory_html_tail(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.text == MANDATORY_TODO_GENERATE_HTML || item.text == MANDATORY_TODO_OPEN_HTML
+        })
     }
 
     fn replan_start_index(&self) -> Result<usize, TodoError> {
@@ -375,6 +392,7 @@ enum TodoValidationPhase {
 fn new_todo_items_with_mandatory_tail(
     items: &[String],
     preserved_texts: &[&str],
+    include_html_tail: bool,
 ) -> Result<Vec<TodoItem>, TodoError> {
     let mut normalized = Vec::new();
     for item in items {
@@ -382,16 +400,18 @@ fn new_todo_items_with_mandatory_tail(
             normalized.push(item);
         }
     }
-    normalized.push(TodoItem {
-        status: TodoStatus::Pending,
-        executor_hint: Some(TodoExecutor::ToolExecutor),
-        text: MANDATORY_TODO_GENERATE_HTML.to_owned(),
-    });
-    normalized.push(TodoItem {
-        status: TodoStatus::Pending,
-        executor_hint: Some(TodoExecutor::ToolExecutor),
-        text: MANDATORY_TODO_OPEN_HTML.to_owned(),
-    });
+    if include_html_tail {
+        normalized.push(TodoItem {
+            status: TodoStatus::Pending,
+            executor_hint: Some(TodoExecutor::ToolExecutor),
+            text: MANDATORY_TODO_GENERATE_HTML.to_owned(),
+        });
+        normalized.push(TodoItem {
+            status: TodoStatus::Pending,
+            executor_hint: Some(TodoExecutor::ToolExecutor),
+            text: MANDATORY_TODO_OPEN_HTML.to_owned(),
+        });
+    }
     Ok(normalized)
 }
 
@@ -561,6 +581,29 @@ mod tests {
             Some(TodoExecutor::ToolExecutor)
         );
         assert_eq!(todos.items[2].text, MANDATORY_TODO_OPEN_HTML);
+    }
+
+    #[test]
+    fn initialize_can_skip_mandatory_html_tail() {
+        let todos = TodoList::initialize_with_html_tail(
+            &[
+                "[mcp-executor] Inspect the data".to_owned(),
+                "[main-agent] Return only the number".to_owned(),
+            ],
+            false,
+        )
+        .expect("initialize should succeed");
+
+        assert_eq!(todos.items.len(), 2);
+        assert_eq!(todos.items[0].text, "Inspect the data");
+        assert_eq!(todos.items[1].text, "Return only the number");
+        assert!(
+            todos
+                .items
+                .iter()
+                .all(|item| item.text != MANDATORY_TODO_GENERATE_HTML
+                    && item.text != MANDATORY_TODO_OPEN_HTML)
+        );
     }
 
     #[test]
@@ -775,5 +818,22 @@ mod tests {
                 .to_string()
                 .contains("cannot replan a concrete todo plan after execution has started")
         );
+    }
+
+    #[test]
+    fn replan_preserves_absence_of_mandatory_html_tail() {
+        let mut todos = TodoList::parse(
+            "1. [completed] [mcp-executor] Inspect source\n2. [failed] [main-agent] Return the number\n3. [pending] [main-agent] Retry the answer\n",
+        )
+        .expect("seed todos should parse");
+
+        todos
+            .replan_pending_suffix(&["[main-agent] Return only the corrected number".to_owned()])
+            .expect("replan should succeed");
+
+        assert_eq!(todos.items.len(), 3);
+        assert_eq!(todos.items[0].text, "Inspect source");
+        assert_eq!(todos.items[1].text, "Return the number");
+        assert_eq!(todos.items[2].text, "Return only the corrected number");
     }
 }

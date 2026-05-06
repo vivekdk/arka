@@ -173,6 +173,166 @@ async fn runtime_delegates_tool_executor_and_executes_tool() {
     let prompts = prompt_log.lock().expect("prompt log should lock");
     assert!(prompts[0].contains("available MCPs") || prompts[0].contains("Server: fake"));
     assert!(prompts[0].contains("mcp-executor"));
+    assert!(
+        prompts
+            .last()
+            .expect("main prompt after handoff should be logged")
+            .contains("\"rowCount\":3"),
+        "main agent prompt after delegated MCP handoff should include MCP result trace"
+    );
+}
+
+#[tokio::test]
+async fn runtime_includes_root_agents_in_prompt_when_working_directory_is_session_workspace() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![Ok(ModelAdapterResponse {
+            decision: ModelStepDecision::Final {
+                content: "Used project instructions".to_owned(),
+            },
+            usage: token_usage(2, 2),
+        })],
+        vec![],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-project-instructions");
+    let working_directory = temp_dir.join(".arka").join("tmp").join("session-1");
+    fs::create_dir_all(&working_directory).expect("session workspace should exist");
+    fs::write(
+        temp_dir.join("AGENTS.md"),
+        "Use Polars instead of pandas for dataframe work.",
+    )
+    .expect("agents file should write");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be precise."),
+            working_directory,
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "Profile the data".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.final_text, "Used project instructions");
+    let prompts = prompt_log.lock().expect("prompt log should lock");
+    assert!(
+        prompts
+            .first()
+            .expect("main-agent prompt should exist")
+            .contains("## Project Instructions")
+    );
+    assert!(
+        prompts
+            .first()
+            .expect("main-agent prompt should exist")
+            .contains("Use Polars instead of pandas for dataframe work.")
+    );
+}
+
+#[tokio::test]
+async fn runtime_short_circuits_when_mcp_executor_hits_login_link_user_action() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("kite");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpCapability(McpCapabilityTarget {
+                            server_name: ServerName::new("kite").expect("valid server"),
+                            capability_kind: mcp_metadata::CapabilityKind::Tool,
+                            capability_id: "login".to_owned(),
+                        }),
+                        goal: "Check Kite authentication status and get the login link if needed."
+                            .to_owned(),
+                    },
+                },
+                usage: token_usage(3, 2),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "tool-executor".to_owned(),
+                        target: DelegationTarget::LocalToolsScope(
+                            LocalToolsScopeTarget::working_directory(),
+                        ),
+                        goal: "This should never run after the login gate.".to_owned(),
+                    },
+                },
+                usage: token_usage(3, 2),
+            }),
+        ],
+        vec![Ok(SubagentAdapterResponse {
+            decision: SubagentDecision::McpToolCall {
+                server_name: ServerName::new("kite").expect("valid server"),
+                tool_name: "login".to_owned(),
+                arguments: json!({}),
+            },
+            usage: token_usage(1, 1),
+        })],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-kite-login-short-circuit");
+    let registry_path = write_registry_named(&temp_dir, "kite", FAKE_SERVER_BIN, Vec::new());
+    write_kite_mcp_metadata(&temp_dir);
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(&temp_dir, "Be precise."),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![],
+            recent_session_messages: vec![],
+            user_message: "current value of my portfolio".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("kite").expect("valid server")]),
+            limits: RuntimeLimits::default(),
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::Final);
+    assert!(
+        outcome
+            .final_text
+            .contains("https://kite.example.com/login"),
+        "final answer should include the login link"
+    );
+    assert!(
+        outcome.final_text.to_ascii_lowercase().contains("log in")
+            || outcome.final_text.to_ascii_lowercase().contains("login"),
+        "final answer should tell the user to login first"
+    );
+    assert!(
+        !outcome.turn.messages.iter().any(|message| matches!(
+            message,
+            MessageRecord::SubAgentCall(record) if record.subagent_type == "tool-executor"
+        )),
+        "runtime should end before any later tool-executor delegation"
+    );
 }
 
 #[tokio::test]
@@ -549,7 +709,7 @@ async fn runtime_reads_resource_via_tool_executor() {
 }
 
 #[tokio::test]
-async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to_main_prompt() {
+async fn delegated_subagent_handoff_carries_mcp_trace_to_main_prompt() {
     let _metadata_guard = metadata_test_lock().lock().await;
     cleanup_mcp_metadata("fake");
     let prompt_log = Arc::new(Mutex::new(Vec::new()));
@@ -630,8 +790,11 @@ async fn delegated_subagent_can_take_multiple_mcp_steps_without_leaking_trace_to
     let prompts = prompt_log.lock().expect("prompt log should lock");
     let follow_up_prompt = prompts.last().expect("follow-up prompt should exist");
     assert!(follow_up_prompt.contains("sub_agent_result"));
-    assert!(!follow_up_prompt.contains("mcp_call"));
-    assert!(!follow_up_prompt.contains("mcp_result"));
+    assert!(follow_up_prompt.contains("mcp_call"));
+    assert!(follow_up_prompt.contains("mcp_result"));
+    assert!(follow_up_prompt.contains("select count(*) from one"));
+    assert!(follow_up_prompt.contains("select count(*) from two"));
+    assert!(follow_up_prompt.contains("\"rowCount\":3"));
     assert!(
         outcome
             .turn
@@ -2488,11 +2651,9 @@ async fn required_todos_mode_creates_todo_file_after_planning_complete() {
     assert!(
         todo_text.contains("[pending] [main-agent] Inspect the request and prepare the answer.")
     );
-    assert!(todo_text.contains(
-        "[pending] [tool-executor] Generate a clear, engaging data blog post with narrative writing, charts, and tables. Use deep analysis in Python with pandas and numpy to surface insights, clearly highlight key data points, organize the post with strong section headers, use color thoughtfully to improve readability, and style the HTML like a polished editorial report with strong typography, elevated cards, clear visual hierarchy, and a mobile-friendly layout."
-    ));
     assert!(
-        todo_text.contains("[pending] [tool-executor] Print the path of the generated HTML file.")
+        !todo_text.contains("Generate a clear, engaging data blog post"),
+        "simple factual turns in required-todo mode should not force the HTML-report tail"
     );
 
     let prompts = prompt_log.lock().expect("prompt log should lock");
@@ -2502,6 +2663,235 @@ async fn required_todos_mode_creates_todo_file_after_planning_complete() {
             && prompt.contains("## Current Turn Todo Plan")
             && prompt.contains("Inspect the request and prepare the answer.")
     }));
+}
+
+#[tokio::test]
+async fn resumed_user_action_does_not_loop_on_stale_wait_todo() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::PlanningComplete {
+                    outcome: PlanningOutcome {
+                        planning_complete: true,
+                        answer_brief: String::new(),
+                        todo_required: true,
+                        planning_summary: "Resume after an external authentication step.".to_owned(),
+                        selected_sources: vec![],
+                        discovered_facts: vec![],
+                        execution_strategy: "Continue with the blocked data retrieval.".to_owned(),
+                        todo_items: vec![
+                            "[main-agent] Wait for the user to complete authentication, then restart the request.".to_owned(),
+                            "[mcp-executor] After authentication, retrieve account data from the API.".to_owned(),
+                        ],
+                        risks_and_constraints: vec![],
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                            server_name: ServerName::new("fake").expect("valid server"),
+                        }),
+                        goal: "After authentication, retrieve account data from the API.".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "Retrieved account data after resume.".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![Ok(SubagentAdapterResponse {
+            decision: SubagentDecision::Done {
+                summary: "Retrieved account data.".to_owned(),
+            },
+            usage: token_usage(1, 1),
+        })],
+        Arc::new(Mutex::new(Vec::new())),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-resume-user-action-wait-todo");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "What is my account value?".to_owned(),
+            }],
+            recent_session_messages: vec![
+                MessageRecord::SubAgentCall(agent_runtime::state::SubAgentCallMessageRecord {
+                    message_id: agent_runtime::MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    goal: "Retrieve account data from the API.".to_owned(),
+                    target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                        server_name: ServerName::new("fake").expect("valid server"),
+                    }),
+                }),
+                MessageRecord::SubAgentResult(agent_runtime::state::SubAgentResultMessageRecord {
+                    message_id: agent_runtime::MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    status: "needs_user_action".to_owned(),
+                    executed_action_count: 1,
+                    detail: "A required user action is needed before continuing.".to_owned(),
+                    tool_mask: None,
+                }),
+            ],
+            user_message: "go ahead".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 4,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::Final);
+    assert!(outcome.events.iter().any(|event| {
+        matches!(event, RuntimeEvent::HandoffToSubagent { subagent_type, .. } if subagent_type == "mcp-executor")
+    }));
+
+    let todo_path = temp_dir
+        .join(outcome.turn.turn_id.to_string())
+        .join("todos.txt");
+    let todo_text = fs::read_to_string(&todo_path).expect("todo file should exist");
+    assert!(!todo_text.contains("Wait for the user to complete authentication"));
+    assert!(todo_text.contains("[completed] [mcp-executor] After authentication"));
+}
+
+#[tokio::test]
+async fn auth_blocked_mcp_cannot_execute_allows_blocker_final_after_resume() {
+    let _metadata_guard = metadata_test_lock().lock().await;
+    cleanup_mcp_metadata("fake");
+    let prompt_log = Arc::new(Mutex::new(Vec::new()));
+    let adapter = FakeModelAdapter::new(
+        vec![
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::PlanningComplete {
+                    outcome: PlanningOutcome {
+                        planning_complete: true,
+                        answer_brief: String::new(),
+                        todo_required: true,
+                        planning_summary: "Resume account data retrieval after login.".to_owned(),
+                        selected_sources: vec![],
+                        discovered_facts: vec![],
+                        execution_strategy: "Fetch account data from the broker API.".to_owned(),
+                        todo_items: vec![
+                            "[mcp-executor] Fetch profile, holdings, and positions from the authenticated account API.".to_owned(),
+                        ],
+                        risks_and_constraints: vec![],
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::DelegateSubagent {
+                    delegation: SubagentDelegationRequest {
+                        subagent_type: "mcp-executor".to_owned(),
+                        target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                            server_name: ServerName::new("fake").expect("valid server"),
+                        }),
+                        goal: "Fetch profile, holdings, and positions from the authenticated account API.".to_owned(),
+                    },
+                },
+                usage: token_usage(1, 1),
+            }),
+            Ok(ModelAdapterResponse {
+                decision: ModelStepDecision::Final {
+                    content: "I’m still blocked on authentication in the account API session, so I can’t continue with portfolio analysis yet.".to_owned(),
+                },
+                usage: token_usage(1, 1),
+            }),
+        ],
+        vec![Ok(SubagentAdapterResponse {
+            decision: SubagentDecision::CannotExecute {
+                reason: "Authentication is still required; no account data can be accessed until the user completes login.".to_owned(),
+            },
+            usage: token_usage(1, 1),
+        })],
+        Arc::clone(&prompt_log),
+        Duration::from_millis(0),
+    );
+    let runtime = AgentRuntime::new(adapter);
+    let temp_dir = temp_dir("runtime-auth-blocker-final-after-resume");
+    let registry_path = write_registry(&temp_dir, FAKE_SERVER_BIN, Vec::new());
+    write_mcp_metadata(&temp_dir, "fake");
+
+    let outcome = runtime
+        .run_turn(RunRequest {
+            system_prompt_path: write_prompt(
+                &temp_dir,
+                "MCPs:\n<dynamic variable: available MCPs>\nSub-agents:\n<dynamic variable: available sub-agents>",
+            ),
+            working_directory: temp_dir.clone(),
+            conversation_history: vec![ConversationMessage {
+                timestamp: SystemTime::now(),
+                role: ConversationRole::User,
+                content: "Analyze my portfolio".to_owned(),
+            }],
+            recent_session_messages: vec![
+                MessageRecord::SubAgentCall(agent_runtime::state::SubAgentCallMessageRecord {
+                    message_id: agent_runtime::MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    goal: "Fetch account data from the broker API.".to_owned(),
+                    target: DelegationTarget::McpServerScope(McpServerScopeTarget {
+                        server_name: ServerName::new("fake").expect("valid server"),
+                    }),
+                }),
+                MessageRecord::SubAgentResult(agent_runtime::state::SubAgentResultMessageRecord {
+                    message_id: agent_runtime::MessageId::new(),
+                    timestamp: SystemTime::now(),
+                    subagent_type: "mcp-executor".to_owned(),
+                    status: "needs_user_action".to_owned(),
+                    executed_action_count: 1,
+                    detail: "Open the login link to authenticate.".to_owned(),
+                    tool_mask: None,
+                }),
+            ],
+            user_message: "I logged in, go ahead".to_owned(),
+            response_target: default_response_target(),
+            registry_path,
+            subagent_registry_path: write_subagent_registry(&temp_dir),
+            tool_policy_path: None,
+            enabled_servers: Some(vec![ServerName::new("fake").expect("valid server")]),
+            limits: RuntimeLimits {
+                max_steps_per_turn: 3,
+                ..RuntimeLimits::default()
+            },
+            model_config: ModelConfig::new("fake-model"),
+            require_todos: false,
+        })
+        .await
+        .expect("turn should succeed");
+
+    assert_eq!(outcome.termination, TerminationReason::Final);
+    assert!(outcome.final_text.contains("still blocked"));
 }
 
 #[tokio::test]
@@ -3437,6 +3827,57 @@ fn write_mcp_metadata(_temp_dir: &Path, logical_name: &str) {
             mime_type: Some("application/json".to_owned()),
             annotations: None,
         }],
+        extensions: json!({}),
+    };
+    write_catalogs(&paths, &minimal, &full).expect("metadata should write");
+}
+
+fn write_kite_mcp_metadata(_temp_dir: &Path) {
+    cleanup_mcp_metadata("kite");
+    let current_dir = std::env::current_dir().expect("cwd should resolve");
+    let metadata_dir = current_dir.join(DEFAULT_METADATA_DIR);
+    fs::create_dir_all(&metadata_dir).expect("metadata dir should exist");
+    let paths = artifact_paths(&metadata_dir, "kite");
+    let families = McpCapabilityFamilies {
+        tools: McpCapabilityFamilySummary {
+            supported: true,
+            count: 1,
+        },
+        resources: McpCapabilityFamilySummary {
+            supported: false,
+            count: 0,
+        },
+    };
+    let server = McpServerMetadata {
+        logical_name: "kite".to_owned(),
+        protocol_name: "fake-runtime-server".to_owned(),
+        title: Some("Kite Test Server".to_owned()),
+        version: "1.0.0".to_owned(),
+        description: Some("Kite auth test MCP".to_owned()),
+        instructions_summary: Some("Use the login tool to check authentication.".to_owned()),
+    };
+    let minimal = McpMinimalCatalog {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        server: server.clone(),
+        capability_families: families.clone(),
+        tools: vec![MinimalToolMetadata {
+            name: "login".to_owned(),
+            title: Some("Login".to_owned()),
+            description: Some("Return the login link when authentication is required.".to_owned()),
+        }],
+        resources: vec![],
+    };
+    let full = McpFullCatalog {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        server,
+        capability_families: families,
+        tools: vec![FullToolMetadata {
+            name: "login".to_owned(),
+            title: Some("Login".to_owned()),
+            description: Some("Return the login link when authentication is required.".to_owned()),
+            input_schema: json!({"type":"object"}),
+        }],
+        resources: vec![],
         extensions: json!({}),
     };
     write_catalogs(&paths, &minimal, &full).expect("metadata should write");

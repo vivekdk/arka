@@ -21,6 +21,8 @@ use crate::state::{
 };
 use crate::tools::ToolDescriptor;
 
+const PROJECT_INSTRUCTIONS_OVERRIDE_FILE: &str = "AGENTS.override.md";
+const PROJECT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const WORKING_DIRECTORY_TAG: &str = "<dynamic variable: working_directory>";
 const CURRENT_DATE_TIME_TAG: &str = "<dynamic variable: current_date and time>";
 const AVAILABLE_MCPS_TAG: &str = "<dynamic variable: available MCPs>";
@@ -37,6 +39,12 @@ pub enum PromptRenderError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to read project instructions file `{path}`: {source}")]
+    ReadProjectInstructions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Builds prompt snapshots from canonical runtime state.
@@ -49,6 +57,10 @@ pub struct TurnPolicyPromptContext {
     pub html_output_path: PathBuf,
     pub force_todo_file: bool,
     pub execution_todo_required: Option<bool>,
+    pub pending_user_action: bool,
+    pub pending_user_action_kind: Option<String>,
+    pub pending_user_action_goal: Option<String>,
+    pub resume_after_user_action: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +76,7 @@ impl PromptAssembler {
     pub fn build(
         &self,
         system_prompt: &str,
+        project_instructions: Option<&str>,
         conversation_history: &[ConversationMessage],
         recent_session_messages: &[MessageRecord],
         current_turn_messages: &[MessageRecord],
@@ -77,6 +90,15 @@ impl PromptAssembler {
             title: "System Prompt".to_owned(),
             content: system_prompt.trim().to_owned(),
         });
+        if let Some(project_instructions) = project_instructions {
+            let project_instructions = project_instructions.trim();
+            if !project_instructions.is_empty() {
+                sections.push(PromptSection {
+                    title: "Project Instructions".to_owned(),
+                    content: project_instructions.to_owned(),
+                });
+            }
+        }
         sections.push(PromptSection {
             title: "Conversation History".to_owned(),
             content: render_history(conversation_history),
@@ -131,8 +153,21 @@ pub fn render_turn_policy_context(turn_policy_context: &TurnPolicyPromptContext)
         Some(required) => format!("Execution todo file required: {required}"),
         None => "Execution todo file required: planning has not decided yet".to_owned(),
     };
+    let pending_user_action_summary = format!(
+        "Pending user action: {}\nPending user action kind: {}\nPending user action blocked goal: {}\nResume signal from current user message: {}",
+        turn_policy_context.pending_user_action,
+        turn_policy_context
+            .pending_user_action_kind
+            .as_deref()
+            .unwrap_or("none"),
+        turn_policy_context
+            .pending_user_action_goal
+            .as_deref()
+            .unwrap_or("none"),
+        turn_policy_context.resume_after_user_action
+    );
     format!(
-        "{phase_summary}\nDeployment force-todo override: {}\n{todo_summary}\nDeterministic HTML output: {}\nIf a todo file is required for execution, it must exist before substantive execution begins.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work in execution, generate the HTML report and print the generated HTML file path before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
+        "{phase_summary}\nDeployment force-todo override: {}\n{todo_summary}\n{pending_user_action_summary}\nDeterministic HTML output: {}\nIf a todo file is required for execution, it must exist before substantive execution begins.\nIf `Pending user action` is true and `Resume signal from current user message` is also true, treat the external user step as completed for planning/execution purposes and resume the blocked goal instead of asking the user to do the same step again. Do not keep or recreate a wait-for-user-action todo in that case.\nDefault rule: if this turn performs analysis, reporting, transformation, or visualization work in execution, generate the HTML report and print the generated HTML file path before finishing.\nSkip is allowed only for very simple factual replies with no meaningful transformation or reporting.",
         turn_policy_context.force_todo_file,
         turn_policy_context.html_output_path.display()
     )
@@ -158,6 +193,54 @@ pub fn load_and_render_system_prompt(
         available_tools,
         response_target,
     )
+}
+
+pub fn load_project_instructions(
+    working_directory: &Path,
+) -> Result<Option<String>, PromptRenderError> {
+    let project_root = discover_project_root(working_directory);
+    let candidates = [
+        project_root.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE),
+        project_root.join(PROJECT_INSTRUCTIONS_FILE),
+    ];
+
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let contents = fs::read_to_string(&path).map_err(|source| {
+            PromptRenderError::ReadProjectInstructions {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        if !contents.trim().is_empty() {
+            return Ok(Some(contents));
+        }
+    }
+
+    Ok(None)
+}
+
+fn discover_project_root(working_directory: &Path) -> PathBuf {
+    let session_dir = working_directory;
+    let Some(tmp_dir) = session_dir.parent() else {
+        return working_directory.to_path_buf();
+    };
+    let Some(arka_dir) = tmp_dir.parent() else {
+        return working_directory.to_path_buf();
+    };
+    let Some(project_root) = arka_dir.parent() else {
+        return working_directory.to_path_buf();
+    };
+
+    if tmp_dir.file_name().and_then(|name| name.to_str()) == Some("tmp")
+        && arka_dir.file_name().and_then(|name| name.to_str()) == Some(".arka")
+    {
+        project_root.to_path_buf()
+    } else {
+        working_directory.to_path_buf()
+    }
 }
 
 fn load_phase_prompt_template(path: &Path, phase: TurnPhase) -> Result<String, PromptRenderError> {
@@ -472,7 +555,10 @@ mod tests {
     use crate::{
         ids::MessageId,
         model::TurnPhase,
-        prompt::{TodoPromptContext, TurnPolicyPromptContext, load_and_render_system_prompt},
+        prompt::{
+            PROJECT_INSTRUCTIONS_FILE, PROJECT_INSTRUCTIONS_OVERRIDE_FILE, TodoPromptContext,
+            TurnPolicyPromptContext, load_and_render_system_prompt, load_project_instructions,
+        },
         state::{
             ConversationMessage, ConversationRole, LlmMessageRecord, McpCapability,
             McpCapabilityTarget, McpResultMessageRecord, MessageRecord, ResponseClient,
@@ -488,6 +574,7 @@ mod tests {
         let assembler = PromptAssembler;
         let prompt = assembler.build(
             "Be precise.",
+            None,
             &[ConversationMessage {
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 role: ConversationRole::User,
@@ -504,6 +591,10 @@ mod tests {
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
                 force_todo_file: false,
                 execution_todo_required: None,
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             None,
@@ -528,6 +619,7 @@ mod tests {
         let assembler = PromptAssembler;
         let prompt = assembler.build(
             "Be precise.",
+            None,
             &[],
             &[MessageRecord::McpResult(McpResultMessageRecord {
                 message_id: MessageId::new(),
@@ -546,6 +638,10 @@ mod tests {
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
                 force_todo_file: false,
                 execution_todo_required: None,
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             None,
@@ -565,6 +661,7 @@ mod tests {
         let assembler = PromptAssembler;
         let prompt = assembler.build(
             "Be precise.",
+            None,
             &[],
             &[],
             &[],
@@ -573,6 +670,10 @@ mod tests {
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
                 force_todo_file: false,
                 execution_todo_required: Some(true),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             Some(&TodoPromptContext {
@@ -592,6 +693,7 @@ mod tests {
         let assembler = PromptAssembler;
         let prompt = assembler.build(
             "Be precise.",
+            None,
             &[],
             &[],
             &[],
@@ -600,6 +702,10 @@ mod tests {
                 html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
                 force_todo_file: true,
                 execution_todo_required: Some(true),
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
             },
             None,
             None,
@@ -617,6 +723,72 @@ mod tests {
                 .rendered
                 .contains("Default rule: if this turn performs analysis")
         );
+    }
+
+    #[test]
+    fn prompt_includes_pending_user_action_resume_context() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            None,
+            &[],
+            &[],
+            &[],
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Execution,
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                force_todo_file: false,
+                execution_todo_required: Some(false),
+                pending_user_action: true,
+                pending_user_action_kind: Some("external_user_step".to_owned()),
+                pending_user_action_goal: Some(
+                    "Fetch holdings and compute portfolio value.".to_owned(),
+                ),
+                resume_after_user_action: true,
+            },
+            None,
+            None,
+        );
+
+        assert!(prompt.rendered.contains("Pending user action: true"));
+        assert!(
+            prompt
+                .rendered
+                .contains("Resume signal from current user message: true")
+        );
+        assert!(
+            prompt
+                .rendered
+                .contains("Fetch holdings and compute portfolio value.")
+        );
+        assert!(prompt.rendered.contains("resume the blocked goal"));
+    }
+
+    #[test]
+    fn prompt_includes_project_instructions_section_when_present() {
+        let assembler = PromptAssembler;
+        let prompt = assembler.build(
+            "Be precise.",
+            Some("Use Polars instead of pandas."),
+            &[],
+            &[],
+            &[],
+            &TurnPolicyPromptContext {
+                phase: TurnPhase::Planning,
+                html_output_path: PathBuf::from("/tmp/session/outputs/turn-report.html"),
+                force_todo_file: false,
+                execution_todo_required: None,
+                pending_user_action: false,
+                pending_user_action_kind: None,
+                pending_user_action_goal: None,
+                resume_after_user_action: false,
+            },
+            None,
+            None,
+        );
+
+        assert!(prompt.rendered.contains("## Project Instructions"));
+        assert!(prompt.rendered.contains("Use Polars instead of pandas."));
     }
 
     #[test]
@@ -699,5 +871,80 @@ mod tests {
         assert!(!rendered.contains("<dynamic variable: available tools>"));
         assert!(!rendered.contains("<dynamic variable: response target>"));
         assert!(!rendered.contains("Tool: read_file"));
+    }
+
+    #[test]
+    fn project_instructions_use_override_when_present() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-runtime-project-instructions-override-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let working_directory = temp_dir.join(".arka").join("tmp").join("session-1");
+        std::fs::create_dir_all(&working_directory).expect("working directory should exist");
+        std::fs::write(
+            temp_dir.join(PROJECT_INSTRUCTIONS_FILE),
+            "Use pandas when convenient.",
+        )
+        .expect("base instructions should write");
+        std::fs::write(
+            temp_dir.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE),
+            "Use Polars instead of pandas.",
+        )
+        .expect("override instructions should write");
+
+        let rendered = load_project_instructions(&working_directory)
+            .expect("project instructions should load")
+            .expect("project instructions should exist");
+
+        assert_eq!(rendered, "Use Polars instead of pandas.");
+        std::fs::remove_dir_all(&temp_dir).expect("temp directory should be removable");
+    }
+
+    #[test]
+    fn project_instructions_fall_back_to_non_empty_base_when_override_is_empty() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-runtime-project-instructions-fallback-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let working_directory = temp_dir.join(".arka").join("tmp").join("session-1");
+        std::fs::create_dir_all(&working_directory).expect("working directory should exist");
+        std::fs::write(temp_dir.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE), " \n\t")
+            .expect("override instructions should write");
+        std::fs::write(
+            temp_dir.join(PROJECT_INSTRUCTIONS_FILE),
+            "Keep charts readable.",
+        )
+        .expect("base instructions should write");
+
+        let rendered = load_project_instructions(&working_directory)
+            .expect("project instructions should load")
+            .expect("project instructions should exist");
+
+        assert_eq!(rendered, "Keep charts readable.");
+        std::fs::remove_dir_all(&temp_dir).expect("temp directory should be removable");
+    }
+
+    #[test]
+    fn project_instructions_fall_back_to_working_directory_when_not_in_session_workspace() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agent-runtime-project-instructions-working-dir-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("working directory should exist");
+        std::fs::write(
+            temp_dir.join(PROJECT_INSTRUCTIONS_FILE),
+            "Prefer DuckDB for local queries.",
+        )
+        .expect("instructions should write");
+
+        let rendered = load_project_instructions(&temp_dir)
+            .expect("project instructions should load")
+            .expect("project instructions should exist");
+
+        assert_eq!(rendered, "Prefer DuckDB for local queries.");
+        std::fs::remove_dir_all(&temp_dir).expect("temp directory should be removable");
     }
 }
